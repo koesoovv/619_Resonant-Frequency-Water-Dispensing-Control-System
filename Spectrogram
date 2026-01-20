@@ -1,0 +1,47 @@
+import numpy as np # 배열로 계산
+import matplotlib.pyplot as plt # 그래프 
+import pydub # 음원 파일 로드
+from scipy.fftpack import fft # 고속 푸리에 변환
+
+pydub.AudioSegment.converter = "C:/ffmpeg/bin/ffmpeg.exe" # 디코딩 경로
+
+sound = pydub.AudioSegment.from_file("C:/Users/user/OneDrive/바탕 화면/동의대/팀플/캡스톤디자인/캡스톤디자인 I/정수기 음원/주파수 분석/cylinder/Cylinder_3-8_4cm.m4a", format="m4a") # ffmpeg를 pydub에서 처리하고, m4a 파일을 디코딩한 오디오 객체 sound로 저장
+
+sample_rate = sound.frame_rate # 샘플링 주파수
+chunk_size = int(sample_rate * 5 / len(sound)) # 프레임 사이즈 지정, 반비례
+nfft = 512 # 한 프레임 내에 FFT가 들어가는 길이
+spectrogram = [] # 빈 리스트 생성
+
+for i in range(0, len(sound), chunk_size): # 0부터 전체 길이까지 프레임 사이즈 만큼
+    chunk = sound[i:i+chunk_size] # 한 프레임 범위
+    samples = chunk.get_array_of_samples() # 1차원 시퀀스로 추출
+    Zxx = fft(samples, n=nfft) # nfft 만큼 fft
+    Zxx = 20 * np.log10(np.abs(Zxx) + 1e-6) * 4 # dB 변환, 스케일링(보정)
+    spectrogram.append(Zxx.reshape(-1, 1)) # 열 벡터로 만들어서 리스트 누적
+
+full_spectrogram = np.concatenate(spectrogram, axis=1) # 열 벡터 이어 붙임
+                                          
+freq_min = 0 # 최소 주파수
+freq_max = 8000 # 최대 주파수
+
+freq_min_index = int(freq_min / (sample_rate / 2) * (nfft // 2)) # 최소 인덱스 위치
+freq_max_index = int(freq_max / (sample_rate / 2) * (nfft // 2)) # 최대 인덱스 위치
+
+selected_spectrogram = full_spectrogram[freq_min_index:freq_max_index] # 인덱스 내의 주파수만 생존
+plt.figure(figsize=(10, 6)) # 그래프 창 생성, 사이즈 10인치x6인치
+plt.imshow(
+    selected_spectrogram, # dB 표시
+    aspect='auto', # 가로, 세로 비율 자동
+    cmap='inferno', # 컬러맵 지정
+    extent=[0, len(sound) / 1000, # 시간 축
+            freq_min, freq_max], # 주파수 축
+    origin='lower' # 원점 왼쪽 아래
+)
+
+plt.xlabel('Time (s)') # x축 라벨
+plt.ylabel('Frequency (Hz)') # y축 라벨
+plt.title('Mess_cylinder_FFT_Spectrogram') # 그래프 제목 
+
+plt.colorbar(label='Intensity (dB)') # 컬러바 라벨
+
+plt.show() # 출력
