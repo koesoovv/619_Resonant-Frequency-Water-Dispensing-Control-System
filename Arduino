@@ -1,0 +1,21 @@
+const int SOLENOID_PIN = 7; 
+
+void setup() {
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
+  Serial.begin(9600); // 파이썬과 속도를 맞춰야 함
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    if (cmd == '1') {
+      digitalWrite(SOLENOID_PIN, HIGH);
+      Serial.println("OK: VALVE OPEN");
+    } 
+    else if (cmd == '0') {
+      digitalWrite(SOLENOID_PIN, LOW);
+      Serial.println("OK: VALVE CLOSED");
+    }
+  }
+}
