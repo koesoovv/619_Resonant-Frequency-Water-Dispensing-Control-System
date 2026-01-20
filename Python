@@ -1,0 +1,125 @@
+import numpy as np
+import sounddevice as sd
+import librosa
+import scipy.signal as signal
+import serial
+import time
+from statsmodels.nonparametric.smoothers_lowess import lowess
+
+# ===== 1. 설정 및 파라미터 =====
+PORT = 'COM5'
+BAUD_RATE = 9600
+SOUND_SPEED = 340.0   # 소리의 속도 (m/s)
+STOP_RATIO = 0.85     # 목표 수위 (0.85 = 85% 찼을 때 정지)
+
+IGNORE_DURATION = 2.0  # 초반 Splash 노이즈 무시 (2초)
+CALIBRATION_DURATION = 1.0 # 컵 깊이 측정 시간 (1초)
+AVERAGE_WINDOW = 10    # 구간 평균 데이터 개수
+
+SAMPLE_RATE = 44100
+CHUNK_SIZE = int(SAMPLE_RATE * 0.05)
+
+# 상태 관리 변수
+freq_history = []
+time_history = []
+smoothed_buffer = []
+base_freq_samples = [] # 초기 1초간 주파수를 모을 버퍼
+
+is_filling = False
+target_freq = 0        # 계산되어 업데이트될 목표 주파수
+filling_start_time = 0
+calibration_done = False
+
+# ===== 2. 시리얼 통신 설정 =====
+try:
+    ser = serial.Serial(PORT, BAUD_RATE, timeout=0.1)
+    time.sleep(2)
+    ser.reset_input_buffer()
+    print(f"[{PORT}] 연결 성공. 시스템 대기 중.")
+except Exception as e:
+    print(f"연결 실패: {e}")
+    exit()
+
+# ===== 3. 실시간 신호처리 콜백 =====
+def audio_callback(indata, frames, time_info, status):
+    global freq_history, time_history, smoothed_buffer, is_filling, filling_start_time
+    global base_freq_samples, target_freq, calibration_done
+    
+    if not is_filling:
+        return
+
+    chunk = indata.flatten().astype(float)
+    if np.max(np.abs(chunk)) < 0.01: return
+
+    try:
+        current_time = time.time()
+        elapsed_time = current_time - filling_start_time
+
+        # 1) LPC 및 주파수 피크 탐지
+        a_lpc = librosa.lpc(chunk, order=24)
+        w, h = signal.freqz(1, a_lpc, worN=512)
+        freqs = w * (SAMPLE_RATE / (2 * np.pi))
+        valid_idx = np.where((freqs > 400) & (freqs < 4000))[0]
+        peak_f = freqs[valid_idx[np.argmax(np.abs(h[valid_idx]))]]
+
+        # LOESS 평활화 적용
+        freq_history.append(peak_f)
+        time_history.append(current_time)
+        if len(freq_history) < 20: return
+        
+        recent_f = np.array(freq_history[-20:])
+        recent_t = np.array(time_history[-20:])
+        res = lowess(recent_f, recent_t, frac=0.4)
+        current_smoothed_f = res[-1, 1]
+
+        # 2) 상태별 로직 제어
+        # [Phase 1] 초기 2초 무시
+        if elapsed_time < IGNORE_DURATION:
+            print(f"[초기 대기] 노이즈 무시 중... ({elapsed_time:.1f}s)", end='\r')
+        
+        # [Phase 2] 이후 1초간 컵 깊이(기본 주파수) 측정
+        elif elapsed_time < (IGNORE_DURATION + CALIBRATION_DURATION):
+            base_freq_samples.append(current_smoothed_f)
+            print(f"[측정 중] 컵 깊이 분석 중... {current_smoothed_f:.1f} Hz", end='\r')
+        
+        # [Phase 3] 측정 완료 및 목표 설정
+        elif not calibration_done:
+            avg_base_f = np.mean(base_freq_samples)
+            # 수위가 STOP_RATIO만큼 차오를 때의 목표 주파수 계산
+            # F_target = F_base / (1 - STOP_RATIO)
+            target_freq = avg_base_f / (1.0 - STOP_RATIO)
+            calibration_done = True
+            print(f"\n[설정 완료] 기준: {avg_base_f:.1f}Hz -> 목표: {target_freq:.1f}Hz 설정됨.")
+
+        # [Phase 4] 실시간 감시 및 정지
+        else:
+            smoothed_buffer.append(current_smoothed_f)
+            if len(smoothed_buffer) > AVERAGE_WINDOW: smoothed_buffer.pop(0)
+            avg_f = np.mean(smoothed_buffer)
+
+            print(f"[분석 중] 현재: {avg_f:.1f}Hz / 목표: {target_freq:.1f}Hz", end='\r')
+
+            if avg_f >= target_freq:
+                print(f"\n[정지] 수위 도달! (계산된 목표치 {target_freq:.1f}Hz 도달)")
+                ser.write(b'0')
+                is_filling = False
+
+    except Exception as e:
+        pass
+
+# ===== 4. 메인 루프 =====
+with sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE):
+    while True:
+        if ser.in_waiting > 0:
+            try:
+                msg = ser.readline().decode('utf-8', errors='ignore').strip()
+                if "ON" in msg:
+                    print("\n[Arduino]: 급수 시작")
+                    is_filling = True
+                    filling_start_time = time.time()
+                    calibration_done = False
+                    freq_history, time_history, smoothed_buffer, base_freq_samples = [], [], [], []
+                elif "OFF" in msg:
+                    is_filling = False
+            except: pass
+        time.sleep(0.05)
