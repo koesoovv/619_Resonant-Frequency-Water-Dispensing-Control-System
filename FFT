@@ -1,0 +1,69 @@
+import numpy as np # 배열로 계산
+import matplotlib.pyplot as plt # 그래프
+import pydub # 음원 파일 로드
+from scipy.fft import fft # 고속 푸리에 변환
+import matplotlib.animation as animation # 그래프 실시간 반복
+import threading # 그래프랑 동시에 오디오 재생
+import os # 경로 찾기
+import subprocess # 오디오 재생
+
+FFMPEG_DIR = "C:/ffmpeg/bin" # 디코딩 및 재생 목적, 폴더 있는 경로
+AUDIO_FILE = "C:/Users/user/OneDrive/바탕 화면/동의대/팀플/캡스톤디자인/캡스톤디자인 I/정수기 음원/주파수 분석/beaker/beaker_3-8_3cm.m4a" # 오디오파일 경로
+
+pydub.AudioSegment.converter = os.path.join(FFMPEG_DIR, "ffmpeg.exe") # 디코딩 경로 지정
+                                          
+sound = pydub.AudioSegment.from_file(AUDIO_FILE, format="m4a") # ffmpeg를 pydub에서 처리하고, m4a 파일을 디코딩한 오디오 객체 sound로 저장
+
+sound = sound.set_channels(1) # sound를 모노로 변경, 기존 객체에서 새로 반환
+sample_rate = sound.frame_rate # sound 객체에서 샘플링 주파수 추출
+chunk_size = int(sample_rate * 0.02) # 샘플링 주파수 이용한 프레임 사이즈 지정, 20ms
+full_data = np.array(sound.get_array_of_samples()) # 디코딩된 sound 1차원 시퀀스로 추출 후 넘파이 배열로 변환, 시간 순으로 나열된 배열
+num_frames = len(full_data) // chunk_size # 프레임의 개수
+
+fig, ax = plt.subplots() # fig 전체 창, ax 축
+ax.set_xlim(0, 3000) # x축 범위
+ax.set_ylim(0, 6000) # y축 범위
+
+line, = ax.plot([], [], c='k', lw=1) # 선 객체 미리 생성. 일단 비워둠
+def update_plot(i): # 그래프 실시간 업데이트
+    start = i * chunk_size # i번째 프레임 시작 인덱스
+    end   = start + chunk_size # 항상 일정한 프레임 유지
+
+    if start >= len(full_data):
+        return line, # 범위 넘어가면 갱신하지 않고 반환
+
+    data = full_data[start:end] # 전체 데이터를 프레임 단위로 봄
+    n = len(data) # 프레임 내의 샘플 개수
+    if n == 0:
+        return line, # 프레임 개수가 0이면 갱신하지 않고 반환
+
+    y = fft(data) / n # 프레임 단위로 fft 실행한 결과를 샘플 개수로 나눔 -> 정규화
+    y = np.abs(y[:n // 2]) # 양의 주파수 절반만 선택 (중복 방지), 크기만 남김 (복소수)
+    x = np.linspace(0, sample_rate/2, n//2) # 나이퀴스트를 이용해 주파수 축 생성, 나이퀴스트란 샘플링 주파수에서 중복 없이 표현할 수 있는 최대 주파수
+    line.set_data(x, y) # 선 객체 갱신
+
+    return line,
+
+def play_sound(): # 오디오 재생 용도
+    ffplay_path = os.path.join(FFMPEG_DIR, "ffplay.exe") # ffplay 경로 설정
+    subprocess.Popen(
+        [ffplay_path, "-nodisp", "-autoexit", AUDIO_FILE], # 창 X, 자동 종료
+                                            
+        stdout=subprocess.DEVNULL, # 표준 출력 버림
+        stderr=subprocess.DEVNULL # 오류 출력 버림
+    )
+def show_realtime_fft(): # 실시간으로 그래프 그림
+    fig.canvas.draw() # 그림 그리는 초기화 작업
+    ani = animation.FuncAnimation(
+        fig, # 그릴 곳
+        update_plot, # 프레임 별로 그림
+        frames=num_frames, # 프레임 개수
+        interval=20, # 20ms 간격으로 화면 업데이트
+        blit=True # 바뀐 것만 다시 그리라는 뜻
+    )
+    plt.show() # 출력
+    
+if __name__ == "__main__": # 이 파일을 직접 실행한다면? import 시에는 소리, 창 X
+    sound_thread = threading.Thread(target=play_sound, daemon=True) # 새 스레드 객체 생성, 백그라운드 스레드로 지정
+    sound_thread.start() # 새 스레드 실행, 소리 재생
+    show_realtime_fft() # 메인 스레드로 창 출력, 애니메이션 돌림
