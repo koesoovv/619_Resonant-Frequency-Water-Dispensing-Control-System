@@ -1,125 +1,78 @@
 import numpy as np
-import sounddevice as sd
-import librosa
-import scipy.signal as signal
-import serial
-import time
-from statsmodels.nonparametric.smoothers_lowess import lowess
+import matplotlib.pyplot as plt
+import pydub
+from scipy.fftpack import fft
 
-# ===== 1. 설정 및 파라미터 =====
-PORT = 'COM5'
-BAUD_RATE = 9600
-SOUND_SPEED = 340.0   # 소리의 속도 (m/s)
-STOP_RATIO = 0.85     # 목표 수위 (0.85 = 85% 찼을 때 정지)
+# ===== 1. 설정 및 파일 로드 =====
+# ffmpeg 경로 설정 (사용자 환경 유지)
+pydub.AudioSegment.converter = "C:/ffmpeg/bin/ffmpeg.exe"
 
-IGNORE_DURATION = 2.0  # 초반 Splash 노이즈 무시 (2초)
-CALIBRATION_DURATION = 1.0 # 컵 깊이 측정 시간 (1초)
-AVERAGE_WINDOW = 10    # 구간 평균 데이터 개수
+file_path = "C:/Users/USER/Documents/python/venv/cylinder/kimcapybara.m4a"
 
-SAMPLE_RATE = 44100
-CHUNK_SIZE = int(SAMPLE_RATE * 0.05)
+# 파일을 로드하되, 채널을 1개(Mono)로 합치고 샘플링 레이트를 윈도우 설정(44100)과 맞춥니다.
+target_fs = 44100
+sound = pydub.AudioSegment.from_file(file_path, format="m4a")
+sound = sound.set_channels(1).set_frame_rate(target_fs)
 
-# 상태 관리 변수
-freq_history = []
-time_history = []
-smoothed_buffer = []
-base_freq_samples = [] # 초기 1초간 주파수를 모을 버퍼
+# [핵심 수정] Pydub 객체를 바로 쓰지 않고, 고속 연산을 위해 '숫자 배열(Numpy)'로 변환합니다.
+# 이렇게 하면 ms 단위와 sample 단위가 섞이는 실수를 원천 차단합니다.
+samples = np.array(sound.get_array_of_samples())
 
-is_filling = False
-target_freq = 0        # 계산되어 업데이트될 목표 주파수
-filling_start_time = 0
-calibration_done = False
+# ===== 2. FFT 분석 파라미터 설정 =====
+# 0.02초(20ms) 단위로 쪼개야 그래프가 선명하게 나옵니다.
+chunk_duration = 0.02 
+chunk_size = int(target_fs * chunk_duration)  # 약 882개 샘플
 
-# ===== 2. 시리얼 통신 설정 =====
-try:
-    ser = serial.Serial(PORT, BAUD_RATE, timeout=0.1)
-    time.sleep(2)
-    ser.reset_input_buffer()
-    print(f"[{PORT}] 연결 성공. 시스템 대기 중.")
-except Exception as e:
-    print(f"연결 실패: {e}")
-    exit()
+# 주파수 해상도를 위해 2048 포인트 사용
+nfft = 2048 
 
-# ===== 3. 실시간 신호처리 콜백 =====
-def audio_callback(indata, frames, time_info, status):
-    global freq_history, time_history, smoothed_buffer, is_filling, filling_start_time
-    global base_freq_samples, target_freq, calibration_done
+spectrogram = []
+
+# ===== 3. 고속 FFT 루프 (Numpy Slicing) =====
+# 전체 샘플을 chunk_size 간격으로 건너뛰며 분석
+for i in range(0, len(samples) - chunk_size, chunk_size):
     
-    if not is_filling:
-        return
+    # 해당 구간의 샘플 가져오기
+    chunk = samples[i : i + chunk_size]
+    
+    # [보정] 해밍 윈도우 적용 (신호가 뚝 끊기는 구간의 노이즈를 부드럽게 잡아줌)
+    windowed_chunk = chunk * np.hamming(len(chunk))
+    
+    # FFT 수행
+    Zxx = fft(windowed_chunk, n=nfft)
+    
+    # 유효한 주파수 대역(절반)만 취하고, 복소수를 dB(강도)로 변환
+    # (+ 1e-6은 log(0) 에러 방지용)
+    valid_Zxx = Zxx[:nfft//2]
+    mag = 20 * np.log10(np.abs(valid_Zxx) + 1e-6)
+    
+    spectrogram.append(mag.reshape(-1, 1))
 
-    chunk = indata.flatten().astype(float)
-    if np.max(np.abs(chunk)) < 0.01: return
+# ===== 4. 데이터 합치기 =====
+full_spectrogram = np.concatenate(spectrogram, axis=1)
 
-    try:
-        current_time = time.time()
-        elapsed_time = current_time - filling_start_time
+# ===== 5. 그래프 그리기 =====
+plt.figure(figsize=(12, 8))
 
-        # 1) LPC 및 주파수 피크 탐지
-        a_lpc = librosa.lpc(chunk, order=24)
-        w, h = signal.freqz(1, a_lpc, worN=512)
-        freqs = w * (SAMPLE_RATE / (2 * np.pi))
-        valid_idx = np.where((freqs > 400) & (freqs < 4000))[0]
-        peak_f = freqs[valid_idx[np.argmax(np.abs(h[valid_idx]))]]
+# X축(시간), Y축(주파수) 범위를 정확하게 계산
+time_end = len(samples) / target_fs
+freq_end = target_fs / 2
 
-        # LOESS 평활화 적용
-        freq_history.append(peak_f)
-        time_history.append(current_time)
-        if len(freq_history) < 20: return
-        
-        recent_f = np.array(freq_history[-20:])
-        recent_t = np.array(time_history[-20:])
-        res = lowess(recent_f, recent_t, frac=0.4)
-        current_smoothed_f = res[-1, 1]
+plt.imshow(
+    full_spectrogram,
+    aspect='auto',
+    cmap='inferno',   # 에너지 강도 보기 좋은 색상
+    origin='lower',   # 낮은 주파수가 아래로 오게
+    extent=[0, time_end, 0, freq_end] # [x시작, x끝, y시작, y끝]
+)
 
-        # 2) 상태별 로직 제어
-        # [Phase 1] 초기 2초 무시
-        if elapsed_time < IGNORE_DURATION:
-            print(f"[초기 대기] 노이즈 무시 중... ({elapsed_time:.1f}s)", end='\r')
-        
-        # [Phase 2] 이후 1초간 컵 깊이(기본 주파수) 측정
-        elif elapsed_time < (IGNORE_DURATION + CALIBRATION_DURATION):
-            base_freq_samples.append(current_smoothed_f)
-            print(f"[측정 중] 컵 깊이 분석 중... {current_smoothed_f:.1f} Hz", end='\r')
-        
-        # [Phase 3] 측정 완료 및 목표 설정
-        elif not calibration_done:
-            avg_base_f = np.mean(base_freq_samples)
-            # 수위가 STOP_RATIO만큼 차오를 때의 목표 주파수 계산
-            # F_target = F_base / (1 - STOP_RATIO)
-            target_freq = avg_base_f / (1.0 - STOP_RATIO)
-            calibration_done = True
-            print(f"\n[설정 완료] 기준: {avg_base_f:.1f}Hz -> 목표: {target_freq:.1f}Hz 설정됨.")
+# 보고 싶은 주파수 대역 설정 (0 ~ 8000Hz)
+plt.ylim(0, 8000)
 
-        # [Phase 4] 실시간 감시 및 정지
-        else:
-            smoothed_buffer.append(current_smoothed_f)
-            if len(smoothed_buffer) > AVERAGE_WINDOW: smoothed_buffer.pop(0)
-            avg_f = np.mean(smoothed_buffer)
+plt.xlabel('Time (s)')
+plt.ylabel('Frequency (Hz)')
+plt.title(f'Corrected Spectrogram (Fs={target_fs}Hz)')
+plt.colorbar(label='Intensity (dB)')
 
-            print(f"[분석 중] 현재: {avg_f:.1f}Hz / 목표: {target_freq:.1f}Hz", end='\r')
-
-            if avg_f >= target_freq:
-                print(f"\n[정지] 수위 도달! (계산된 목표치 {target_freq:.1f}Hz 도달)")
-                ser.write(b'0')
-                is_filling = False
-
-    except Exception as e:
-        pass
-
-# ===== 4. 메인 루프 =====
-with sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE):
-    while True:
-        if ser.in_waiting > 0:
-            try:
-                msg = ser.readline().decode('utf-8', errors='ignore').strip()
-                if "ON" in msg:
-                    print("\n[Arduino]: 급수 시작")
-                    is_filling = True
-                    filling_start_time = time.time()
-                    calibration_done = False
-                    freq_history, time_history, smoothed_buffer, base_freq_samples = [], [], [], []
-                elif "OFF" in msg:
-                    is_filling = False
-            except: pass
-        time.sleep(0.05)
+plt.tight_layout()
+plt.show()
