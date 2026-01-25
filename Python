@@ -6,29 +6,33 @@ import time
 import matplotlib.pyplot as plt
 
 # ===== [1. 사용자 설정] =====
-PORT = 'COM5'          # 아두이노 포트
+PORT = 'COM5'
 BAUD_RATE = 9600
 
-# 물리 상수 및 컵 정보
+# [물리 상수]
 SOUND_SPEED = 34300.0   # 소리 속도 (cm/s)
-CUP_DIAMETER = 6      # 컵 지름 (cm)
+
+# [설정] 유량 및 보정
+FLOW_RATE = 21.0        # 펌프 유량 21 mL/s
+END_CORRECTION_K = 0.4  # 관구 보정 계수
+
+# [목표]
 TARGET_AIR_CM = 3.0     # 목표 공기 기둥 높이 (3cm)
 
-# [핵심 수정] 정밀도 대폭 상향
-# 기존 3~5회 -> 10회 연속 감지 시에만 정지 (오작동/조기차단 완전 방지)
-STOP_TRIGGER_COUNT = 13
+# [정밀도]
+STOP_TRIGGER_COUNT = 15 
 
 # 주파수 탐색 범위
 FREQ_MIN_LIMIT = 200     
 FREQ_MAX_LIMIT = 3500    
 
-# [초기 잡음 방지]
-SPLASH_GUARD_TIME = 3.0  
-SPLASH_CEILING = 1000    
+# [시간 설정]
+SPLASH_GUARD_TIME = 2.0    # 2초까지 가드
 
-# 시스템 설정
-IGNORE_DURATION = 1.0       
-CALIBRATION_DURATION = 2.0  
+# [핵심 변경] 계산 종료 시간을 없애고, 계속 보정함
+# 최소한 이 시간 이후부터 제어를 시작한다는 의미로 변경
+CONTROL_START_TIME = 6.0   
+
 SAMPLE_RATE = 44100
 CHUNK_SIZE = 4096           
 
@@ -36,18 +40,22 @@ CHUNK_SIZE = 4096
 history_time = [] 
 history_freq = [] 
 
+# 너비 계산용 버퍼
+reg_time_buffer = []      
+reg_inv_freq_buffer = []  
+width_candidates = []       
+
 # 상태 변수
 freq_buffer = []
-full_audio_buffer = []
 is_filling = False
 filling_start_time = 0
-calibration_done = False
-target_freq = 0
+calibration_done = False # 이제 이 변수는 '최소 데이터 확보됨'을 의미
 
-# 제어용 변수
+target_freq = 0
+current_diameter = 0        
 last_tracked_freq = 0       
 consecutive_loss_count = 0 
-consecutive_stop_hits = 0   # 목표 도달 카운트
+consecutive_stop_hits = 0 
 
 # 아두이노 연결
 ser = None
@@ -59,25 +67,21 @@ try:
 except:
     print("아두이노 연결 실패 (테스트 모드)")
 
-# ===== [2. 스마트 주파수 추적 (알고리즘 유지)] =====
+# ===== [2. 스마트 주파수 추적] =====
 def get_smart_frequency(chunk, rate, last_freq, current_ceiling):
-    # 1. 필터링
     sos = signal.butter(4, 200, 'hp', fs=rate, output='sos')
     filtered_chunk = signal.sosfilt(sos, chunk)
     
-    # 2. FFT
     windowed = filtered_chunk * np.hamming(len(chunk))
     fft_val = np.abs(np.fft.rfft(windowed))
     freqs = np.fft.rfftfreq(len(chunk), d=1/rate)
     
-    # 3. 범위 제한
     mask = (freqs >= FREQ_MIN_LIMIT) & (freqs <= current_ceiling)
     valid_freqs = freqs[mask]
     valid_mag = fft_val[mask]
     
     if len(valid_mag) == 0: return 0
 
-    # 4. 피크 찾기
     peaks, _ = signal.find_peaks(valid_mag, prominence=np.max(valid_mag)*0.15, distance=20)
     
     if len(peaks) == 0: return 0
@@ -85,11 +89,9 @@ def get_smart_frequency(chunk, rate, last_freq, current_ceiling):
     peak_freqs = valid_freqs[peaks]
     peak_mags = valid_mag[peaks]
 
-    # 추적 로직 (연속성 + 기본음 우선)
     if last_freq > 0:
         lower_bound = last_freq - 50
         upper_bound = last_freq + 400
-        
         candidates_mask = (peak_freqs >= lower_bound) & (peak_freqs <= upper_bound)
         cand_freqs = peak_freqs[candidates_mask]
         cand_mags = peak_mags[candidates_mask]
@@ -108,23 +110,22 @@ def get_smart_frequency(chunk, rate, last_freq, current_ceiling):
 
 # ===== [3. 오디오 처리 및 제어] =====
 def audio_callback(indata, frames, time_info, status):
-    global is_filling, filling_start_time, calibration_done, target_freq
-    global freq_buffer, full_audio_buffer
+    global is_filling, filling_start_time, calibration_done
+    global target_freq, current_diameter
+    global freq_buffer, reg_time_buffer, reg_inv_freq_buffer, width_candidates
     global history_time, history_freq
     global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
     
     if not is_filling: return
 
     chunk = indata.flatten().astype(float)
-    full_audio_buffer.append(chunk)
-
     if np.max(np.abs(chunk)) < 0.01: return
 
     try:
         elapsed = time.time() - filling_start_time
         
         if elapsed < SPLASH_GUARD_TIME:
-            current_ceil = SPLASH_CEILING 
+            current_ceil = 1000 
         else:
             current_ceil = FREQ_MAX_LIMIT
 
@@ -145,64 +146,82 @@ def audio_callback(indata, frames, time_info, status):
         history_time.append(elapsed)
         history_freq.append(detected_f)
 
-        # 현재 공기 기둥 높이 역산
-        current_air_height = (SOUND_SPEED / (4 * stable_f)) - (0.3 * CUP_DIAMETER)
+        # ---------------------------------------------------------
+        # [데이터 수집 & 실시간 너비 보정]
+        # ---------------------------------------------------------
+        # 2초 이후부터 멈추기 전까지 계속 데이터를 모으고 계산합니다.
+        if elapsed > SPLASH_GUARD_TIME:
+            reg_time_buffer.append(elapsed)
+            reg_inv_freq_buffer.append(1.0 / stable_f)
+            
+            # 데이터가 10개 이상 쌓이면 계산 시작
+            if len(reg_time_buffer) > 10:
+                # 전체 데이터를 이용해 기울기 계산 (데이터가 많을수록 정확해짐)
+                s_a, _ = np.polyfit(reg_time_buffer, reg_inv_freq_buffer, 1)
+                abs_a = abs(s_a)
+                
+                if abs_a > 1e-9:
+                    # 현재 시점까지의 데이터로 너비 계산
+                    temp_D = np.sqrt((16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs_a))
+                    
+                    # 이상한 값 필터링
+                    if 1.0 < temp_D < 20.0:
+                        # [핵심] 너비를 계속 업데이트 (누적 평균 방식)
+                        if current_diameter == 0:
+                            current_diameter = temp_D
+                        else:
+                            # 기존 값 95% + 새 값 5% (급격한 변화 방지)
+                            current_diameter = (current_diameter * 0.95) + (temp_D * 0.05)
+                        
+                        # 목표 주파수도 실시간으로 바꿈
+                        target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)
+                        target_freq = SOUND_SPEED / (4 * target_L_effective)
+                        
+                        calibration_done = True # 제어 시작 가능 상태
 
-        # --- 제어 로직 ---
-        if elapsed < IGNORE_DURATION:
-            print(f"[대기] 안정화 중... {stable_f:.0f}Hz", end='\r')
-            last_tracked_freq = stable_f
+        # ---------------------------------------------------------
+        # [제어 로직] (6초 이후부터 작동)
+        # ---------------------------------------------------------
+        if elapsed > CONTROL_START_TIME and calibration_done:
+            current_air = (SOUND_SPEED / (4 * stable_f)) - (END_CORRECTION_K * current_diameter)
             
-        elif elapsed < (IGNORE_DURATION + CALIBRATION_DURATION):
-            print(f"[측정] 초기 높이 계산 중: {current_air_height:.1f} cm ({stable_f:.0f}Hz)", end='\r')
-            
-        elif not calibration_done:
-            target_L_effective = TARGET_AIR_CM + (0.3 * CUP_DIAMETER)
-            target_freq = SOUND_SPEED / (4 * target_L_effective)
-            calibration_done = True
-            
-            print(f"\n===== [설정 완료] =====")
-            print(f" - 초기 공기 높이 : {current_air_height:.1f} cm")
-            print(f" - 목표 주파수   : {target_freq:.0f} Hz (남은공간 3cm)")
-            print(f" - 정지 조건     : 목표치 {STOP_TRIGGER_COUNT}회 연속 감지 시")
-            print(f"=======================")
-            
-        else:
-            # [핵심] 10회 연속 도달 체크
             if stable_f >= target_freq:
                 consecutive_stop_hits += 1
             else:
-                consecutive_stop_hits = 0 # 한 번이라도 떨어지면 리셋 (아주 엄격하게)
+                if consecutive_stop_hits > 0:
+                    consecutive_stop_hits -= 1
 
-            # 상태바 출력 (카운트 상태 표시)
-            # 진행률을 시각적으로 보여줌: [#####-----]
-            progress_bar = "#" * consecutive_stop_hits + "-" * (STOP_TRIGGER_COUNT - consecutive_stop_hits)
+            bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)
+            progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len)
             
-            status_msg = f"[주입 중] {stable_f:.0f}Hz ({current_air_height:.1f}cm) | 확신도: [{progress_bar}]"
-            print(status_msg, end='\r')
+            # 화면 표시
+            print(f"[제어] D:{current_diameter:.2f}cm | {stable_f:.0f}Hz / {target_freq:.0f}Hz | 확신:[{progress_bar}]", end='\r')
 
-            # 정지 명령
             if consecutive_stop_hits >= STOP_TRIGGER_COUNT:
-                print(f"\n\n[완료] 목표 높이 정확히 도달! ({stable_f:.0f}Hz 유지됨)")
-                print(">>> 밸브 잠금 (STOP)")
+                print(f"\n\n[완료] 목표 도달! 밸브 잠금.")
+                print(f"최종 계산된 너비: {current_diameter:.4f} cm")
                 if ser: ser.write(b'0')
                 is_filling = False
                 plot_result()
+        
+        elif elapsed <= CONTROL_START_TIME and calibration_done:
+             print(f"[보정 중] D:{current_diameter:.2f}cm (데이터 수집: {len(reg_time_buffer)}개)", end='\r')
+
 
     except Exception as e:
         print(f"Error: {e}")
 
 # ===== [4. 결과 그래프] =====
 def plot_result():
-    if not history_time:
-        print("데이터 없음")
-        return
+    if not history_time: return
     plt.figure(figsize=(10, 6))
+    
     plt.scatter(history_time, history_freq, c='blue', alpha=0.5, s=15, label='Detected Freq')
+    
     if target_freq > 0:
         plt.axhline(y=target_freq, color='r', linestyle='--', label=f'Target ({target_freq:.0f}Hz)')
-    plt.axvline(x=SPLASH_GUARD_TIME, color='green', linestyle=':', label='Splash Guard End')
-    plt.title("High-Precision Water Level Control")
+        
+    plt.title(f"Result (Flow:{FLOW_RATE}, Final D:{current_diameter:.2f}cm)")
     plt.xlabel("Time (s)")
     plt.ylabel("Frequency (Hz)")
     plt.legend()
@@ -212,21 +231,29 @@ def plot_result():
 # ===== [5. 메인 루프] =====
 try:
     with sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE):
-        print("\n[준비] 아두이노 ON 버튼을 누르면 시작됩니다.")
+        print("\n[준비] 아두이노 ON 버튼 대기중...")
+        print(f"[설정] 유량: {FLOW_RATE} mL/s | 동적 보정 모드")
+        
         while True:
             if ser and ser.in_waiting:
                 msg = ser.readline().decode().strip()
                 if "ON" in msg:
                     is_filling = True
                     filling_start_time = time.time()
+                    
                     calibration_done = False
                     freq_buffer = []
-                    full_audio_buffer = []
+                    reg_time_buffer = []      
+                    reg_inv_freq_buffer = []
+                    width_candidates = [] 
+                    
                     history_time = [] 
                     history_freq = [] 
                     last_tracked_freq = 0
                     consecutive_stop_hits = 0
-                    print("\n>>> 물 주입 시작!")
+                    current_diameter = 0      
+                    
+                    print("\n>>> 물 주입 시작! (실시간으로 너비를 보정합니다)")
                 elif "OFF" in msg:
                     if is_filling:
                         is_filling = False
