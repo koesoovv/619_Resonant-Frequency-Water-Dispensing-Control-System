@@ -1,21 +1,54 @@
-const int SOLENOID_PIN = 7; 
+const int SOLENOID_PIN = 7;        // 솔레노이드 제어 핀 (D7)
+const int SW_ON_PIN    = 3;        // ON 스위치 (D3)
+const int SW_OFF_PIN   = 5;        // OFF 스위치 (D5)
+
+bool solenoidOn = false;           // 현재 솔밸브 상태
+
+void solenoidOnSet() {
+  digitalWrite(SOLENOID_PIN, HIGH);     // 솔밸브 ON
+  solenoidOn = true;                   // 상태 갱신
+  Serial.println("STATUS:ON");          // 파이썬 인식을 위한 상태 전송
+}
+
+void solenoidOffSet() {
+  digitalWrite(SOLENOID_PIN, LOW);      // 솔밸브 OFF
+  solenoidOn = false;                  // 상태 갱신
+  Serial.println("STATUS:OFF");         // 파이썬 인식을 위한 상태 전송
+}
 
 void setup() {
-  pinMode(SOLENOID_PIN, OUTPUT);
-  digitalWrite(SOLENOID_PIN, LOW);
-  Serial.begin(9600); // 파이썬과 속도를 맞춰야 함
+  pinMode(SOLENOID_PIN, OUTPUT);        // D7 출력
+  digitalWrite(SOLENOID_PIN, LOW);      // 초기 OFF
+
+  pinMode(SW_ON_PIN, INPUT_PULLUP);     // D3 버튼(누르면 LOW)
+  pinMode(SW_OFF_PIN, INPUT_PULLUP);    // D5 버튼(누르면 LOW)
+
+  Serial.begin(9600);                   // 시리얼 시작
 }
 
 void loop() {
+  // ===== 1. 물리 스위치 입력 제어 =====
+  if (digitalRead(SW_ON_PIN) == LOW) {              // D3 눌림
+    solenoidOnSet();
+    delay(200);                                     // 디바운싱
+    while (digitalRead(SW_ON_PIN) == LOW) {}        // 버튼 뗄 때까지 대기
+  }
+
+  if (digitalRead(SW_OFF_PIN) == LOW) {             // D5 눌림
+    solenoidOffSet();
+    delay(200);                                     // 디바운싱
+    while (digitalRead(SW_OFF_PIN) == LOW) {}        // 버튼 뗄 때까지 대기
+  }
+
+  // ===== 2. 파이썬 시리얼 명령 제어 (기존 '1', '0' 유지) =====
   if (Serial.available() > 0) {
     char cmd = Serial.read();
-    if (cmd == '1') {
-      digitalWrite(SOLENOID_PIN, HIGH);
-      Serial.println("OK: VALVE OPEN");
-    } 
-    else if (cmd == '0') {
-      digitalWrite(SOLENOID_PIN, LOW);
-      Serial.println("OK: VALVE CLOSED");
+
+    if (cmd == '1') {          // 파이썬에서 '1' 전송 시
+      solenoidOnSet();
+    }
+    else if (cmd == '0') {     // 파이썬에서 '0' 전송 시
+      solenoidOffSet();
     }
   }
 }
