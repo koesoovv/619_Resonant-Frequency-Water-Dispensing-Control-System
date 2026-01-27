@@ -1,78 +1,87 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import pydub
-from scipy.fftpack import fft
+2. Spectrogram
 
-# ===== 1. 설정 및 파일 로드 =====
-# ffmpeg 경로 설정 (사용자 환경 유지)
+import numpy as np                          # 수치 계산 및 배열 처리용
+import matplotlib.pyplot as plt             # 스펙트로그램 시각화용
+import pydub                                # 오디오 파일 로드 및 분할용
+from scipy.fftpack import fft               # FFT(고속 푸리에 변환) 함수
+
+# ===== m4a 파일 로드 설정 =====
 pydub.AudioSegment.converter = "C:/ffmpeg/bin/ffmpeg.exe"
+                                           # pydub이 내부적으로 사용할 ffmpeg 실행 파일 경로 지정
 
-file_path = "C:/Users/USER/Documents/python/venv/cylinder/kimcapybara.m4a"
+sound = pydub.AudioSegment.from_file(
+    "C:/Users/user/OneDrive/바탕 화면/동의대/팀플/캡스톤디자인/캡스톤디자인 I/정수기 음원/주파수 분석/cylinder/Cylinder_3-8_4cm.m4a",
+    format="m4a"
+)
+                                           # m4a 오디오 파일을 AudioSegment 객체로 로드
 
-# 파일을 로드하되, 채널을 1개(Mono)로 합치고 샘플링 레이트를 윈도우 설정(44100)과 맞춥니다.
-target_fs = 44100
-sound = pydub.AudioSegment.from_file(file_path, format="m4a")
-sound = sound.set_channels(1).set_frame_rate(target_fs)
+# ===== 샘플링 주파수 =====
+sample_rate = sound.frame_rate             # 오디오 샘플링 주파수(fs), 예: 44100 Hz
 
-# [핵심 수정] Pydub 객체를 바로 쓰지 않고, 고속 연산을 위해 '숫자 배열(Numpy)'로 변환합니다.
-# 이렇게 하면 ms 단위와 sample 단위가 섞이는 실수를 원천 차단합니다.
-samples = np.array(sound.get_array_of_samples())
+# ===== chunk_size 설정 =====
+chunk_size = int(sample_rate * 5 / len(sound))
+                                           # 오디오 전체 길이(len(sound)는 ms 단위)에 비례한 chunk 크기
+                                           # 시간 해상도를 맞추기 위한 경험적 설정
+                                           # ⚠ 물리적으로 직관적인 값(20ms 등)은 아님
 
-# ===== 2. FFT 분석 파라미터 설정 =====
-# 0.02초(20ms) 단위로 쪼개야 그래프가 선명하게 나옵니다.
-chunk_duration = 0.02 
-chunk_size = int(target_fs * chunk_duration)  # 약 882개 샘플
+# ===== FFT 파라미터 =====
+nfft = 512                                 # FFT 포인트 수 (zero-padding 포함)
 
-# 주파수 해상도를 위해 2048 포인트 사용
-nfft = 2048 
+spectrogram = []                           # 시간별 FFT 결과를 저장할 리스트
 
-spectrogram = []
-
-# ===== 3. 고속 FFT 루프 (Numpy Slicing) =====
-# 전체 샘플을 chunk_size 간격으로 건너뛰며 분석
-for i in range(0, len(samples) - chunk_size, chunk_size):
+# ===== chunk 단위로 FFT 계산 =====
+for i in range(0, len(sound), chunk_size): # 전체 오디오를 chunk_size(ms) 간격으로 순회
     
-    # 해당 구간의 샘플 가져오기
-    chunk = samples[i : i + chunk_size]
+    chunk = sound[i:i+chunk_size]          # i번째 시간 구간의 오디오 조각 추출
     
-    # [보정] 해밍 윈도우 적용 (신호가 뚝 끊기는 구간의 노이즈를 부드럽게 잡아줌)
-    windowed_chunk = chunk * np.hamming(len(chunk))
+    samples = chunk.get_array_of_samples() # AudioSegment → PCM 샘플 배열(int16 등)
     
-    # FFT 수행
-    Zxx = fft(windowed_chunk, n=nfft)
+    Zxx = fft(samples, n=nfft)             # FFT 수행 (nfft 길이로 zero-padding 포함)
     
-    # 유효한 주파수 대역(절반)만 취하고, 복소수를 dB(강도)로 변환
-    # (+ 1e-6은 log(0) 에러 방지용)
-    valid_Zxx = Zxx[:nfft//2]
-    mag = 20 * np.log10(np.abs(valid_Zxx) + 1e-6)
+    Zxx = 20 * np.log10(np.abs(Zxx) + 1e-6) * 4
+                                           # FFT 복소값 → 크기(abs)
+                                           # log10으로 dB 스케일 변환
+                                           # 1e-6: log(0) 방지
+                                           # *4: 시각적 대비를 키우기 위한 임의 스케일
     
-    spectrogram.append(mag.reshape(-1, 1))
+    spectrogram.append(Zxx.reshape(-1, 1)) # FFT 결과를 세로 벡터 형태로 저장
+                                           # 시간축 방향으로 이어붙이기 위함
 
-# ===== 4. 데이터 합치기 =====
+# ===== 스펙트로그램 이어붙이기 =====
 full_spectrogram = np.concatenate(spectrogram, axis=1)
+                                           # [주파수 × 시간] 형태의 2차원 배열 생성
 
-# ===== 5. 그래프 그리기 =====
-plt.figure(figsize=(12, 8))
+# ===== 관심 주파수 대역 선택 =====
+freq_min = 0                               # 최소 주파수(Hz)
+freq_max = 8000                            # 최대 주파수(Hz)
 
-# X축(시간), Y축(주파수) 범위를 정확하게 계산
-time_end = len(samples) / target_fs
-freq_end = target_fs / 2
+freq_min_index = int(freq_min / (sample_rate / 2) * (nfft // 2))
+                                           # freq_min(Hz)을 FFT 인덱스로 변환
+
+freq_max_index = int(freq_max / (sample_rate / 2) * (nfft // 2))
+                                           # freq_max(Hz)을 FFT 인덱스로 변환
+
+selected_spectrogram = full_spectrogram[
+    freq_min_index:freq_max_index
+]
+                                           # 관심 주파수 대역만 슬라이싱
+
+# ===== 스펙트로그램 시각화 =====
+plt.figure(figsize=(10, 6))                # 그래프 크기 설정
 
 plt.imshow(
-    full_spectrogram,
-    aspect='auto',
-    cmap='inferno',   # 에너지 강도 보기 좋은 색상
-    origin='lower',   # 낮은 주파수가 아래로 오게
-    extent=[0, time_end, 0, freq_end] # [x시작, x끝, y시작, y끝]
+    selected_spectrogram,                 # 표시할 스펙트로그램 데이터
+    aspect='auto',                        # 시간/주파수 비율 자동 조정
+    cmap='inferno',                       # 색상 맵(에너지 강조에 적합)
+    extent=[0, len(sound) / 1000,          # x축: 시간 (ms → s 변환)
+            freq_min, freq_max],           # y축: 주파수 (Hz)
+    origin='lower'                         # 저주파가 아래쪽에 오도록 설정
 )
 
-# 보고 싶은 주파수 대역 설정 (0 ~ 8000Hz)
-plt.ylim(0, 8000)
+plt.xlabel('Time (s)')                     # x축 라벨
+plt.ylabel('Frequency (Hz)')               # y축 라벨
+plt.title('Mess_cylinder_FFT_Spectrogram') # 그래프 제목
 
-plt.xlabel('Time (s)')
-plt.ylabel('Frequency (Hz)')
-plt.title(f'Corrected Spectrogram (Fs={target_fs}Hz)')
-plt.colorbar(label='Intensity (dB)')
+plt.colorbar(label='Intensity (dB)')       # 색상바(에너지 크기)
 
-plt.tight_layout()
-plt.show()
+plt.show()                                 # 스펙트로그램 출력
