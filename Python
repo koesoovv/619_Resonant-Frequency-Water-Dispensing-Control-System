@@ -4,9 +4,16 @@ import scipy.signal as signal                                    # 필터/피크
 import serial                                                    # 아두이노 시리얼 통신(pyserial)
 import time                                                      # 시간 처리
 import threading                                                 # 백그라운드 스레드
-import tkinter as tk                                             # GUI
-from tkinter import ttk                                          # GUI 위젯
-import matplotlib.pyplot as plt                                  # 결과 그래프
+import matplotlib                                                # matplotlib 본체
+
+# ===== customtkinter (카페 키오스크 UI) =====
+# 설치: pip install customtkinter pillow matplotlib               # pillow도 필요(이미지)
+import customtkinter as ctk                                      # modern tkinter
+from PIL import Image                                            # 이미지 로드(Pillow)
+
+# ===== matplotlib GUI 임베딩(TkAgg) =====
+from matplotlib.figure import Figure                             # GUI용 Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg   # Tk에 그래프 넣기
 
 # ===== [1. 사용자 설정] =====
 PORT = 'COM17'                                                   # 아두이노 포트
@@ -30,6 +37,21 @@ CONTROL_START_TIME = 6.0                                         # 제어 시작
 SAMPLE_RATE = 44100                                              # 샘플레이트
 CHUNK_SIZE = 4096                                                # 콜백 블록 크기
 
+# ===== [로고 설정] =====
+LOGO_PATH = r"C:/Users/user/OneDrive/바탕 화면/동의대/팀플/캡스톤디자인/캡스톤디자인 I/정수기 음원/DEU.png"
+LOGO_SIZE = (75, 75)
+
+# ===== [창 위치/크기 고정 설정] =====
+WIN_W = 720                                                      # 창 가로(px)
+WIN_H = 900                                                      # 창 세로(px)
+WIN_X = 80                                                       # 좌상단 x(px)
+WIN_Y = 40                                                       # 좌상단 y(px)
+USE_CENTER = False                                               # True=중앙, False=고정
+
+# ===== [그래프 설정] =====
+PLOT_UPDATE_MS = 200                                             # 그래프 갱신 주기(ms)
+PLOT_MAX_POINTS = 2000                                           # 너무 많으면 느려서 제한(최근 N개만)
+
 # ===== [2. 데이터/상태 변수] =====
 history_time = []                                                # 기록 시간
 history_freq = []                                                # 기록 주파수
@@ -48,7 +70,7 @@ last_tracked_freq = 0.0                                          # 마지막 추
 consecutive_loss_count = 0                                       # 추적 실패 카운트
 consecutive_stop_hits = 0                                        # 정지 확신 카운트
 
-request_plot = False                                             # 그래프 요청 플래그(콜백->메인/GUI)
+request_plot = False                                             # (이제 GUI 내 실시간이므로 거의 불필요)
 last_stable_f = 0.0                                              # UI 표시용 안정 주파수
 last_current_air = 0.0                                           # UI 표시용 공기층(cm)
 
@@ -58,366 +80,321 @@ audio_stream = None                                              # 오디오 스
 lock = threading.Lock()                                          # 스레드 공유 보호용 락
 
 # ===== [터미널 출력 제어] =====
-last_print_time = 0.0                                            # (추가) 마지막 터미널 출력 시각
-PRINT_INTERVAL = 0.10                                             # (추가) 0.1초마다 한 번만 출력
+last_print_time = 0.0
+PRINT_INTERVAL = 0.10
 
 # ===== [3. 시리얼 연결] =====
-def connect_serial(port: str, baud: int) -> bool:                # 시리얼 연결 함수
-    global ser                                                   # 전역 시리얼 객체 사용
-    try:                                                         # 예외 처리 시작
-        ser = serial.Serial(port, baud, timeout=0.1)             # 포트 오픈
-        time.sleep(2)                                            # 아두이노 리셋 대기
-        ser.reset_input_buffer()                                 # 입력 버퍼 초기화
-        print(f"[{port}] 아두이노 연결 성공.")                    # (추가) 터미널 출력
-        return True                                              # 성공 반환
-    except Exception:                                            # 실패 시
-        ser = None                                               # 테스트 모드
-        print(f"[{port}] 아두이노 연결 실패 (테스트 모드).")       # (추가) 터미널 출력
-        return False                                             # 실패 반환
+def connect_serial(port: str, baud: int) -> bool:
+    global ser
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+        time.sleep(2)
+        ser.reset_input_buffer()
+        print(f"[{port}] 아두이노 연결 성공.")
+        return True
+    except Exception:
+        ser = None
+        print(f"[{port}] 아두이노 연결 실패 (테스트 모드).")
+        return False
 
-def serial_write(b: bytes) -> None:                              # 안전 전송
-    if ser is None:                                              # 시리얼 없으면 종료
-        return                                                   # 리턴
-    try:                                                         # 예외 처리
-        ser.write(b)                                             # 바이트 전송
-    except Exception:                                            # 전송 실패
-        return                                                   # 무시
+def serial_write(b: bytes) -> None:
+    if ser is None:
+        return
+    try:
+        ser.write(b)
+    except Exception:
+        return
 
 # ===== [4. 시작/정지 상태 초기화] =====
-def start_filling_local() -> None:                               # 주입 시작(로컬)
-    global is_filling, filling_start_time                        # 전역 사용
-    global calibration_done, freq_buffer                          # 전역 사용
-    global reg_time_buffer, reg_inv_freq_buffer                    # 전역 사용
-    global history_time, history_freq                              # 전역 사용
-    global last_tracked_freq, consecutive_stop_hits                # 전역 사용
-    global consecutive_loss_count                                  # 전역 사용
-    global current_diameter, target_freq                           # 전역 사용
-    global request_plot, last_stable_f, last_current_air           # 전역 사용
-    global last_print_time                                         # (추가) 출력 타이머
+def start_filling_local() -> None:
+    global is_filling, filling_start_time
+    global calibration_done, freq_buffer
+    global reg_time_buffer, reg_inv_freq_buffer
+    global history_time, history_freq
+    global last_tracked_freq, consecutive_stop_hits
+    global consecutive_loss_count
+    global current_diameter, target_freq
+    global request_plot, last_stable_f, last_current_air
+    global last_print_time
 
-    with lock:                                                   # 락으로 보호
-        is_filling = True                                        # 주입 상태 ON
-        filling_start_time = time.time()                         # 시작 시각 기록
+    with lock:
+        is_filling = True
+        filling_start_time = time.time()
 
-        calibration_done = False                                 # 보정 상태 초기화
-        freq_buffer = []                                         # 안정화 버퍼 초기화
-        reg_time_buffer = []                                     # 회귀 시간 초기화
-        reg_inv_freq_buffer = []                                 # 회귀 1/f 초기화
+        calibration_done = False
+        freq_buffer = []
+        reg_time_buffer = []
+        reg_inv_freq_buffer = []
 
-        history_time = []                                        # 기록 초기화
-        history_freq = []                                        # 기록 초기화
+        history_time = []
+        history_freq = []
 
-        last_tracked_freq = 0.0                                  # 추적 초기화
-        consecutive_loss_count = 0                                # 실패 카운트 초기화
-        consecutive_stop_hits = 0                                 # 정지 확신 초기화
+        last_tracked_freq = 0.0
+        consecutive_loss_count = 0
+        consecutive_stop_hits = 0
 
-        current_diameter = 0.0                                   # 지름 초기화
-        target_freq = 0.0                                        # 목표 주파수 초기화
+        current_diameter = 0.0
+        target_freq = 0.0
 
-        request_plot = False                                     # 그래프 요청 초기화
-        last_stable_f = 0.0                                      # UI값 초기화
-        last_current_air = 0.0                                   # UI값 초기화
+        request_plot = False
+        last_stable_f = 0.0
+        last_current_air = 0.0
 
-        last_print_time = 0.0                                    # (추가) 출력 타이머 초기화
+        last_print_time = 0.0
 
-    print("\n>>> 물 주입 시작! (실시간 너비 보정 모드)")           # (추가) 터미널 출력
+    print("\n>>> 물 주입 시작! (실시간 너비 보정 모드)")
 
-def stop_filling_local(plot_after: bool) -> None:                # 주입 종료(로컬)
-    global is_filling, request_plot                               # 전역 사용
-    with lock:                                                   # 락
-        is_filling = False                                       # 주입 OFF
-        if plot_after:                                           # 그래프 띄울지
-            request_plot = True                                  # 요청 플래그 ON
-    print("\n>>> 물 주입 종료.")                                   # (추가) 터미널 출력
+def stop_filling_local(plot_after: bool) -> None:
+    global is_filling, request_plot
+    with lock:
+        is_filling = False
+        if plot_after:
+            request_plot = True
+    print("\n>>> 물 주입 종료.")
 
 # ===== [5. 스마트 주파수 추적] =====
-def get_smart_frequency(chunk, rate, last_freq, current_ceiling): # 주파수 추적 함수
-    sos = signal.butter(4, 200, 'hp', fs=rate, output='sos')      # 200Hz HPF 설계
-    filtered_chunk = signal.sosfilt(sos, chunk)                  # 필터 적용
+def get_smart_frequency(chunk, rate, last_freq, current_ceiling):
+    sos = signal.butter(4, 200, 'hp', fs=rate, output='sos')
+    filtered_chunk = signal.sosfilt(sos, chunk)
 
-    windowed = filtered_chunk * np.hamming(len(chunk))           # 해밍 윈도잉
-    fft_val = np.abs(np.fft.rfft(windowed))                      # FFT 크기값
-    freqs = np.fft.rfftfreq(len(chunk), d=1/rate)                # 주파수 축
+    windowed = filtered_chunk * np.hamming(len(chunk))
+    fft_val = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(len(chunk), d=1/rate)
 
-    mask = (freqs >= FREQ_MIN_LIMIT) & (freqs <= current_ceiling)# 관심 대역 마스크
-    valid_freqs = freqs[mask]                                    # 유효 주파수
-    valid_mag = fft_val[mask]                                    # 유효 스펙트럼
+    mask = (freqs >= FREQ_MIN_LIMIT) & (freqs <= current_ceiling)
+    valid_freqs = freqs[mask]
+    valid_mag = fft_val[mask]
 
-    if len(valid_mag) == 0:                                      # 데이터 없으면
-        return 0                                                 # 0 반환
+    if len(valid_mag) == 0:
+        return 0
 
-    peaks, _ = signal.find_peaks(                                # 피크 탐색
-        valid_mag,                                                # 스펙트럼
-        prominence=np.max(valid_mag) * 0.15,                      # 최소 prominence
-        distance=20                                               # 피크 간격
+    peaks, _ = signal.find_peaks(
+        valid_mag,
+        prominence=np.max(valid_mag) * 0.15,
+        distance=20
     )
+    if len(peaks) == 0:
+        return 0
 
-    if len(peaks) == 0:                                          # 피크 없으면
-        return 0                                                 # 0 반환
+    peak_freqs = valid_freqs[peaks]
+    peak_mags = valid_mag[peaks]
 
-    peak_freqs = valid_freqs[peaks]                              # 피크 주파수들
-    peak_mags = valid_mag[peaks]                                 # 피크 크기들
-
-    if last_freq > 0:                                            # 추적 중이면
-        lower_bound = last_freq - 50                             # 하한
-        upper_bound = last_freq + 400                            # 상한
+    if last_freq > 0:
+        lower_bound = last_freq - 50
+        upper_bound = last_freq + 400
         candidates_mask = (peak_freqs >= lower_bound) & (peak_freqs <= upper_bound)
-        cand_freqs = peak_freqs[candidates_mask]                 # 후보 주파수
-        cand_mags = peak_mags[candidates_mask]                   # 후보 크기
-
-        if len(cand_freqs) > 0:                                  # 후보 있으면
-            return float(cand_freqs[np.argmax(cand_mags)])        # 가장 강한 후보
-        return 0                                                 # 후보 없으면 0
-    else:                                                        # 초기 탐색이면
-        strong_mask = peak_mags > (np.max(peak_mags) * 0.5)       # 강한 피크 마스크
-        strong_freqs = peak_freqs[strong_mask]                   # 강한 주파수들
-        if len(strong_freqs) > 0:                                # 강한 피크 있으면
-            return float(np.min(strong_freqs))                    # 가장 낮은 강피크
-        return float(peak_freqs[np.argmax(peak_mags)])            # 최강 피크
-
-# ===== [6. 결과 그래프] =====
-def plot_result():                                               # 결과 플롯 함수
-    global history_time, history_freq                             # 전역 사용
-    global target_freq, current_diameter                          # 전역 사용
-    if not history_time:                                          # 기록 없으면
-        return                                                    # 종료
-    plt.figure(figsize=(10, 6))                                   # 그림 생성
-    plt.scatter(history_time, history_freq, alpha=0.5, s=15, label='Detected Freq')  # 산점도
-    if target_freq > 0:                                           # 목표 주파수 있으면
-        plt.axhline(y=target_freq, linestyle='--', label=f'Target ({target_freq:.0f}Hz)')  # 목표선
-    plt.title(f"결과 (유량:{FLOW_RATE} mL/s, 최종 D:{current_diameter:.2f} cm)")      # (한글)
-    plt.xlabel("시간 (s)")                                        # (한글)
-    plt.ylabel("주파수 (Hz)")                                     # (한글)
-    plt.legend()                                                  # 범례
-    plt.grid(True, alpha=0.3)                                     # 그리드
-    plt.show()                                                    # 표시
+        cand_freqs = peak_freqs[candidates_mask]
+        cand_mags = peak_mags[candidates_mask]
+        if len(cand_freqs) > 0:
+            return float(cand_freqs[np.argmax(cand_mags)])
+        return 0
+    else:
+        strong_mask = peak_mags > (np.max(peak_mags) * 0.5)
+        strong_freqs = peak_freqs[strong_mask]
+        if len(strong_freqs) > 0:
+            return float(np.min(strong_freqs))
+        return float(peak_freqs[np.argmax(peak_mags)])
 
 # ===== [7. 오디오 콜백] =====
-def audio_callback(indata, frames, time_info, status):            # 오디오 콜백
-    global is_filling, filling_start_time, calibration_done        # 전역
-    global target_freq, current_diameter                           # 전역
-    global freq_buffer, reg_time_buffer, reg_inv_freq_buffer       # 전역
-    global history_time, history_freq                               # 전역
-    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits  # 전역
-    global request_plot, last_stable_f, last_current_air           # 전역
-    global last_print_time                                         # (추가) 출력 타이머
+def audio_callback(indata, frames, time_info, status):
+    global is_filling, filling_start_time, calibration_done
+    global target_freq, current_diameter
+    global freq_buffer, reg_time_buffer, reg_inv_freq_buffer
+    global history_time, history_freq
+    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
+    global request_plot, last_stable_f, last_current_air
+    global last_print_time
 
-    with lock:                                                    # 락
-        if not is_filling:                                        # 주입 아니면
-            return                                                # 바로 리턴
+    with lock:
+        if not is_filling:
+            return
 
-    chunk = indata.flatten().astype(float)                         # 1채널 배열
-    if np.max(np.abs(chunk)) < 0.01:                               # 신호 너무 작으면
-        return                                                    # 무시
+    chunk = indata.flatten().astype(float)
+    if np.max(np.abs(chunk)) < 0.01:
+        return
 
-    try:                                                          # 예외 시작
-        with lock:                                                # 락
-            elapsed = time.time() - filling_start_time             # 경과시간
+    try:
+        with lock:
+            elapsed = time.time() - filling_start_time
 
-        if elapsed < SPLASH_GUARD_TIME:                            # 초반이면
-            current_ceil = 1000                                    # 천장 낮게
-        else:                                                      # 이후면
-            current_ceil = FREQ_MAX_LIMIT                          # 상한 사용
+        current_ceil = 1000 if elapsed < SPLASH_GUARD_TIME else FREQ_MAX_LIMIT
 
-        detected_f = get_smart_frequency(chunk, SAMPLE_RATE, last_tracked_freq, current_ceil)  # 추적
-        if detected_f == 0:                                        # 추적 실패면
-            consecutive_loss_count += 1                             # 실패 증가
-            if consecutive_loss_count > 10:                        # 많이 실패하면
-                last_tracked_freq = 0.0                            # 추적 리셋
-            return                                                 # 리턴
+        detected_f = get_smart_frequency(chunk, SAMPLE_RATE, last_tracked_freq, current_ceil)
+        if detected_f == 0:
+            consecutive_loss_count += 1
+            if consecutive_loss_count > 10:
+                last_tracked_freq = 0.0
+            return
 
-        consecutive_loss_count = 0                                 # 실패 리셋
-        last_tracked_freq = detected_f                             # 추적 갱신
+        consecutive_loss_count = 0
+        last_tracked_freq = detected_f
 
-        freq_buffer.append(detected_f)                             # 버퍼에 추가
-        if len(freq_buffer) > 5:                                   # 5개 넘으면
-            freq_buffer.pop(0)                                     # 앞 제거
-        stable_f = float(np.median(freq_buffer))                   # 중앙값 안정화
+        freq_buffer.append(detected_f)
+        if len(freq_buffer) > 5:
+            freq_buffer.pop(0)
+        stable_f = float(np.median(freq_buffer))
 
-        with lock:                                                 # 락
-            history_time.append(elapsed)                            # 기록 시간
-            history_freq.append(detected_f)                         # 기록 주파수
-            last_stable_f = stable_f                                # UI 업데이트
+        with lock:
+            history_time.append(elapsed)
+            history_freq.append(detected_f)
+            last_stable_f = stable_f
 
-        # ---- [데이터 수집 & 실시간 너비 보정] ----
-        if elapsed > SPLASH_GUARD_TIME:                             # 2초 이후부터
-            reg_time_buffer.append(elapsed)                         # 회귀 시간
-            reg_inv_freq_buffer.append(1.0 / stable_f)              # 회귀 1/f
+        if elapsed > SPLASH_GUARD_TIME:
+            reg_time_buffer.append(elapsed)
+            reg_inv_freq_buffer.append(1.0 / stable_f)
 
-            if len(reg_time_buffer) > 10:                           # 데이터 10개 이상
-                s_a, _ = np.polyfit(reg_time_buffer, reg_inv_freq_buffer, 1)  # 1차 회귀
-                abs_a = abs(float(s_a))                             # 기울기 절댓값
+            if len(reg_time_buffer) > 10:
+                s_a, _ = np.polyfit(reg_time_buffer, reg_inv_freq_buffer, 1)
+                abs_a = abs(float(s_a))
+                if abs_a > 1e-9:
+                    temp_D = np.sqrt((16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs_a))
+                    if 1.0 < temp_D < 20.0:
+                        if current_diameter == 0.0:
+                            current_diameter = float(temp_D)
+                        else:
+                            current_diameter = (current_diameter * 0.95) + (float(temp_D) * 0.05)
 
-                if abs_a > 1e-9:                                    # 0 방지
-                    temp_D = np.sqrt((16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs_a))  # D 계산
+                        target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)
+                        target_freq = SOUND_SPEED / (4 * target_L_effective)
+                        calibration_done = True
 
-                    if 1.0 < temp_D < 20.0:                         # 이상치 필터
-                        if current_diameter == 0.0:                 # 최초면
-                            current_diameter = float(temp_D)        # 바로 대입
-                        else:                                       # 이후면
-                            current_diameter = (current_diameter * 0.95) + (float(temp_D) * 0.05)  # 누적평균
+        now = time.time()
+        if elapsed > CONTROL_START_TIME and calibration_done:
+            current_air = (SOUND_SPEED / (4 * stable_f)) - (END_CORRECTION_K * current_diameter)
+            with lock:
+                last_current_air = float(current_air)
 
-                        target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)  # 유효 길이
-                        target_freq = SOUND_SPEED / (4 * target_L_effective)  # 목표 주파수
-                        calibration_done = True                      # 제어 가능
+            if stable_f >= target_freq:
+                consecutive_stop_hits += 1
+            else:
+                if consecutive_stop_hits > 0:
+                    consecutive_stop_hits -= 1
 
-        # ---- [제어 로직] ----
-        now = time.time()                                           # (추가) 현재 시각
-        if elapsed > CONTROL_START_TIME and calibration_done:        # 제어 시작 조건
-            current_air = (SOUND_SPEED / (4 * stable_f)) - (END_CORRECTION_K * current_diameter)  # 공기층
-            with lock:                                               # 락
-                last_current_air = float(current_air)                # UI 업데이트
-
-            if stable_f >= target_freq:                              # 목표 이상이면
-                consecutive_stop_hits += 1                           # 확신 증가
-            else:                                                    # 아니면
-                if consecutive_stop_hits > 0:                        # 0보다 크면
-                    consecutive_stop_hits -= 1                       # 감소
-
-            # (추가) 터미널 출력: 원래와 같은 스타일(제어 줄)
-            if (now - last_print_time) >= PRINT_INTERVAL:            # 출력 주기 제한
-                bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)   # 바 길이
-                progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len)  # 바 문자열
+            if (now - last_print_time) >= PRINT_INTERVAL:
+                bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)
+                progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len)
                 print(
                     f"[제어] D:{current_diameter:.2f}cm | {stable_f:.0f}Hz / {target_freq:.0f}Hz | 공기:{current_air:.2f}cm | 확신:[{progress_bar}]",
                     end='\r'
                 )
-                last_print_time = now                                 # 마지막 출력 갱신
+                last_print_time = now
 
-            if consecutive_stop_hits >= STOP_TRIGGER_COUNT:            # 확신 충분하면
-                print("\n\n[완료] 목표 도달! 밸브 잠금.")              # (추가) 완료 메시지
-                print(f"최종 계산된 너비: {current_diameter:.4f} cm")  # (추가) 최종 D
-                serial_write(b'0')                                     # 아두이노 OFF 전송
-                with lock:                                             # 락
-                    is_filling = False                                 # 주입 종료
-                    request_plot = True                                # 그래프 요청
-                return                                                  # 콜백 종료
+            if consecutive_stop_hits >= STOP_TRIGGER_COUNT:
+                print("\n\n[완료] 목표 도달! 밸브 잠금.")
+                print(f"최종 계산된 너비: {current_diameter:.4f} cm")
+                serial_write(b'0')
+                with lock:
+                    is_filling = False
+                return
 
-        elif elapsed <= CONTROL_START_TIME and calibration_done:        # 보정 후 제어 대기구간
-            # (추가) 터미널 출력: 원래와 같은 스타일(보정 중)
-            if (now - last_print_time) >= PRINT_INTERVAL:              # 출력 주기 제한
+        elif elapsed <= CONTROL_START_TIME and calibration_done:
+            if (now - last_print_time) >= PRINT_INTERVAL:
                 print(f"[보정 중] D:{current_diameter:.2f}cm (데이터: {len(reg_time_buffer)}개)", end='\r')
-                last_print_time = now                                   # 마지막 출력 갱신
+                last_print_time = now
 
-    except Exception:                                                  # 예외 발생 시
-        return                                                        # 조용히 무시
+    except Exception:
+        return
 
 # ===== [8. 오디오 스트림 시작] =====
-def ensure_audio_stream():                                            # 스트림 보장
-    global audio_stream                                               # 전역 사용
-    if audio_stream is not None:                                      # 이미 있으면
-        return                                                        # 종료
-    audio_stream = sd.InputStream(                                    # 입력 스트림 생성
-        callback=audio_callback,                                      # 콜백 지정
-        channels=1,                                                   # 1채널
-        samplerate=SAMPLE_RATE,                                       # 샘플레이트
-        blocksize=CHUNK_SIZE                                          # 블록크기
+def ensure_audio_stream():
+    global audio_stream
+    if audio_stream is not None:
+        return
+    audio_stream = sd.InputStream(
+        callback=audio_callback,
+        channels=1,
+        samplerate=SAMPLE_RATE,
+        blocksize=CHUNK_SIZE
     )
-    audio_stream.start()                                              # 스트림 시작
+    audio_stream.start()
 
 # ===== [9. 시리얼 수신 스레드] =====
-def serial_reader_loop(on_status):                                    # 시리얼 읽기 루프
-    global ser                                                        # 전역 시리얼
-    while True:                                                       # 무한 루프
-        if ser is None:                                               # 미연결이면
-            time.sleep(0.1)                                           # 대기
-            continue                                                  # 계속
-        try:                                                          # 예외 시작
-            if ser.in_waiting:                                        # 수신 있으면
-                msg = ser.readline().decode(errors='ignore').strip()  # 한 줄 읽기
-                if "ON" in msg:                                       # ON 수신이면
-                    start_filling_local()                              # 로컬 시작
-                    on_status("ON 수신: 주입 시작")                    # 상태 표시
-                elif "OFF" in msg:                                     # OFF 수신이면
-                    stop_filling_local(plot_after=True)                # 로컬 정지+그래프
-                    on_status("OFF 수신: 주입 종료")                   # 상태 표시
-        except Exception:                                              # 예외 시
-            pass                                                       # 무시
-        time.sleep(0.01)                                              # 짧게 쉬기
+def serial_reader_loop(on_status):
+    global ser
+    while True:
+        if ser is None:
+            time.sleep(0.1)
+            continue
+        try:
+            if ser.in_waiting:
+                msg = ser.readline().decode(errors='ignore').strip()
+                if "ON" in msg:
+                    start_filling_local()
+                    on_status("아두이노 ON 수신 → 주입 시작")
+                elif "OFF" in msg:
+                    stop_filling_local(plot_after=True)
+                    on_status("아두이노 OFF 수신 → 주입 종료")
+        except Exception:
+            pass
+        time.sleep(0.01)
 
-# ===== [10. GUI] =====
-def run_gui():                                                        # GUI 실행
-    root = tk.Tk()                                                    # 루트 생성
-    root.title("급수 제어 GUI")                                       # 타이틀
+# ===== [10. customtkinter GUI (카페 키오스크 느낌)] =====
+def run_kiosk_gui():
+    ctk.set_appearance_mode("light")
+    ctk.set_default_color_theme("blue")
 
-    status_var = tk.StringVar(value="초기화 중...")                   # 상태 텍스트
-    port_var = tk.StringVar(value=PORT)                               # 포트 입력
-    baud_var = tk.StringVar(value=str(BAUD_RATE))                     # 보드레이트 입력
+    C_BG = "#F6F7FB"
+    C_CARD = "#FFFFFF"
+    C_NAVY = "#0B2D5B"
+    C_NAVY_HOVER = "#123A73"
+    C_TEXT = "#0F172A"
+    C_MUTED = "#64748B"
 
-    d_var = tk.StringVar(value="지름(D): - cm")                       # (한글) 지름 표시
-    f_var = tk.StringVar(value="주파수(F): - Hz")                     # (한글) 주파수 표시
-    tf_var = tk.StringVar(value="목표(Target): - Hz")                 # (한글) 목표 표시
-    air_var = tk.StringVar(value="공기층(Air): - cm")                 # (한글) 공기층 표시
-    hit_var = tk.StringVar(value="확신(Hits): 0")                     # (한글) 확신 표시
+    app = ctk.CTk()
+    app.title("주파수 기반 급수 제어 시스템")
+    app.configure(fg_color=C_BG)
 
-    def set_status(s: str):                                           # 상태 변경
-        status_var.set(s)                                             # 텍스트 반영
+    # ===== 창 크기 + 위치 고정 =====
+    app.update_idletasks()
+    if USE_CENTER:
+        sw = app.winfo_screenwidth()
+        sh = app.winfo_screenheight()
+        x = max(0, (sw - WIN_W) // 2)
+        y = max(0, (sh - WIN_H) // 2)
+        app.geometry(f"{WIN_W}x{WIN_H}+{x}+{y}")
+    else:
+        app.geometry(f"{WIN_W}x{WIN_H}+{WIN_X}+{WIN_Y}")
+    app.minsize(WIN_W, WIN_H)
 
-    def do_connect():                                                 # 연결 버튼
-        global PORT, BAUD_RATE                                        # 전역 갱신
-        PORT = port_var.get().strip()                                 # 포트 읽기
-        try:                                                          # 변환 예외
-            BAUD_RATE = int(baud_var.get().strip())                   # baud 읽기
-        except Exception:                                             # 실패 시
-            BAUD_RATE = 9600                                          # 기본값
-        ok = connect_serial(PORT, BAUD_RATE)                          # 연결 시도
-        set_status("아두이노 연결 성공" if ok else "아두이노 연결 실패(테스트 모드)")  # 상태
-        ensure_audio_stream()                                         # 오디오 스트림 시작/유지
-        print("\n[준비] 아두이노 ON/OFF 대기중...")                   # (추가) 터미널 안내
-        print(f"[설정] 유량: {FLOW_RATE} mL/s | 동적 보정 모드")       # (추가) 터미널 안내
+    status_var = ctk.StringVar(value="초기화 중...")
+    port_var = ctk.StringVar(value=PORT)
+    baud_var = ctk.StringVar(value=str(BAUD_RATE))
 
-    def gui_on():                                                     # GUI ON
-        serial_write(b'1')                                            # 아두이노 ON 전송
-        start_filling_local()                                         # 로컬 시작(에코 없어도 동작)
-        set_status("GUI ON: 주입 시작")                               # 상태
+    d_var = ctk.StringVar(value="지름(D) : - cm")
+    f_var = ctk.StringVar(value="주파수(F) : - Hz")
+    tf_var = ctk.StringVar(value="목표(Target) : - Hz")
+    air_var = ctk.StringVar(value="공기층(Air) : - cm")
+    hit_var = ctk.StringVar(value=f"확신(Hits) : 0/{STOP_TRIGGER_COUNT}")
 
-    def gui_off():                                                    # GUI OFF
-        serial_write(b'0')                                            # 아두이노 OFF 전송
-        stop_filling_local(plot_after=True)                           # 로컬 정지+그래프
-        set_status("GUI OFF: 주입 종료")                              # 상태
+    def set_status(s: str):
+        status_var.set(s)
+        print(f"\n[GUI] {s}")
 
-    def periodic_update():                                            # 주기 갱신
-        global request_plot                                           # 전역 사용
-        with lock:                                                    # 락
-            d = current_diameter                                      # 지름 복사
-            sf = last_stable_f                                        # 안정 주파수 복사
-            tf = target_freq                                          # 목표 주파수 복사
-            air = last_current_air                                    # 공기층 복사
-            hits = consecutive_stop_hits                              # 히트 복사
-            plot_now = request_plot                                   # 플래그 복사
-            if request_plot:                                          # 요청 있으면
-                request_plot = False                                  # 플래그 해제
+    def do_connect():
+        global PORT, BAUD_RATE
+        PORT = port_entry.get().strip()
+        try:
+            BAUD_RATE = int(baud_entry.get().strip())
+        except Exception:
+            BAUD_RATE = 9600
+        ok = connect_serial(PORT, BAUD_RATE)
+        set_status("아두이노 연결 성공" if ok else "아두이노 연결 실패(테스트 모드)")
+        ensure_audio_stream()
+        print("\n[준비] 아두이노 ON/OFF 대기중...")
+        print(f"[설정] 유량: {FLOW_RATE} mL/s | 동적 보정 모드")
 
-        if d > 0:
-            d_var.set(f"지름(D): {d:.2f} cm")
-        else:
-            d_var.set("지름(D): - cm")
+    def gui_on():
+        serial_write(b'1')
+        start_filling_local()
+        set_status("GUI ON → 주입 시작")
 
-        if sf > 0:
-            f_var.set(f"주파수(F): {sf:.0f} Hz")
-        else:
-            f_var.set("주파수(F): - Hz")
+    def gui_off():
+        serial_write(b'0')
+        stop_filling_local(plot_after=True)
+        set_status("GUI OFF → 주입 종료")
 
-        if tf > 0:
-            tf_var.set(f"목표(Target): {tf:.0f} Hz")
-        else:
-            tf_var.set("목표(Target): - Hz")
-
-        if air != 0:
-            air_var.set(f"공기층(Air): {air:.2f} cm")
-        else:
-            air_var.set("공기층(Air): - cm")
-
-        hit_var.set(f"확신(Hits): {hits}/{STOP_TRIGGER_COUNT}")
-
-        if plot_now:                                                  # 그래프 요청이면
-            set_status("종료: 결과 그래프 표시")                        # 상태
-            plot_result()                                             # 메인 스레드에서 표시
-
-        root.after(100, periodic_update)                              # 100ms마다 반복
-
-    def on_close():                                                   # 창 닫기
-        serial_write(b'0')                                            # 종료 시 OFF
+    def on_close():
+        serial_write(b'0')
         try:
             if ser is not None:
                 ser.close()
@@ -429,30 +406,241 @@ def run_gui():                                                        # GUI 실�
                 audio_stream.close()
         except Exception:
             pass
-        root.destroy()
+        app.destroy()
 
-    # ---- UI 레이아웃 ----
-    frm = ttk.Frame(root, padding=12)
-    frm.grid(row=0, column=0, sticky="nsew")
+    # ===== 레이아웃 =====
+    container = ctk.CTkFrame(app, fg_color=C_BG, corner_radius=0)
+    container.pack(fill="both", expand=True, padx=30, pady=30)
 
-    ttk.Label(frm, text="포트(PORT)").grid(row=0, column=0, sticky="w")
-    ttk.Entry(frm, textvariable=port_var, width=12).grid(row=0, column=1, sticky="w")
-    ttk.Label(frm, text="보드레이트(BAUD)").grid(row=0, column=2, sticky="w")
-    ttk.Entry(frm, textvariable=baud_var, width=10).grid(row=0, column=3, sticky="w")
-    ttk.Button(frm, text="연결", command=do_connect).grid(row=0, column=4, padx=6)
+    card = ctk.CTkFrame(container, fg_color=C_CARD, corner_radius=20)
+    card.pack(fill="both", expand=True, padx=0, pady=0)
 
-    ttk.Button(frm, text="ON (주입 시작)", command=gui_on).grid(row=1, column=0, columnspan=5, sticky="ew", pady=6)
-    ttk.Button(frm, text="OFF (주입 종료)", command=gui_off).grid(row=2, column=0, columnspan=5, sticky="ew")
+    header = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)
+    header.pack(fill="x", padx=28, pady=(28, 12))
 
-    ttk.Label(frm, textvariable=d_var).grid(row=3, column=0, columnspan=5, sticky="w", pady=(10, 0))
-    ttk.Label(frm, textvariable=f_var).grid(row=4, column=0, columnspan=5, sticky="w")
-    ttk.Label(frm, textvariable=tf_var).grid(row=5, column=0, columnspan=5, sticky="w")
-    ttk.Label(frm, textvariable=air_var).grid(row=6, column=0, columnspan=5, sticky="w")
-    ttk.Label(frm, textvariable=hit_var).grid(row=7, column=0, columnspan=5, sticky="w")
+    title = ctk.CTkLabel(
+        header, text="주파수 기반 급수 제어 시스템", text_color=C_NAVY,
+        font=ctk.CTkFont(family="Malgun Gothic", size=30, weight="bold")
+    )
+    title.pack(anchor="w")
 
-    ttk.Label(frm, textvariable=status_var).grid(row=8, column=0, columnspan=5, sticky="w", pady=(10, 0))
+    subtitle = ctk.CTkLabel(
+        header, text="ON/OFF + 실시간 추정값 + 실시간 그래프",
+        text_color=C_MUTED,
+        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="normal")
+    )
+    subtitle.pack(anchor="w", pady=(6, 0))
 
-    root.protocol("WM_DELETE_WINDOW", on_close)
+    # ===== 로고(우측 상단) =====
+    try:
+        pil_img = Image.open(LOGO_PATH)
+        logo_img = ctk.CTkImage(light_image=pil_img, size=LOGO_SIZE)
+        app.logo_img = logo_img                                   # GC 방지
+        logo_label = ctk.CTkLabel(header, text="", image=logo_img, fg_color="transparent")
+        logo_label.place(relx=1.0, rely=0.0, anchor="ne")
+    except Exception as e:
+        print(f"\n[로고] 로드 실패: {e}")
+
+    # ===== 연결 영역 =====
+    conn = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)
+    conn.pack(fill="x", padx=28, pady=(6, 14))
+
+    conn.grid_columnconfigure(0, weight=0)
+    conn.grid_columnconfigure(1, weight=1)
+    conn.grid_columnconfigure(2, weight=0)
+    conn.grid_columnconfigure(3, weight=1)
+
+    ctk.CTkLabel(
+        conn, text="포트(PORT)", text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold")
+    ).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
+
+    port_entry = ctk.CTkEntry(
+        conn, textvariable=port_var, height=40,
+        fg_color="#F1F5F9", border_color="#E2E8F0", text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=14)
+    )
+    port_entry.grid(row=0, column=1, sticky="ew", pady=(0, 10))
+
+    ctk.CTkLabel(
+        conn, text="보드레이트(BAUD)", text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold")
+    ).grid(row=0, column=2, sticky="w", padx=(18, 12), pady=(0, 10))
+
+    baud_entry = ctk.CTkEntry(
+        conn, textvariable=baud_var, height=40,
+        fg_color="#F1F5F9", border_color="#E2E8F0", text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=14)
+    )
+    baud_entry.grid(row=0, column=3, sticky="ew", pady=(0, 10))
+
+    connect_btn = ctk.CTkButton(
+        conn, text="연결", height=46,
+        fg_color=C_CARD, hover_color="#EEF2FF",
+        border_color="#CBD5E1", border_width=2,
+        text_color=C_NAVY,
+        font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold"),
+        command=do_connect
+    )
+    connect_btn.grid(row=1, column=0, columnspan=4, sticky="ew")
+
+    # ===== 버튼 =====
+    btn_area = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)
+    btn_area.pack(fill="x", padx=28, pady=(4, 14))
+
+    on_btn = ctk.CTkButton(
+        btn_area, text="ON  (주입 시작)", height=64,
+        fg_color=C_NAVY, hover_color=C_NAVY_HOVER,
+        text_color="white",
+        font=ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold"),
+        corner_radius=18,
+        command=gui_on
+    )
+    on_btn.pack(fill="x", pady=(0, 10))
+
+    off_btn = ctk.CTkButton(
+        btn_area, text="OFF (주입 종료)", height=64,
+        fg_color=C_CARD, hover_color="#F1F5F9",
+        border_color="#CBD5E1", border_width=2,
+        text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold"),
+        corner_radius=18,
+        command=gui_off
+    )
+    off_btn.pack(fill="x")
+
+    # ===== 진행바 =====
+    progress_area = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)
+    progress_area.pack(fill="x", padx=28, pady=(0, 12))
+
+    progress_title = ctk.CTkLabel(
+        progress_area, text="정지 확신도", text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
+    )
+    progress_title.pack(anchor="w", pady=(0, 8))
+
+    progress = ctk.CTkProgressBar(
+        progress_area, height=18, corner_radius=10,
+        fg_color="#E5E7EB", progress_color=C_NAVY
+    )
+    progress.set(0.0)
+    progress.pack(fill="x")
+
+    # ===== 실시간 값 =====
+    stats = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)
+    stats.pack(fill="x", padx=28, pady=(0, 12))
+
+    def make_stat_row(parent, var):
+        row = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=12)
+        row.pack(fill="x", pady=4)
+        lbl = ctk.CTkLabel(
+            row, textvariable=var, text_color=C_TEXT,
+            font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
+        )
+        lbl.pack(anchor="w", padx=6)
+        return row
+
+    make_stat_row(stats, d_var)
+    make_stat_row(stats, f_var)
+    make_stat_row(stats, tf_var)
+    make_stat_row(stats, air_var)
+    make_stat_row(stats, hit_var)
+
+    # ===== 그래프 영역(GUI 내 임베딩) =====
+    plot_frame = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)
+    plot_frame.pack(fill="both", expand=True, padx=28, pady=(0, 12))
+
+    plot_title = ctk.CTkLabel(
+        plot_frame, text="실시간 주파수 추적 그래프", text_color=C_TEXT,
+        font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
+    )
+    plot_title.pack(anchor="w", pady=(0, 6))
+
+    fig = Figure(figsize=(6, 3), dpi=100)                      # Figure(plt.figure 대신)
+    ax = fig.add_subplot(111)                                     # 축 생성
+    ax.set_xlabel("t [s]")
+    ax.set_ylabel("f [Hz]")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout(pad=3.0)          
+
+    line_freq, = ax.plot([], [], linewidth=1.5)                   # 주파수 라인
+    target_line = ax.axhline(y=0, linestyle="--", alpha=0.8)       # 목표선(나중에 위치 갱신)
+
+    canvas = FigureCanvasTkAgg(fig, master=plot_frame)            # Tk에 캔버스 생성
+    canvas_widget = canvas.get_tk_widget()                        # 위젯 가져오기
+    canvas_widget.pack(fill="both", expand=True)                  # 프레임에 꽉 채우기
+
+    def update_plot():
+        with lock:
+            t_list = list(history_time)
+            f_list = list(history_freq)
+            tf = float(target_freq)
+
+        if len(t_list) == 0:
+            line_freq.set_data([], [])
+            target_line.set_ydata([0, 0])
+            ax.set_xlim(0, 1)
+            ax.set_ylim(FREQ_MIN_LIMIT, FREQ_MAX_LIMIT)
+            canvas.draw_idle()
+            return
+
+        # 최근 N개만 표시(성능)
+        if len(t_list) > PLOT_MAX_POINTS:
+            t_list = t_list[-PLOT_MAX_POINTS:]
+            f_list = f_list[-PLOT_MAX_POINTS:]
+
+        line_freq.set_data(t_list, f_list)                        # 라인 데이터 갱신
+
+        # x/y 범위 자동 조정
+        t_max = max(t_list)
+        ax.set_xlim(max(0, t_max - 30), max(5, t_max))            # 최근 30초 윈도우(원하면 변경)
+        f_min = min(f_list)
+        f_max = max(f_list)
+        pad = max(50, 0.1 * (f_max - f_min))                      # 여백
+        ax.set_ylim(max(0, f_min - pad), f_max + pad)
+
+        # 목표선 갱신
+        if tf > 0:
+            target_line.set_ydata([tf, tf])
+            target_line.set_alpha(0.9)
+        else:
+            target_line.set_ydata([0, 0])
+            target_line.set_alpha(0.0)
+
+        canvas.draw_idle()                                        # 부드럽게 갱신
+
+    # ===== 하단 상태바 =====
+    footer = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)
+    footer.pack(fill="x", padx=28, pady=(0, 22))
+
+    status_lbl = ctk.CTkLabel(
+        footer, textvariable=status_var, text_color=C_MUTED,
+        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="normal")
+    )
+    status_lbl.pack(anchor="w")
+
+    def periodic_update():
+        with lock:
+            d = current_diameter
+            sf = last_stable_f
+            tf = target_freq
+            air = last_current_air
+            hits = consecutive_stop_hits
+
+        d_var.set(f"지름(D) : {d:.2f} cm" if d > 0 else "지름(D) : - cm")
+        f_var.set(f"주파수(F) : {sf:.0f} Hz" if sf > 0 else "주파수(F) : - Hz")
+        tf_var.set(f"목표(Target) : {tf:.0f} Hz" if tf > 0 else "목표(Target) : - Hz")
+        air_var.set(f"공기층(Air) : {air:.2f} cm" if air != 0 else "공기층(Air) : - cm")
+        hit_var.set(f"확신(Hits) : {hits}/{STOP_TRIGGER_COUNT}")
+
+        progress.set(hits / float(STOP_TRIGGER_COUNT))
+
+        update_plot()                                             # GUI 내 그래프 실시간 갱신
+        app.after(PLOT_UPDATE_MS, periodic_update)
+
+    app.protocol("WM_DELETE_WINDOW", on_close)
+    app.bind("<Escape>", lambda e: on_close())
 
     do_connect()
     ensure_audio_stream()
@@ -461,8 +649,7 @@ def run_gui():                                                        # GUI 실�
     t.start()
 
     periodic_update()
-    root.mainloop()
+    app.mainloop()
 
-# ===== [11. 엔트리포인트] =====
 if __name__ == "__main__":
-    run_gui()
+    run_kiosk_gui()
