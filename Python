@@ -1,676 +1,707 @@
-import numpy as np                                              # 수치 계산용
-import sounddevice as sd                                         # 실시간 마이크 입력
-import scipy.signal as signal                                    # 필터/피크탐지
-import serial                                                    # 아두이노 시리얼 통신(pyserial)
-import time                                                      # 시간 처리
-import threading                                                 # 백그라운드 스레드
-import matplotlib                                                # matplotlib 본체
+import numpy as np
+import sounddevice as sd
+import scipy.signal as signal
+import serial
+import time
+import threading
+import matplotlib
+import matplotlib.pyplot as plt
+from collections import deque
+import csv
+import os
+from datetime import datetime
 
 # ===== customtkinter (카페 키오스크 UI) =====
-# 설치: pip install customtkinter pillow matplotlib               # pillow도 필요(이미지)
-import customtkinter as ctk                                      # modern tkinter
-from PIL import Image                                            # 이미지 로드(Pillow)
+import customtkinter as ctk
+from PIL import Image
 
 # ===== matplotlib GUI 임베딩(TkAgg) =====
-from matplotlib.figure import Figure                             # GUI용 Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg   # Tk에 그래프 넣기
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # =========================================================
-# [1. 사용자 설정]
+# [1. 사용자 설정 (튜닝 모드)]
 # =========================================================
-PORT = 'COM17'                                                   # 아두이노 포트
-BAUD_RATE = 9600                                                 # 보드레이트
+PORT = 'COM5'
+BAUD_RATE = 9600
+CSV_FILENAME = "experiment_results.csv"
 
-SOUND_SPEED = 34300.0                                            # 소리 속도 (cm/s)
+# [물리 상수]
+SOUND_SPEED = 34300.0
+FLOW_RATE = 21.0
+END_CORRECTION_K = 0.4
+TARGET_AIR_CM = 3.0
 
-FLOW_RATE = 21.0                                                 # 펌프 유량 (mL/s)
-END_CORRECTION_K = 0.4                                           # 관구 보정 계수
+# [★ 고정 튜닝 파라미터 (GUI 슬라이더 없음)]
+STOP_OFFSET_HZ = 0             # 목표보다 50Hz 더 높아야 정지 (물 덜 참 방지)
+DIAMETER_SCALE = 1.0             # 지름 보정 계수
+CALC_START_TIME = 3.0            # 3초 뒤부터 지름 계산 데이터 수집 (초반 튀는 값 배제)
 
-TARGET_AIR_CM = 3.0                                              # 목표 공기 기둥 높이 (cm)
+# [★ 가변 튜닝 파라미터 (GUI 슬라이더 연동)]
+STOP_TRIGGER_COUNT = 7           # 정지 확신 카운트
+CONTROL_START_TIME = 4.0         # 제어(밸브 잠금 시도) 시작 시간
+FREQ_MAX_LIMIT = 3500            # 최대 탐색 주파수
+EARLY_CEIL_HZ = 1000             # 초반(3.5초 전) 주파수 제한 상한선
 
-STOP_TRIGGER_COUNT = 15                                          # 정지 확신 카운트
+# [기타 설정]
+CALIBRATION_CUTOFF_RATIO = 0.90
+FREQ_MIN_LIMIT = 200
+NOISE_CALIBRATION_TIME = 1.0
+SPLASH_GUARD_TIME = 2.0          # 2초간 데이터 수집 금지
 
-FREQ_MIN_LIMIT = 200                                             # 주파수 탐색 하한
-FREQ_MAX_LIMIT = 3500                                            # 주파수 탐색 상한
-
-SPLASH_GUARD_TIME = 2.0                                          # 초기 튐 가드 시간(s)
-CONTROL_START_TIME = 6.0                                         # 제어 시작 시간(s)
-
-SAMPLE_RATE = 44100                                              # 샘플레이트
-CHUNK_SIZE = 4096                                                # 콜백 블록 크기
+SAMPLE_RATE = 44100
+CHUNK_SIZE = 4096
 
 # ===== [로고 설정] =====
-LOGO_PATH = r"C:/Users/user/OneDrive/바탕 화면/동의대/팀플/캡스톤디자인/캡스톤디자인 I/정수기 음원/DEU.png"  # 로고 경로
-LOGO_SIZE = (75, 75)                                             # 로고 크기(px)
+LOGO_PATH = r"C:/Users/USER/Desktop/동의대사진.png"
+LOGO_SIZE = (70, 70)
 
-# ===== [창 위치/크기 고정 설정 - 가로 디스플레이용] =====
-WIN_W = 1000                                                     # 창 가로(px) - RPi 800x480이면 800
-WIN_H = 600                                                      # 창 세로(px) - RPi 800x480이면 480
-WIN_X = 80                                                       # 좌상단 x(px)
-WIN_Y = 40                                                       # 좌상단 y(px)
-USE_CENTER = False                                               # True=중앙, False=고정
+# ===== [창 위치/크기 고정 설정] =====
+WIN_W = 1000
+WIN_H = 600
+WIN_X = 80
+WIN_Y = 40
+USE_CENTER = False
 
 # ===== [그래프 설정] =====
-PLOT_UPDATE_MS = 200                                             # 그래프 갱신 주기(ms)
-PLOT_MAX_POINTS = 2000                                           # 최근 N개만 표시(성능)
+PLOT_UPDATE_MS = 200
+PLOT_MAX_POINTS = 2000
 
 # =========================================================
-# [2. 데이터/상태 변수]
+# [2. 전역 변수]
 # =========================================================
-history_time = []                                                # 기록 시간
-history_freq = []                                                # 기록 주파수
+history_time = []
+history_freq = []
 
-reg_time_buffer = []                                             # 회귀용 시간 버퍼
-reg_inv_freq_buffer = []                                         # 회귀용 1/f 버퍼
+reg_time_buffer = deque(maxlen=50)
+reg_inv_freq_buffer = deque(maxlen=50)
+diameter_candidates = deque(maxlen=10)
 
-freq_buffer = []                                                 # 주파수 안정화 버퍼
-is_filling = False                                               # 주입 중 여부
-filling_start_time = 0.0                                         # 주입 시작 시간
-calibration_done = False                                         # 최소 데이터 확보 여부
+freq_buffer = []
+is_filling = False
+filling_start_time = 0.0
+calibration_done = False
+calibration_frozen = False
 
-target_freq = 0.0                                                # 목표 주파수
-current_diameter = 0.0                                           # 추정 지름(cm)
-last_tracked_freq = 0.0                                          # 마지막 추적 주파수
-consecutive_loss_count = 0                                       # 추적 실패 카운트
-consecutive_stop_hits = 0                                        # 정지 확신 카운트
+target_freq = 0.0
+current_diameter = 0.0
+last_tracked_freq = 0.0
+consecutive_loss_count = 0
+consecutive_stop_hits = 0
+initial_stable_freq = 0.0
 
-last_stable_f = 0.0                                              # UI 표시용 안정 주파수
-last_current_air = 0.0                                           # UI 표시용 공기층(cm)
+dynamic_min_limit = FREQ_MIN_LIMIT 
+noise_profile = []
 
-ser = None                                                       # 시리얼 객체
-audio_stream = None                                              # 오디오 스트림 객체
-
-lock = threading.Lock()                                          # 스레드 공유 보호용 락
-
-# ===== [터미널 출력 제어] =====
+request_finish = False
+last_stable_f = 0.0
+last_current_air = 0.0
 last_print_time = 0.0
-PRINT_INTERVAL = 0.10
 
-
-# =========================================================
-# [3. 시리얼 연결]
-# =========================================================
-def connect_serial(port: str, baud: int) -> bool:                # 시리얼 연결 함수
-    global ser                                                   # 전역 시리얼 객체 사용
-    try:                                                         # 예외 처리 시작
-        ser = serial.Serial(port, baud, timeout=0.1)             # 포트 오픈
-        time.sleep(2)                                            # 아두이노 리셋 대기
-        ser.reset_input_buffer()                                 # 입력 버퍼 초기화
-        print(f"[{port}] 아두이노 연결 성공.")                    # 터미널 출력
-        return True                                              # 성공 반환
-    except Exception:                                            # 실패 시
-        ser = None                                               # 테스트 모드
-        print(f"[{port}] 아두이노 연결 실패 (테스트 모드).")       # 터미널 출력
-        return False                                             # 실패 반환
-
-
-def serial_write(b: bytes) -> None:                              # 안전 전송 함수
-    if ser is None:                                              # 시리얼 없으면
-        return                                                   # 종료
-    try:                                                         # 예외 처리
-        ser.write(b)                                             # 전송
-    except Exception:                                            # 실패 시
-        return                                                   # 무시
-
+ser = None
+audio_stream = None
+lock = threading.Lock()
+PRINT_INTERVAL = 0.1
 
 # =========================================================
-# [4. 시작/정지 상태 초기화]
+# [3. CSV 저장 함수]
 # =========================================================
-def start_filling_local() -> None:                               # 주입 시작(로컬)
-    global is_filling, filling_start_time                        # 상태
-    global calibration_done, freq_buffer                          # 버퍼
-    global reg_time_buffer, reg_inv_freq_buffer                    # 회귀
-    global history_time, history_freq                              # 기록
-    global last_tracked_freq, consecutive_stop_hits                # 추적
-    global consecutive_loss_count                                  # 실패
-    global current_diameter, target_freq                           # 추정
-    global last_stable_f, last_current_air                         # UI
-    global last_print_time                                         # 출력 타이머
-
-    with lock:                                                   # 락
-        is_filling = True                                        # 주입 ON
-        filling_start_time = time.time()                         # 시작시간
-
-        calibration_done = False                                 # 보정 초기화
-        freq_buffer = []                                         # 안정화 초기화
-        reg_time_buffer = []                                     # 회귀 초기화
-        reg_inv_freq_buffer = []                                 # 회귀 초기화
-
-        history_time = []                                        # 기록 초기화
-        history_freq = []                                        # 기록 초기화
-
-        last_tracked_freq = 0.0                                  # 추적 초기화
-        consecutive_loss_count = 0                                # 실패 초기화
-        consecutive_stop_hits = 0                                 # 확신 초기화
-
-        current_diameter = 0.0                                   # 지름 초기화
-        target_freq = 0.0                                        # 목표 초기화
-
-        last_stable_f = 0.0                                      # UI 초기화
-        last_current_air = 0.0                                   # UI 초기화
-
-        last_print_time = 0.0                                    # 터미널 출력 타이머 초기화
-
-    print("\n>>> 물 주입 시작! (실시간 너비 보정 모드)")            # 터미널 출력
-
-
-def stop_filling_local() -> None:                                # 주입 종료(로컬)
-    global is_filling                                             # 상태
-    with lock:                                                   # 락
-        is_filling = False                                       # 주입 OFF
-    print("\n>>> 물 주입 종료.")                                   # 터미널 출력
-
+def save_to_csv(diameter, init_freq, target_f, final_freq):
+    file_exists = os.path.isfile(CSV_FILENAME)
+    init_air_len = 0
+    if init_freq > 0:
+        init_air_len = (SOUND_SPEED / (4 * init_freq)) - (END_CORRECTION_K * diameter)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [round(diameter, 4), round(init_freq, 1), round(init_air_len, 4), 
+           round(target_f, 1), round(final_freq, 1), timestamp]
+    try:
+        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["Diameter(cm)", "Init_Freq(Hz)", "Init_Air_Len(cm)", 
+                                 "Target_Freq(Hz)", "Stop_Freq(Hz)", "Timestamp"])
+            writer.writerow(row)
+        print(f"\n[저장 완료] {CSV_FILENAME}")
+    except Exception as e:
+        print(f"\n[저장 실패] {e}")
 
 # =========================================================
-# [5. 스마트 주파수 추적]
+# [4. 시리얼 연결]
 # =========================================================
-def get_smart_frequency(chunk, rate, last_freq, current_ceiling): # 주파수 추적 함수
-    sos = signal.butter(4, 200, 'hp', fs=rate, output='sos')      # 200Hz HPF
-    filtered_chunk = signal.sosfilt(sos, chunk)                  # 필터 적용
+def connect_serial(port: str, baud: int) -> bool:
+    global ser
+    try:
+        ser = serial.Serial(port, baud, timeout=0.1)
+        time.sleep(2)
+        ser.reset_input_buffer()
+        print(f"[{port}] 아두이노 연결 성공.")
+        return True
+    except Exception:
+        ser = None
+        print(f"[{port}] 아두이노 연결 실패 (테스트 모드).")
+        return False
 
-    windowed = filtered_chunk * np.hamming(len(chunk))           # 해밍 윈도
-    fft_val = np.abs(np.fft.rfft(windowed))                      # FFT 크기
-    freqs = np.fft.rfftfreq(len(chunk), d=1/rate)                # 주파수 축
-
-    mask = (freqs >= FREQ_MIN_LIMIT) & (freqs <= current_ceiling)# 관심 대역
-    valid_freqs = freqs[mask]                                    # 유효 주파수
-    valid_mag = fft_val[mask]                                    # 유효 크기
-
-    if len(valid_mag) == 0:                                      # 비었으면
-        return 0                                                 # 실패
-
-    peaks, _ = signal.find_peaks(                                # 피크 탐지
-        valid_mag,                                               # 크기 배열
-        prominence=np.max(valid_mag) * 0.15,                     # prominence 기준
-        distance=20                                              # 피크 간 최소 간격
-    )
-    if len(peaks) == 0:                                          # 피크 없으면
-        return 0                                                 # 실패
-
-    peak_freqs = valid_freqs[peaks]                              # 피크 주파수
-    peak_mags = valid_mag[peaks]                                 # 피크 크기
-
-    if last_freq > 0:                                            # 이전 주파수 있으면
-        lower_bound = last_freq - 50                             # 아래 경계
-        upper_bound = last_freq + 400                            # 위 경계
-        candidates_mask = (peak_freqs >= lower_bound) & (peak_freqs <= upper_bound)  # 후보
-        cand_freqs = peak_freqs[candidates_mask]                 # 후보 주파수
-        cand_mags = peak_mags[candidates_mask]                   # 후보 크기
-        if len(cand_freqs) > 0:                                  # 후보 있으면
-            return float(cand_freqs[np.argmax(cand_mags)])        # 가장 큰 후보 반환
-        return 0                                                 # 없으면 실패
-    else:                                                        # 초기 상태면
-        strong_mask = peak_mags > (np.max(peak_mags) * 0.5)       # 강한 피크
-        strong_freqs = peak_freqs[strong_mask]                   # 강한 피크 주파수
-        if len(strong_freqs) > 0:                                # 있으면
-            return float(np.min(strong_freqs))                    # 가장 낮은 강피크
-        return float(peak_freqs[np.argmax(peak_mags)])            # 아니면 최대 피크
-
+def serial_write(b: bytes) -> None:
+    if ser is None: return
+    try: ser.write(b)
+    except Exception: return
 
 # =========================================================
-# [6. 오디오 콜백]
+# [5. 알고리즘: 스마트 주파수 추적]
 # =========================================================
-def audio_callback(indata, frames, time_info, status):           # 사운드디바이스 콜백
-    global is_filling, filling_start_time, calibration_done       # 상태
-    global target_freq, current_diameter                          # 추정치
-    global freq_buffer, reg_time_buffer, reg_inv_freq_buffer      # 버퍼
-    global history_time, history_freq                             # 기록
-    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits  # 추적
-    global last_stable_f, last_current_air                         # UI 표시
-    global last_print_time                                        # 출력 제어
+def get_smart_frequency(chunk, rate, last_freq, current_min, current_ceil):
+    # HPF 150Hz
+    sos = signal.butter(4, 150, 'hp', fs=rate, output='sos')
+    filtered_chunk = signal.sosfilt(sos, chunk)
+    
+    windowed = filtered_chunk * np.hamming(len(chunk))
+    fft_val = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(len(chunk), d=1/rate)
+    
+    mask = (freqs >= current_min) & (freqs <= current_ceil)
+    valid_freqs = freqs[mask]
+    valid_mag = fft_val[mask]
+    
+    if len(valid_mag) == 0: return 0
 
-    with lock:                                                   # 락
-        if not is_filling:                                       # 주입 중 아니면
-            return                                               # 종료
+    peaks, _ = signal.find_peaks(valid_mag, prominence=np.max(valid_mag)*0.15, distance=10)
+    
+    if len(peaks) == 0: 
+        return float(valid_freqs[np.argmax(valid_mag)])
 
-    chunk = indata.flatten().astype(float)                       # 1채널 배열
-    if np.max(np.abs(chunk)) < 0.01:                             # 너무 작으면(무음)
-        return                                                   # 종료
+    peak_freqs = valid_freqs[peaks]
+    peak_mags = valid_mag[peaks]
+    
+    clean_candidates_idx = []
+    for i, f in enumerate(peak_freqs):
+        is_noise = False
+        for noise_f in noise_profile:
+            if abs(f - noise_f) < 25.0: 
+                is_noise = True
+                break
+        if not is_noise:
+            clean_candidates_idx.append(i)
+    
+    if not clean_candidates_idx: return 0
+        
+    clean_freqs = peak_freqs[clean_candidates_idx]
+    clean_mags = peak_mags[clean_candidates_idx]
+    
+    max_idx = np.argmax(clean_mags)
+    dom_freq = clean_freqs[max_idx]
+
+    # 배음 역산
+    if last_freq > 0:
+        ratio = dom_freq / last_freq
+        if 2.7 <= ratio <= 3.3: return float(dom_freq / 3.0)
+        elif 4.7 <= ratio <= 5.3: return float(dom_freq / 5.0)
+        elif ratio > 2.5: return 0
+
+    return float(dom_freq)
+
+# =========================================================
+# [6. RANSAC 기울기]
+# =========================================================
+def robust_slope_calculation(times, inv_freqs):
+    if len(times) < 10: return None, 0
+    x = np.array(times)
+    y = np.array(inv_freqs)
+    try:
+        p = np.polyfit(x, y, 1)
+        y_pred = p[0] * x + p[1]
+        residuals = np.abs(y - y_pred)
+        threshold = np.percentile(residuals, 70) 
+        inlier_mask = residuals <= threshold
+        x_in = x[inlier_mask]
+        y_in = y[inlier_mask]
+        
+        if len(x_in) < 8: return None, 0
+        
+        slope, intercept = np.polyfit(x_in, y_in, 1)
+        y_in_pred = slope * x_in + intercept
+        ss_res = np.sum((y_in - y_in_pred) ** 2)
+        ss_tot = np.sum((y_in - np.mean(y_in)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        return slope, r_squared
+    except:
+        return None, 0
+
+# =========================================================
+# [7. 제어 로직]
+# =========================================================
+def start_filling_local() -> None:
+    global is_filling, filling_start_time, calibration_done, calibration_frozen
+    global freq_buffer, reg_time_buffer, reg_inv_freq_buffer, diameter_candidates
+    global history_time, history_freq
+    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
+    global current_diameter, target_freq, initial_stable_freq
+    global request_finish, last_stable_f, last_current_air, dynamic_min_limit, noise_profile
+
+    with lock:
+        is_filling = True
+        filling_start_time = time.time()
+        calibration_done = False
+        calibration_frozen = False
+        freq_buffer = []
+        reg_time_buffer.clear()
+        reg_inv_freq_buffer.clear()
+        diameter_candidates.clear()
+        history_time = []
+        history_freq = []
+        last_tracked_freq = 0.0
+        consecutive_loss_count = 0
+        consecutive_stop_hits = 0
+        initial_stable_freq = 0.0
+        current_diameter = 0.0
+        target_freq = 0.0
+        request_finish = False
+        last_stable_f = 0.0
+        last_current_air = 0.0
+        dynamic_min_limit = FREQ_MIN_LIMIT
+        noise_profile = []
+
+    print("\n>>> [1단계] 배경 소음 측정 (1초)...")
+
+def stop_filling_local(save_result: bool) -> None:
+    global is_filling, request_finish
+    with lock:
+        is_filling = False
+        if save_result:
+            request_finish = True
+    print("\n>>> 물 주입 종료.")
+
+# =========================================================
+# [8. 오디오 콜백 (Stable Version)]
+# =========================================================
+def audio_callback(indata, frames, time_info, status):
+    global is_filling, filling_start_time, calibration_done, calibration_frozen
+    global target_freq, current_diameter
+    global freq_buffer, reg_time_buffer, reg_inv_freq_buffer, diameter_candidates
+    global history_time, history_freq
+    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
+    global request_finish, last_stable_f, last_current_air, initial_stable_freq
+    global last_print_time, dynamic_min_limit, noise_profile
+    # GUI 제어 변수 연동
+    global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ
+
+    with lock:
+        if not is_filling: return
+
+    chunk = indata.flatten().astype(float)
+    if np.max(np.abs(chunk)) < 0.01: return
 
     try:
         with lock:
-            elapsed = time.time() - filling_start_time           # 경과시간(s)
+            current_time = time.time()
+            elapsed = current_time - filling_start_time
 
-        current_ceil = 1000 if elapsed < SPLASH_GUARD_TIME else FREQ_MAX_LIMIT  # 초기 천장
+        # [Phase 1] 노이즈 수집
+        if elapsed < NOISE_CALIBRATION_TIME:
+            windowed = chunk * np.hamming(len(chunk))
+            fft_val = np.abs(np.fft.rfft(windowed))
+            freqs = np.fft.rfftfreq(len(chunk), d=1/SAMPLE_RATE)
+            mask = (freqs >= 100) & (freqs <= 2000)
+            if np.any(mask):
+                valid_freqs = freqs[mask]
+                valid_mag = fft_val[mask]
+                peaks, _ = signal.find_peaks(valid_mag, prominence=np.max(valid_mag)*0.2)
+                for p in peaks:
+                    f_noise = valid_freqs[p]
+                    if not any(abs(f_noise - nf) < 20 for nf in noise_profile):
+                        noise_profile.append(f_noise)
+            return
 
-        detected_f = get_smart_frequency(chunk, SAMPLE_RATE, last_tracked_freq, current_ceil)  # 주파수
-        if detected_f == 0:                                      # 실패면
-            consecutive_loss_count += 1                          # 실패 증가
-            if consecutive_loss_count > 10:                      # 너무 많으면
-                last_tracked_freq = 0.0                          # 리셋
-            return                                               # 종료
+        filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
-        consecutive_loss_count = 0                               # 실패 리셋
-        last_tracked_freq = detected_f                            # 마지막 추적 갱신
+        # [Safety 1] 초기 물 튀는 소리 무시 (2초)
+        if filling_elapsed < SPLASH_GUARD_TIME:
+            return 
 
-        freq_buffer.append(detected_f)                            # 안정화 버퍼 추가
-        if len(freq_buffer) > 5:                                  # 길면
-            freq_buffer.pop(0)                                    # 앞 제거
-        stable_f = float(np.median(freq_buffer))                  # 안정 주파수(중앙값)
+        # [Safety 2] 3.5초 전에는 EARLY_CEIL_HZ (1000Hz) 이상 금지
+        if filling_elapsed < 3.5:
+            current_ceil = EARLY_CEIL_HZ
+        elif last_tracked_freq > 0:
+            current_ceil = last_tracked_freq + 600
+        else:
+            current_ceil = FREQ_MAX_LIMIT
+
+        # [Rising Floor]
+        if last_tracked_freq > 400:
+            new_floor = last_tracked_freq * 0.7 
+            if new_floor > dynamic_min_limit:
+                dynamic_min_limit = new_floor
+        
+        if target_freq > 0 and dynamic_min_limit > target_freq * 0.85:
+            dynamic_min_limit = target_freq * 0.85
+
+        detected_f = get_smart_frequency(chunk, SAMPLE_RATE, last_tracked_freq, dynamic_min_limit, current_ceil)
+        
+        if detected_f < dynamic_min_limit: detected_f = 0
+
+        # [Safety 3] 3.5초 전 급발진 차단
+        if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
+            detected_f = 0
+
+        if detected_f == 0:
+            consecutive_loss_count += 1
+            if consecutive_loss_count > 10: last_tracked_freq = 0
+            return
+        
+        consecutive_loss_count = 0
+        
+        if last_tracked_freq > 0:
+            detected_f = last_tracked_freq * 0.7 + detected_f * 0.3
+            
+        last_tracked_freq = detected_f
+
+        freq_buffer.append(detected_f)
+        if len(freq_buffer) > 5: freq_buffer.pop(0)
+        stable_f = float(np.median(freq_buffer))
 
         with lock:
-            history_time.append(elapsed)                          # 시간 기록
-            history_freq.append(detected_f)                       # 주파수 기록
-            last_stable_f = stable_f                              # UI 표시값 갱신
+            history_time.append(filling_elapsed)
+            history_freq.append(detected_f)
+            last_stable_f = stable_f
+            if filling_elapsed > SPLASH_GUARD_TIME and initial_stable_freq == 0:
+                initial_stable_freq = stable_f
 
-        if elapsed > SPLASH_GUARD_TIME:                           # 튐 이후부터
-            reg_time_buffer.append(elapsed)                       # 회귀 시간
-            reg_inv_freq_buffer.append(1.0 / stable_f)            # 1/f
+        # --- [데이터 수집 & 지름 계산 (CALC_START_TIME 이후 시작)] ---
+        if filling_elapsed > CALC_START_TIME:
+            if target_freq > 0 and stable_f > (target_freq * CALIBRATION_CUTOFF_RATIO):
+                calibration_frozen = True
+            
+            if not calibration_frozen:
+                # 2% 이상 상승 시
+                if initial_stable_freq > 0 and stable_f > initial_stable_freq * 1.02:
+                    reg_time_buffer.append(filling_elapsed)
+                    reg_inv_freq_buffer.append(1.0 / stable_f)
 
-            if len(reg_time_buffer) > 10:                         # 데이터 충분하면
-                s_a, _ = np.polyfit(reg_time_buffer, reg_inv_freq_buffer, 1)  # 1차 회귀
-                abs_a = abs(float(s_a))                           # 기울기 절댓값
-                if abs_a > 1e-9:                                  # 0 방지
-                    temp_D = np.sqrt((16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs_a))  # 지름 추정
-                    if 1.0 < temp_D < 20.0:                       # 합리 범위
-                        if current_diameter == 0.0:               # 초기면
-                            current_diameter = float(temp_D)      # 바로 설정
-                        else:                                     # 아니면
-                            current_diameter = (current_diameter * 0.95) + (float(temp_D) * 0.05)  # EMA
+                    if len(reg_time_buffer) > 12: 
+                        s_a, r_sq = robust_slope_calculation(reg_time_buffer, reg_inv_freq_buffer)
+                        
+                        if s_a is not None and abs(s_a) > 1e-9 and r_sq > 0.75:
+                            temp_D = np.sqrt((16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs(s_a)))
+                            
+                            # [핵심] 보정 계수 적용
+                            temp_D *= DIAMETER_SCALE 
 
-                        target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)  # 유효 길이
-                        target_freq = SOUND_SPEED / (4 * target_L_effective)  # 목표 주파수
-                        calibration_done = True                   # 보정 완료
+                            if 2.0 < temp_D < 15.0:
+                                diameter_candidates.append(temp_D)
+                                if len(diameter_candidates) >= 5:
+                                    median_D = float(np.median(list(diameter_candidates)[-5:]))
+                                    if current_diameter == 0:
+                                        current_diameter = median_D
+                                    else:
+                                        current_diameter = current_diameter * 0.9 + median_D * 0.1
+                                else:
+                                    current_diameter = float(temp_D)
 
-        now = time.time()                                         # 현재시간
-        if elapsed > CONTROL_START_TIME and calibration_done:      # 제어 시작 조건
-            current_air = (SOUND_SPEED / (4 * stable_f)) - (END_CORRECTION_K * current_diameter)  # 공기층
-            with lock:
-                last_current_air = float(current_air)             # UI 표시값 갱신
+                                target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)
+                                target_freq = SOUND_SPEED / (4 * target_L_effective)
+                                calibration_done = True
 
-            if stable_f >= target_freq:                           # 목표 도달 방향이면
-                consecutive_stop_hits += 1                        # 확신 증가
-            else:                                                 # 아니면
-                if consecutive_stop_hits > 0:                     # 0 아래 방지
-                    consecutive_stop_hits -= 1                    # 확신 감소
+        # [제어 로직]
+        if filling_elapsed > CONTROL_START_TIME and calibration_done:
+            current_air = (SOUND_SPEED / (4 * stable_f)) - (END_CORRECTION_K * current_diameter)
+            with lock: last_current_air = float(current_air)
 
-            if (now - last_print_time) >= PRINT_INTERVAL:         # 터미널 출력 주기
-                bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)  # 진행바 길이
-                progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len)  # 문자열
-                print(
-                    f"[제어] D:{current_diameter:.2f}cm | {stable_f:.0f}Hz / {target_freq:.0f}Hz | 공기:{current_air:.2f}cm | 확신:[{progress_bar}]",
-                    end='\r'
-                )
-                last_print_time = now                             # 출력 시각 갱신
+            # [핵심] 목표보다 STOP_OFFSET_HZ 만큼 더 높아야 멈춤
+            if stable_f >= (target_freq + STOP_OFFSET_HZ):
+                consecutive_stop_hits += 1
+            else:
+                if consecutive_stop_hits > 0: consecutive_stop_hits -= 1
 
-            if consecutive_stop_hits >= STOP_TRIGGER_COUNT:       # 확신 충분하면
-                print("\n\n[완료] 목표 도달! 밸브 잠금.")
-                print(f"최종 계산된 너비: {current_diameter:.4f} cm")
-                serial_write(b'0')                                # 아두이노 OFF
+            if (current_time - last_print_time) >= PRINT_INTERVAL:
+                bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)
+                progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len)
+                print(f"[제어] D:{current_diameter:.2f}cm | {stable_f:.0f}/{target_freq:.0f}Hz | [{progress_bar}]", end='\r')
+                last_print_time = current_time
+
+            if consecutive_stop_hits >= STOP_TRIGGER_COUNT:
+                print(f"\n[완료] 목표 도달! 최종 D: {current_diameter:.4f} cm")
+                serial_write(b'0')
                 with lock:
-                    is_filling = False                            # 주입 종료
+                    is_filling = False
+                    request_finish = True
                 return
-
-        elif elapsed <= CONTROL_START_TIME and calibration_done:   # 보정중 표시
-            if (now - last_print_time) >= PRINT_INTERVAL:
-                print(f"[보정 중] D:{current_diameter:.2f}cm (데이터: {len(reg_time_buffer)}개)", end='\r')
-                last_print_time = now
 
     except Exception:
         return
 
+# =========================================================
+# [9. 오디오 스트림 보장]
+# =========================================================
+def ensure_audio_stream():
+    global audio_stream
+    if audio_stream is not None: return
+    audio_stream = sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE)
+    audio_stream.start()
 
 # =========================================================
-# [7. 오디오 스트림 시작]
+# [10. 시리얼 수신 스레드]
 # =========================================================
-def ensure_audio_stream():                                       # 스트림 생성 보장
-    global audio_stream                                          # 전역 스트림
-    if audio_stream is not None:                                 # 이미 있으면
-        return                                                   # 종료
-    audio_stream = sd.InputStream(                               # 입력 스트림 생성
-        callback=audio_callback,                                 # 콜백
-        channels=1,                                              # 1채널
-        samplerate=SAMPLE_RATE,                                  # 샘플레이트
-        blocksize=CHUNK_SIZE                                     # 블록 크기
-    )
-    audio_stream.start()                                         # 시작
-
-
-# =========================================================
-# [8. 시리얼 수신 스레드]
-# =========================================================
-def serial_reader_loop(on_status):                               # 시리얼 수신 루프
-    global ser                                                   # 전역 시리얼
-    while True:                                                  # 무한 루프
-        if ser is None:                                          # 시리얼 없으면
-            time.sleep(0.1)                                      # 대기
-            continue                                             # 다음
+def serial_reader_loop(on_status):
+    global ser
+    while True:
+        if ser is None:
+            time.sleep(0.1); continue
         try:
-            if ser.in_waiting:                                   # 수신 데이터 있으면
-                msg = ser.readline().decode(errors='ignore').strip()  # 한 줄 읽기
-                if "ON" in msg:                                  # ON이면
-                    start_filling_local()                        # 로컬 시작
-                    on_status("아두이노 ON 수신 → 주입 시작")      # 상태 표시
-                elif "OFF" in msg:                               # OFF이면
-                    stop_filling_local()                         # 로컬 종료
-                    on_status("아두이노 OFF 수신 → 주입 종료")     # 상태 표시
-        except Exception:
-            pass
-        time.sleep(0.01)                                         # CPU 과점유 방지
-
+            if ser.in_waiting:
+                msg = ser.readline().decode(errors='ignore').strip()
+                if "ON" in msg:
+                    start_filling_local()
+                    on_status("아두이노 ON 수신")
+                elif "OFF" in msg:
+                    stop_filling_local(save_result=True)
+                    on_status("아두이노 OFF 수신")
+        except Exception: pass
+        time.sleep(0.01)
 
 # =========================================================
-# [9. customtkinter GUI (가로 레이아웃)]
+# [11. customtkinter GUI (가로 레이아웃 + 튜닝 패널)]
 # =========================================================
 def run_kiosk_gui():
-    ctk.set_appearance_mode("light")                             # 라이트 모드
-    ctk.set_default_color_theme("blue")                          # 기본 테마
+    ctk.set_appearance_mode("light")
+    ctk.set_default_color_theme("blue")
 
-    C_BG = "#F6F7FB"                                             # 전체 배경
-    C_CARD = "#FFFFFF"                                           # 카드
-    C_NAVY = "#0B2D5B"                                           # 네이비 포인트
-    C_NAVY_HOVER = "#123A73"                                     # 네이비 hover
-    C_TEXT = "#0F172A"                                           # 텍스트
-    C_MUTED = "#64748B"                                          # 보조 텍스트
+    C_BG = "#F6F7FB"
+    C_CARD = "#FFFFFF"
+    C_NAVY = "#0B2D5B"
+    C_NAVY_HOVER = "#123A73"
+    C_TEXT = "#0F172A"
+    C_MUTED = "#64748B"
 
-    app = ctk.CTk()                                              # 메인 창
-    app.title("주파수 기반 급수 제어 시스템")                      # 타이틀
-    app.configure(fg_color=C_BG)                                 # 배경
+    app = ctk.CTk()
+    app.title("주파수 기반 급수 제어 시스템")
+    app.configure(fg_color=C_BG)
 
-    # ===== 창 크기 + 위치 고정 =====
-    app.update_idletasks()                                       # OS 배치 전 내부 계산 갱신
-    if USE_CENTER:                                               # 중앙이면
-        sw = app.winfo_screenwidth()                             # 화면 가로
-        sh = app.winfo_screenheight()                            # 화면 세로
-        x = max(0, (sw - WIN_W) // 2)                            # 중앙 x
-        y = max(0, (sh - WIN_H) // 2)                            # 중앙 y
-        app.geometry(f"{WIN_W}x{WIN_H}+{x}+{y}")                  # 적용
-    else:                                                        # 고정이면
-        app.geometry(f"{WIN_W}x{WIN_H}+{WIN_X}+{WIN_Y}")          # 적용
-    app.minsize(WIN_W, WIN_H)                                    # 최소 크기
+    if USE_CENTER:
+        sw = app.winfo_screenwidth()
+        sh = app.winfo_screenheight()
+        x = max(0, (sw - WIN_W) // 2)
+        y = max(0, (sh - WIN_H) // 2)
+        app.geometry(f"{WIN_W}x{WIN_H}+{x}+{y}")
+    else:
+        app.geometry(f"{WIN_W}x{WIN_H}+{WIN_X}+{WIN_Y}")
+    app.minsize(WIN_W, WIN_H)
 
-    # ===== 상태 변수 =====
-    status_var = ctk.StringVar(value="초기화 중...")              # 상태바
-    port_var = ctk.StringVar(value=PORT)                         # 포트
-    baud_var = ctk.StringVar(value=str(BAUD_RATE))               # baud
+    status_var = ctk.StringVar(value="초기화 중...")
+    port_var = ctk.StringVar(value=PORT)
+    baud_var = ctk.StringVar(value=str(BAUD_RATE))
 
-    d_var = ctk.StringVar(value="지름(D) : - cm")                # 지름
-    f_var = ctk.StringVar(value="주파수(F) : - Hz")              # 주파수
-    tf_var = ctk.StringVar(value="목표(Target) : - Hz")          # 목표
-    air_var = ctk.StringVar(value="공기층(Air) : - cm")          # 공기층
-    hit_var = ctk.StringVar(value=f"확신(Hits) : 0/{STOP_TRIGGER_COUNT}")  # 확신
+    d_var = ctk.StringVar(value="지름(D) : - cm")
+    f_var = ctk.StringVar(value="주파수(F) : - Hz")
+    tf_var = ctk.StringVar(value="목표(Target) : - Hz")
+    air_var = ctk.StringVar(value="공기층(Air) : - cm")
+    hit_var = ctk.StringVar(value=f"확신(Hits) : 0/{STOP_TRIGGER_COUNT}")
 
     def set_status(s: str):
-        status_var.set(s)                                        # 상태텍스트 변경
-        print(f"\n[GUI] {s}")                                    # 터미널 출력
+        status_var.set(s)
+        print(f"\n[GUI] {s}")
 
     def do_connect():
-        global PORT, BAUD_RATE                                   # 전역 업데이트
-        PORT = port_entry.get().strip()                          # 입력 포트
-        try:
-            BAUD_RATE = int(baud_entry.get().strip())            # 입력 baud
-        except Exception:
-            BAUD_RATE = 9600                                     # 기본값
-        ok = connect_serial(PORT, BAUD_RATE)                     # 연결 시도
-        set_status("아두이노 연결 성공" if ok else "아두이노 연결 실패(테스트 모드)")  # 상태
-        ensure_audio_stream()                                    # 스트림 시작
-        print("\n[준비] 아두이노 ON/OFF 대기중...")
-        print(f"[설정] 유량: {FLOW_RATE} mL/s | 동적 보정 모드")
+        global PORT, BAUD_RATE
+        PORT = port_entry.get().strip()
+        try: BAUD_RATE = int(baud_entry.get().strip())
+        except: BAUD_RATE = 9600
+        ok = connect_serial(PORT, BAUD_RATE)
+        set_status("아두이노 연결 성공" if ok else "연결 실패(테스트 모드)")
+        ensure_audio_stream()
+        print(f"\n[준비] 유량: {FLOW_RATE} mL/s, 튜닝 GUI 적용됨")
 
     def gui_on():
-        serial_write(b'1')                                       # 아두이노 ON
-        start_filling_local()                                    # 로컬 시작
-        set_status("GUI ON → 주입 시작")                          # 상태 표시
+        start_filling_local()
+        set_status("배경 소음 측정 중... (1초 후 펌프 작동)")
+        def delayed_pump_on():
+            time.sleep(NOISE_CALIBRATION_TIME + 0.1)
+            serial_write(b'1')
+            print("\n>>> [2단계] 소음 측정 완료. 펌프 가동!")
+        threading.Thread(target=delayed_pump_on, daemon=True).start()
 
     def gui_off():
-        serial_write(b'0')                                       # 아두이노 OFF
-        stop_filling_local()                                     # 로컬 종료
-        set_status("GUI OFF → 주입 종료")                         # 상태 표시
+        serial_write(b'0')
+        stop_filling_local(save_result=True)
+        set_status("GUI OFF → 주입 종료")
 
     def on_close():
-        serial_write(b'0')                                       # 닫기 시 OFF
+        serial_write(b'0')
         try:
-            if ser is not None:
-                ser.close()                                      # 시리얼 닫기
-        except Exception:
-            pass
-        try:
-            if audio_stream is not None:
-                audio_stream.stop()                              # 오디오 정지
-                audio_stream.close()                             # 오디오 닫기
-        except Exception:
-            pass
-        app.destroy()                                            # 창 종료
+            if ser: ser.close()
+            if audio_stream: audio_stream.stop(); audio_stream.close()
+        except: pass
+        app.destroy()
 
-    # =====================================================
-    # 가로(2열) 레이아웃
-    # =====================================================
     container = ctk.CTkFrame(app, fg_color=C_BG, corner_radius=0)
     container.pack(fill="both", expand=True, padx=20, pady=20)
 
     card = ctk.CTkFrame(container, fg_color=C_CARD, corner_radius=20)
     card.pack(fill="both", expand=True)
 
-    card.grid_rowconfigure(0, weight=0)                          # header
-    card.grid_rowconfigure(1, weight=1)                          # body
-    card.grid_rowconfigure(2, weight=0)                          # footer
+    card.grid_rowconfigure(0, weight=0)
+    card.grid_rowconfigure(1, weight=1)
+    card.grid_rowconfigure(2, weight=0)
     card.grid_columnconfigure(0, weight=1)
 
-    # ===== 헤더(상단 전체 폭) =====
     header = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)
     header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10))
     header.grid_columnconfigure(0, weight=1)
 
-    title = ctk.CTkLabel(
-        header, text="주파수 기반 급수 제어 시스템", text_color=C_NAVY,
-        font=ctk.CTkFont(family="Malgun Gothic", size=28, weight="bold")
-    )
+    title = ctk.CTkLabel(header, text="주파수 기반 급수 제어 시스템", text_color=C_NAVY, font=ctk.CTkFont(family="Malgun Gothic", size=28, weight="bold"))
     title.grid(row=0, column=0, sticky="w")
-
-    subtitle = ctk.CTkLabel(
-        header, text="ON/OFF + 실시간 추정값 + 실시간 그래프",
-        text_color=C_MUTED,
-        font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="normal")
-    )
+    subtitle = ctk.CTkLabel(header, text="ON/OFF + 실시간 추정값 + 실시간 그래프", text_color=C_MUTED, font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="normal"))
     subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-    # 로고(헤더 오른쪽 상단)
     try:
         pil_img = Image.open(LOGO_PATH)
         logo_img = ctk.CTkImage(light_image=pil_img, size=LOGO_SIZE)
-        app.logo_img = logo_img
-        logo_label = ctk.CTkLabel(header, text="", image=logo_img, fg_color="transparent")
-        logo_label.place(relx=1.0, rely=0.0, anchor="ne")
-    except Exception as e:
-        print(f"\n[로고] 로드 실패: {e}")
+        ctk.CTkLabel(header, text="", image=logo_img, fg_color="transparent").place(relx=1.0, rely=0.0, anchor="ne")
+    except: pass
 
-    # ===== 본문(2열) =====
     body = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)
     body.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 10))
     body.grid_rowconfigure(0, weight=1)
-    body.grid_columnconfigure(0, weight=1)                       # left
-    body.grid_columnconfigure(1, weight=1)                       # right
+    body.grid_columnconfigure(0, weight=1)
+    body.grid_columnconfigure(1, weight=1)
 
     left = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=16)
     left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
-
     right = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=16)
     right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
 
-    # -------------------------
-    # LEFT: 연결 + 버튼
-    # -------------------------
     conn = ctk.CTkFrame(left, fg_color=C_CARD, corner_radius=16)
     conn.pack(fill="x", pady=(0, 12))
+    conn.grid_columnconfigure(1, weight=1); conn.grid_columnconfigure(3, weight=1)
 
-    conn.grid_columnconfigure(0, weight=0)
-    conn.grid_columnconfigure(1, weight=1)
-    conn.grid_columnconfigure(2, weight=0)
-    conn.grid_columnconfigure(3, weight=1)
-
-    ctk.CTkLabel(
-        conn, text="포트(PORT)", text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold")
-    ).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10))
-
-    port_entry = ctk.CTkEntry(
-        conn, textvariable=port_var, height=40,
-        fg_color="#F1F5F9", border_color="#E2E8F0", text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=14)
-    )
-    port_entry.grid(row=0, column=1, sticky="ew", pady=(0, 10))
-
-    ctk.CTkLabel(
-        conn, text="보드레이트(BAUD)", text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="bold")
-    ).grid(row=0, column=2, sticky="w", padx=(18, 12), pady=(0, 10))
-
-    baud_entry = ctk.CTkEntry(
-        conn, textvariable=baud_var, height=40,
-        fg_color="#F1F5F9", border_color="#E2E8F0", text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=14)
-    )
-    baud_entry.grid(row=0, column=3, sticky="ew", pady=(0, 10))
-
-    connect_btn = ctk.CTkButton(
-        conn, text="연결", height=44,
-        fg_color=C_CARD, hover_color="#EEF2FF",
-        border_color="#CBD5E1", border_width=2,
-        text_color=C_NAVY,
-        font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold"),
-        command=do_connect
-    )
-    connect_btn.grid(row=1, column=0, columnspan=4, sticky="ew")
+    ctk.CTkLabel(conn, text="PORT", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 12))
+    port_entry = ctk.CTkEntry(conn, textvariable=port_var, height=40, fg_color="#F1F5F9", text_color=C_TEXT)
+    port_entry.grid(row=0, column=1, sticky="ew")
+    ctk.CTkLabel(conn, text="BAUD", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=0, column=2, sticky="w", padx=(18, 12))
+    baud_entry = ctk.CTkEntry(conn, textvariable=baud_var, height=40, fg_color="#F1F5F9", text_color=C_TEXT)
+    baud_entry.grid(row=0, column=3, sticky="ew")
+    ctk.CTkButton(conn, text="연결", height=44, fg_color=C_CARD, hover_color="#EEF2FF", border_color="#CBD5E1", border_width=2, text_color=C_NAVY, font=("Malgun Gothic", 16, "bold"), command=do_connect).grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10,0))
 
     btn_area = ctk.CTkFrame(left, fg_color=C_CARD, corner_radius=16)
     btn_area.pack(fill="x", pady=(0, 12))
+    ctk.CTkButton(btn_area, text="ON  (주입 시작)", height=64, fg_color=C_NAVY, hover_color=C_NAVY_HOVER, font=("Malgun Gothic", 20, "bold"), corner_radius=18, command=gui_on).pack(fill="x", pady=(0, 10))
+    ctk.CTkButton(btn_area, text="OFF (주입 종료)", height=64, fg_color=C_CARD, hover_color="#F1F5F9", border_color="#CBD5E1", border_width=2, text_color=C_TEXT, font=("Malgun Gothic", 20, "bold"), corner_radius=18, command=gui_off).pack(fill="x")
 
-    on_btn = ctk.CTkButton(
-        btn_area, text="ON  (주입 시작)", height=64,
-        fg_color=C_NAVY, hover_color=C_NAVY_HOVER,
-        text_color="white",
-        font=ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold"),
-        corner_radius=18,
-        command=gui_on
-    )
-    on_btn.pack(fill="x", pady=(0, 10))
+    # ===== 튜닝 패널 =====
+    tune = ctk.CTkFrame(left, fg_color=C_CARD, corner_radius=16)
+    tune.pack(fill="both", expand=True)
+    ctk.CTkLabel(tune, text="튜닝 패널(실험용)", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
 
-    off_btn = ctk.CTkButton(
-        btn_area, text="OFF (주입 종료)", height=64,
-        fg_color=C_CARD, hover_color="#F1F5F9",
-        border_color="#CBD5E1", border_width=2,
-        text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=20, weight="bold"),
-        corner_radius=18,
-        command=gui_off
-    )
-    off_btn.pack(fill="x")
+    DEFAULT_STOP_TRIGGER_COUNT = int(STOP_TRIGGER_COUNT)
+    DEFAULT_CONTROL_START_TIME = float(CONTROL_START_TIME)
+    DEFAULT_FREQ_MAX_LIMIT = int(FREQ_MAX_LIMIT)
+    DEFAULT_EARLY_CEIL_HZ = int(EARLY_CEIL_HZ)
 
-    # -------------------------
-    # RIGHT: 진행바 + 값 + 그래프
-    # -------------------------
-    progress_area = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
-    progress_area.pack(fill="x", pady=(0, 12))
+    lock_var = ctk.BooleanVar(value=True)
+    stop_cnt_var = ctk.IntVar(value=DEFAULT_STOP_TRIGGER_COUNT)
+    ctrl_start_var = ctk.DoubleVar(value=DEFAULT_CONTROL_START_TIME)
+    fmax_var = ctk.IntVar(value=DEFAULT_FREQ_MAX_LIMIT)
+    early_ceil_var = ctk.IntVar(value=DEFAULT_EARLY_CEIL_HZ)
+    lock_hint = ctk.StringVar(value="LOCK 상태: 변경 불가")
 
-    progress_title = ctk.CTkLabel(
-        progress_area, text="정지 확신도", text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
-    )
-    progress_title.pack(anchor="w", pady=(0, 8))
+    def apply_tuning_from_vars():
+        global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ
+        if lock_var.get(): return
+        STOP_TRIGGER_COUNT = int(stop_cnt_var.get())
+        CONTROL_START_TIME = float(ctrl_start_var.get())
+        FREQ_MAX_LIMIT = int(fmax_var.get())
+        EARLY_CEIL_HZ = int(early_ceil_var.get())
 
-    progress = ctk.CTkProgressBar(
-        progress_area, height=18, corner_radius=10,
-        fg_color="#E5E7EB", progress_color=C_NAVY
-    )
-    progress.set(0.0)
-    progress.pack(fill="x")
+    def on_lock_toggle():
+        is_locked = lock_var.get()
+        lock_hint.set("LOCK 상태: 변경 불가" if is_locked else "UNLOCK 상태: 변경 가능")
+        state = "disabled" if is_locked else "normal"
+        stop_cnt_slider.configure(state=state)
+        ctrl_start_slider.configure(state=state)
+        fmax_slider.configure(state=state)
+        early_ceil_slider.configure(state=state)
+
+    def reset_to_defaults():
+        global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ
+        stop_cnt_var.set(DEFAULT_STOP_TRIGGER_COUNT); ctrl_start_var.set(DEFAULT_CONTROL_START_TIME)
+        fmax_var.set(DEFAULT_FREQ_MAX_LIMIT); early_ceil_var.set(DEFAULT_EARLY_CEIL_HZ)
+        stop_cnt_slider.set(DEFAULT_STOP_TRIGGER_COUNT); ctrl_start_slider.set(DEFAULT_CONTROL_START_TIME)
+        fmax_slider.set(DEFAULT_FREQ_MAX_LIMIT); early_ceil_slider.set(DEFAULT_EARLY_CEIL_HZ)
+        STOP_TRIGGER_COUNT = DEFAULT_STOP_TRIGGER_COUNT; CONTROL_START_TIME = DEFAULT_CONTROL_START_TIME
+        FREQ_MAX_LIMIT = DEFAULT_FREQ_MAX_LIMIT; EARLY_CEIL_HZ = DEFAULT_EARLY_CEIL_HZ
+        stop_cnt_val.set(f"{DEFAULT_STOP_TRIGGER_COUNT}"); ctrl_start_val.set(f"{DEFAULT_CONTROL_START_TIME:.1f} s")
+        fmax_val.set(f"{DEFAULT_FREQ_MAX_LIMIT} Hz"); early_ceil_val.set(f"{DEFAULT_EARLY_CEIL_HZ} Hz")
+        hit_var.set(f"확신(Hits) : 0/{STOP_TRIGGER_COUNT}")
+        set_status("튜닝 값 초기화(기본값 복귀)")
+
+    lock_row = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
+    lock_row.pack(fill="x", padx=12, pady=(0, 8))
+    lock_row.grid_columnconfigure(0, weight=0); lock_row.grid_columnconfigure(1, weight=0); lock_row.grid_columnconfigure(2, weight=1)
+    ctk.CTkButton(lock_row, text="초기화", height=28, width=70, fg_color=C_CARD, hover_color="#EEF2FF", border_color="#CBD5E1", border_width=2, text_color=C_NAVY, font=("Malgun Gothic", 12, "bold"), command=reset_to_defaults).grid(row=0, column=0, sticky="w")
+    ctk.CTkSwitch(lock_row, text="LOCK", variable=lock_var, command=on_lock_toggle).grid(row=0, column=1, sticky="w", padx=(10, 12))
+    ctk.CTkLabel(lock_row, textvariable=lock_hint, text_color=C_MUTED, font=("Malgun Gothic", 12, "normal")).grid(row=0, column=2, sticky="w")
+
+    ctk.CTkLabel(tune, text="정지 확신 카운트 (STOP_TRIGGER_COUNT)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+    stop_cnt_val = ctk.StringVar(value=str(DEFAULT_STOP_TRIGGER_COUNT))
+    ctk.CTkLabel(tune, textvariable=stop_cnt_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).pack(anchor="w", padx=12)
+    def on_stop_cnt(v): stop_cnt_val.set(f"{int(float(v))}"); stop_cnt_var.set(int(float(v))); apply_tuning_from_vars()
+    stop_cnt_slider = ctk.CTkSlider(tune, from_=5, to=30, number_of_steps=25, command=on_stop_cnt)
+    stop_cnt_slider.set(DEFAULT_STOP_TRIGGER_COUNT); stop_cnt_slider.pack(fill="x", padx=12, pady=(6, 0))
+
+    ctk.CTkLabel(tune, text="제어 시작 시간 (CONTROL_START_TIME)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).pack(anchor="w", padx=12, pady=(16, 2))
+    ctrl_start_val = ctk.StringVar(value=f"{DEFAULT_CONTROL_START_TIME:.1f} s")
+    ctk.CTkLabel(tune, textvariable=ctrl_start_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).pack(anchor="w", padx=12)
+    def on_ctrl_start(v): ctrl_start_val.set(f"{float(v):.1f} s"); ctrl_start_var.set(float(v)); apply_tuning_from_vars()
+    ctrl_start_slider = ctk.CTkSlider(tune, from_=1.0, to=10.0, number_of_steps=90, command=on_ctrl_start)
+    ctrl_start_slider.set(DEFAULT_CONTROL_START_TIME); ctrl_start_slider.pack(fill="x", padx=12, pady=(6, 0))
+
+    ctk.CTkLabel(tune, text="최대 탐색 주파수 (FREQ_MAX_LIMIT)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).pack(anchor="w", padx=12, pady=(16, 2))
+    fmax_val = ctk.StringVar(value=f"{DEFAULT_FREQ_MAX_LIMIT} Hz")
+    ctk.CTkLabel(tune, textvariable=fmax_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).pack(anchor="w", padx=12)
+    def on_fmax(v): fmax_val.set(f"{int(float(v))} Hz"); fmax_var.set(int(float(v))); apply_tuning_from_vars()
+    fmax_slider = ctk.CTkSlider(tune, from_=800, to=5000, number_of_steps=420, command=on_fmax)
+    fmax_slider.set(DEFAULT_FREQ_MAX_LIMIT); fmax_slider.pack(fill="x", padx=12, pady=(6, 0))
+
+    ctk.CTkLabel(tune, text="초반 제한 상한 (EARLY_CEIL_HZ)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).pack(anchor="w", padx=12, pady=(16, 2))
+    early_ceil_val = ctk.StringVar(value=f"{DEFAULT_EARLY_CEIL_HZ} Hz")
+    ctk.CTkLabel(tune, textvariable=early_ceil_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).pack(anchor="w", padx=12)
+    def on_early_ceil(v): early_ceil_val.set(f"{int(float(v))} Hz"); early_ceil_var.set(int(float(v))); apply_tuning_from_vars()
+    early_ceil_slider = ctk.CTkSlider(tune, from_=300, to=1500, number_of_steps=120, command=on_early_ceil)
+    early_ceil_slider.set(DEFAULT_EARLY_CEIL_HZ); early_ceil_slider.pack(fill="x", padx=12, pady=(6, 12))
+    
+    on_lock_toggle()
+
+    prog_area = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
+    prog_area.pack(fill="x", pady=(0, 12))
+    ctk.CTkLabel(prog_area, text="정지 확신도", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(0, 8))
+    progress = ctk.CTkProgressBar(prog_area, height=18, corner_radius=10, fg_color="#E5E7EB", progress_color=C_NAVY)
+    progress.set(0.0); progress.pack(fill="x")
 
     stats = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
     stats.pack(fill="x", pady=(0, 12))
-
-    def make_stat_row(parent, var):
-        row = ctk.CTkFrame(parent, fg_color=C_CARD, corner_radius=12)
-        row.pack(fill="x", pady=4)
-        lbl = ctk.CTkLabel(
-            row, textvariable=var, text_color=C_TEXT,
-            font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
-        )
-        lbl.pack(anchor="w", padx=6)
-        return row
-
-    make_stat_row(stats, d_var)
-    make_stat_row(stats, f_var)
-    make_stat_row(stats, tf_var)
-    make_stat_row(stats, air_var)
-    make_stat_row(stats, hit_var)
+    def add_stat(p, v):
+        r = ctk.CTkFrame(p, fg_color=C_CARD, corner_radius=12); r.pack(fill="x", pady=4)
+        ctk.CTkLabel(r, textvariable=v, text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", padx=6)
+    add_stat(stats, d_var); add_stat(stats, f_var); add_stat(stats, tf_var); add_stat(stats, air_var); add_stat(stats, hit_var)
 
     plot_frame = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
     plot_frame.pack(fill="both", expand=True)
-
-    plot_title = ctk.CTkLabel(
-        plot_frame, text="실시간 주파수 추적 그래프", text_color=C_TEXT,
-        font=ctk.CTkFont(family="Malgun Gothic", size=16, weight="bold")
-    )
-    plot_title.pack(anchor="w", pady=(0, 6))
+    ctk.CTkLabel(plot_frame, text="실시간 주파수 추적 그래프", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(0, 6))
 
     fig = Figure(figsize=(6.2, 3.0), dpi=100)
     ax = fig.add_subplot(111)
-    ax.set_xlabel("t [s]")
-    ax.set_ylabel("f [Hz]")
-    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("t [s]"); ax.set_ylabel("f [Hz]"); ax.grid(True, alpha=0.3)
     fig.tight_layout(pad=3.0)
-
     line_freq, = ax.plot([], [], linewidth=1.5)
     target_line = ax.axhline(y=0, linestyle="--", alpha=0.8)
-
     canvas = FigureCanvasTkAgg(fig, master=plot_frame)
-    canvas_widget = canvas.get_tk_widget()
-    canvas_widget.pack(fill="both", expand=True)
-
-    def update_plot():
-        with lock:
-            t_list = list(history_time)
-            f_list = list(history_freq)
-            tf = float(target_freq)
-
-        if len(t_list) == 0:
-            line_freq.set_data([], [])
-            target_line.set_ydata([0, 0])
-            ax.set_xlim(0, 1)
-            ax.set_ylim(FREQ_MIN_LIMIT, FREQ_MAX_LIMIT)
-            canvas.draw_idle()
-            return
-
-        if len(t_list) > PLOT_MAX_POINTS:
-            t_list = t_list[-PLOT_MAX_POINTS:]
-            f_list = f_list[-PLOT_MAX_POINTS:]
-
-        line_freq.set_data(t_list, f_list)
-
-        t_max = max(t_list)
-        ax.set_xlim(max(0, t_max - 30), max(5, t_max))
-
-        f_min = min(f_list)
-        f_max = max(f_list)
-        pad = max(50, 0.1 * (f_max - f_min))
-        ax.set_ylim(max(0, f_min - pad), f_max + pad)
-
-        if tf > 0:
-            target_line.set_ydata([tf, tf])
-            target_line.set_alpha(0.9)
-        else:
-            target_line.set_ydata([0, 0])
-            target_line.set_alpha(0.0)
-
-        canvas.draw_idle()
-
-    # ===== 하단 상태바(전체 폭) =====
-    footer = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)
-    footer.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 18))
-
-    status_lbl = ctk.CTkLabel(
-        footer, textvariable=status_var, text_color=C_MUTED,
-        font=ctk.CTkFont(family="Malgun Gothic", size=14, weight="normal")
-    )
-    status_lbl.pack(anchor="w")
+    canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def periodic_update():
+        global request_finish
         with lock:
-            d = current_diameter
-            sf = last_stable_f
-            tf = target_freq
-            air = last_current_air
-            hits = consecutive_stop_hits
+            d, sf, tf, air, hits = current_diameter, last_stable_f, target_freq, last_current_air, consecutive_stop_hits
+            do_finish = request_finish
+            if request_finish: request_finish = False
 
         d_var.set(f"지름(D) : {d:.2f} cm" if d > 0 else "지름(D) : - cm")
         f_var.set(f"주파수(F) : {sf:.0f} Hz" if sf > 0 else "주파수(F) : - Hz")
@@ -678,26 +709,45 @@ def run_kiosk_gui():
         air_var.set(f"공기층(Air) : {air:.2f} cm" if air != 0 else "공기층(Air) : - cm")
         hit_var.set(f"확신(Hits) : {hits}/{STOP_TRIGGER_COUNT}")
 
-        progress.set(hits / float(STOP_TRIGGER_COUNT))
+        progress.set(hits / float(max(1, STOP_TRIGGER_COUNT)))
 
-        update_plot()
-        app.after(PLOT_UPDATE_MS, periodic_update)
+        with lock:
+            t_list = list(history_time)
+            f_list = list(history_freq)
+            tf_val = float(target_freq)
+
+        if not t_list:
+            line_freq.set_data([], [])
+            target_line.set_ydata([0, 0])
+            ax.set_xlim(0, 1); ax.set_ylim(FREQ_MIN_LIMIT, FREQ_MAX_LIMIT)
+            canvas.draw_idle()
+        else:
+            if len(t_list) > PLOT_MAX_POINTS:
+                t_list = t_list[-PLOT_MAX_POINTS:]
+                f_list = f_list[-PLOT_MAX_POINTS:]
+            line_freq.set_data(t_list, f_list)
+            t_max = max(t_list)
+            ax.set_xlim(max(0, t_max - 30), max(5, t_max))
+            f_min, f_max = min(f_list), max(f_list)
+            pad = max(50, 0.1 * (f_max - f_min))
+            ax.set_ylim(max(0, f_min - pad), f_max + pad)
+            if tf_val > 0:
+                target_line.set_ydata([tf_val, tf_val]); target_line.set_alpha(0.9)
+            else:
+                target_line.set_alpha(0.0)
+            canvas.draw_idle()
+
+        if do_finish:
+            set_status("종료 → 결과 저장")
+            save_to_csv(d, initial_stable_freq, tf, sf)
+
+        app.after(100, periodic_update)
 
     app.protocol("WM_DELETE_WINDOW", on_close)
-    app.bind("<Escape>", lambda e: on_close())
-
-    do_connect()
-    ensure_audio_stream()
-
-    t = threading.Thread(target=serial_reader_loop, args=(set_status,), daemon=True)
-    t.start()
-
+    do_connect(); ensure_audio_stream()
+    threading.Thread(target=serial_reader_loop, args=(set_status,), daemon=True).start()
     periodic_update()
     app.mainloop()
 
-
-# =========================================================
-# [10. 엔트리포인트]
-# =========================================================
 if __name__ == "__main__":
     run_kiosk_gui()
