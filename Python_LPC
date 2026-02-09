@@ -22,14 +22,15 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg      # Tk에 그
 # =========================================================
 # [1. 사용자 설정 (튜닝 모드)]
 # =========================================================
-PORT = 'COM17'                                                       # 아두이노 포트
+PORT = "/dev/ttyACM0"                                               # 아두이노 포트
 BAUD_RATE = 9600                                                    # 통신 속도
 CSV_FILENAME = "experiment_results.csv"                             # CSV 파일명
+INPUT_DEVICE = 0
 
 # [물리 상수]
 SOUND_SPEED = 34300.0                                               # 소리속도(cm/s)
 FLOW_RATE = 21.0                                                    # 유량(mL/s)
-END_CORRECTION_K = 0.4                                              # 관구효과 보정 계수
+END_CORRECTION_K = 0.4                                            # 관구효과 보정 계수
 TARGET_AIR_CM = 3.0                                                 # 목표 공기층(cm)
 
 # [★ 고정 튜닝 파라미터 (GUI 슬라이더 없음)]
@@ -53,12 +54,12 @@ SAMPLE_RATE = 44100                                                 # 샘플레�
 CHUNK_SIZE = 4096                                                   # 블록 크기
 
 # ===== [로고 설정] =====
-LOGO_PATH = r"C:\Users\user\OneDrive\바탕 화면\동의대\팀플\캡스톤디자인\캡스톤디자인 I\정수기 음원\DEU.png"                 # 로고 경로
+LOGO_PATH = r"/home/kimcapybara/venv/DEU.png"                       # 로고 경로
 LOGO_SIZE = (70, 70)                                                # 로고 크기
 
 # ===== [창 위치/크기 고정 설정] =====
-WIN_W = 1000                                                        # 창 너비
-WIN_H = 600                                                         # 창 높이
+WIN_W = 800                                                        # 창 너비
+WIN_H = 480                                                         # 창 높이
 WIN_X = 80                                                          # 창 x
 WIN_Y = 40                                                          # 창 y
 USE_CENTER = False                                                  # 중앙 배치 여부
@@ -70,7 +71,7 @@ PLOT_MAX_POINTS = 2000                                              # 최대 표
 # =========================================================
 # [★ LPC 보조 추적 설정]
 # =========================================================
-USE_LPC_ASSIST = True                                               # LPC 보조 사용 여부(최소 변경용)
+USE_LPC_ASSIST = True                                              # LPC 보조 사용 여부(최소 변경용)
 LPC_ORDER = 16                                                      # LPC 차수(너무 높이면 불안정/과적합)
 LPC_NFFT = 4096                                                     # LPC 스펙트럼 해상도(rfft 길이)
 LPC_MIN_VALID_ENERGY = 1e-6                                         # 너무 작은 신호면 LPC 스킵
@@ -558,7 +559,7 @@ def audio_callback(indata, frames, time_info, status):               # 오디오
 def ensure_audio_stream():                                            # 오디오 스트림 생성/시작
     global audio_stream
     if audio_stream is not None: return                               # 이미 있으면 종료
-    audio_stream = sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE)  # 스트림 생성
+    audio_stream = sd.InputStream(device=INPUT_DEVICE, callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE)  # 스트림 생성
     audio_stream.start()                                              # 시작
 
 # =========================================================
