@@ -1,0 +1,113 @@
+#include <WiFiS3.h>                                           // UNO R4 WiFi용 Wi-Fi
+
+const char* SSID = "619";                                     // 공유기 SSID
+const char* PASS = "619619619@!";                             // 공유기 비번
+
+WiFiServer server(5000);                                      // TCP 서버 포트
+WiFiClient client;                                            // 연결된 클라이언트
+
+const int SOLENOID_PIN = 7;                                   // 솔레노이드 제어 핀 (D7)
+const int SW_ON_PIN    = 3;                                   // ON 스위치 (D3)
+const int SW_OFF_PIN   = 5;                                   // OFF 스위치 (D5)
+
+bool solenoidOn = false;                                      // 현재 솔밸브 상태
+
+String rxBuf = "";                                            // (추가) TCP 수신 버퍼
+
+void sendStatus(const char* s) {                              // (추가) 상태 전송(시리얼+TCP)
+  Serial.println(s);                                          // 디버그/로그용
+  if (client && client.connected()) client.println(s);        // 라즈베리파이로도 전송
+}
+
+void solenoidOnSet() {
+  digitalWrite(SOLENOID_PIN, HIGH);                           // 솔밸브 ON
+  solenoidOn = true;                                          // 상태 갱신
+  sendStatus("STATUS:ON");                                    // 상태 전송
+}
+
+void solenoidOffSet() {
+  digitalWrite(SOLENOID_PIN, LOW);                            // 솔밸브 OFF
+  solenoidOn = false;                                         // 상태 갱신
+  sendStatus("STATUS:OFF");                                   // 상태 전송
+}
+
+void setup() {
+  pinMode(SOLENOID_PIN, OUTPUT);                              // D7 출력
+  digitalWrite(SOLENOID_PIN, LOW);                            // 초기 OFF
+
+  pinMode(SW_ON_PIN, INPUT_PULLUP);                           // D3 버튼(누르면 LOW)
+  pinMode(SW_OFF_PIN, INPUT_PULLUP);                          // D5 버튼(누르면 LOW)
+
+  Serial.begin(9600);                                         // (유지) 디버그/상태 확인용
+
+  // ===== Wi-Fi 연결 + DHCP 대기(이전에 해결한 부분 포함) =====
+  Serial.println("WiFi begin...");                            // 로그
+  WiFi.begin(SSID, PASS);                                     // 연결 시작
+
+  unsigned long t0 = millis();                                // 시작 시간
+  while (WiFi.status() != WL_CONNECTED) {                     // 연결 대기
+    if (millis() - t0 > 20000) break;                         // 20초 타임아웃
+    delay(500);                                               // 대기
+  }
+
+  Serial.print("WiFi status = ");                             // 상태 출력
+  Serial.println(WiFi.status());                              // 3이면 연결됨
+
+  t0 = millis();                                              // DHCP 대기
+  while (WiFi.localIP() == IPAddress(0,0,0,0)) {              // IP가 0.0.0.0이면
+    if (millis() - t0 > 30000) break;                         // 30초 타임아웃
+    delay(200);                                               // 대기
+  }
+
+  Serial.print("UNO R4 IP: ");                                // IP 출력
+  Serial.println(WiFi.localIP());                             // 할당 IP
+
+  server.begin();                                             // TCP 서버 시작
+  Serial.println("TCP SERVER READY");                         // 준비
+}
+
+// (추가) TCP에서 1글자 명령('1'/'0') 읽기: 줄바꿈/공백 무시
+bool readTcpCmdChar(char& outCmd) {                           // 명령 1개를 outCmd에 반환
+  if (!(client && client.connected())) return false;          // 연결 없으면 false
+  while (client.available()) {                                // 수신 데이터 처리
+    char ch = (char)client.read();                            // 1바이트 읽기
+    if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') continue; // 공백/개행 무시
+    outCmd = ch;                                              // '1' 또는 '0' 기대
+    return true;                                              // 명령 1개 획득
+  }
+  return false;                                               // 아직 없음
+}
+
+void loop() {
+  // ===== (추가) TCP 클라이언트 연결 수락/유지 =====
+  if (!client || !client.connected()) {                       // 연결 없거나 끊김이면
+    client = server.available();                              // 새 연결 수락
+    if (client) {                                             // 연결되면
+      rxBuf = "";                                             // 버퍼 초기화(안정성)
+      Serial.println("CLIENT CONNECTED");                     // 로그
+    }
+  }
+
+  // ===== 1. 물리 스위치 입력 제어 (원본 그대로) =====
+  if (digitalRead(SW_ON_PIN) == LOW) {                        // D3 눌림
+    solenoidOnSet();                                          // ON
+    delay(200);                                               // 디바운싱
+    while (digitalRead(SW_ON_PIN) == LOW) {}                  // 버튼 뗄 때까지 대기
+  }
+
+  if (digitalRead(SW_OFF_PIN) == LOW) {                       // D5 눌림
+    solenoidOffSet();                                         // OFF
+    delay(200);                                               // 디바운싱
+    while (digitalRead(SW_OFF_PIN) == LOW) {}                 // 버튼 뗄 때까지 대기
+  }
+
+  // ===== 2. Wi-Fi(TCP) 명령 제어 (기존 '1','0' 유지) =====
+  char cmd;                                                   // 수신 명령
+  if (readTcpCmdChar(cmd)) {                                  // TCP에서 1글자 받으면
+    if (cmd == '1') {                                         // '1'이면 ON
+      solenoidOnSet();                                        // ON
+    } else if (cmd == '0') {                                  // '0'이면 OFF
+      solenoidOffSet();                                       // OFF
+    }
+  }
+}
