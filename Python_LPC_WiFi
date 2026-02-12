@@ -220,7 +220,7 @@ def levinson_durbin(r, order):                                      # Levinson-D
     a = np.zeros(order + 1, dtype=float)                            # AR 계수 배열(길이 order+1)
     e = float(r[0])                                                 # 초기 오차 에너지
     if e <= 0:                                                      # r[0]이 0이면 실패
-        return None
+        return None                                                 # 실패 반환
     a[0] = 1.0                                                      # a0 = 1
     for k in range(1, order + 1):                                   # 1..order 반복
         acc = 0.0                                                   # 누적항
@@ -234,7 +234,7 @@ def levinson_durbin(r, order):                                      # Levinson-D
         a = a_new                                                   # 적용
         e *= (1.0 - lam * lam)                                      # 오차 갱신
         if e <= 1e-12:                                              # 너무 작아지면 중단
-            break
+            break                                                   # 중단
     return a                                                        # AR 다항식 반환(1 + a1 z^-1 + ...)
 
 def lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil):  # LPC 스펙트럼 피크 추정
@@ -286,7 +286,7 @@ def lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil):  # LPC 
         for nf in noise_profile:                                    # 저장된 노이즈 피크들과 비교
             if abs(f - nf) < 25.0:                                  # ±25Hz 이내면
                 is_noise = True                                     # 노이즈로 간주
-                break
+                break                                               # 중단
         if not is_noise:                                            # 노이즈 아니면
             clean_idx.append(i)                                     # 후보로 추가
 
@@ -332,7 +332,7 @@ def get_smart_frequency(chunk, rate, last_freq, current_min, current_ceil):  # �
             for noise_f in noise_profile:                            # 노이즈 리스트 비교
                 if abs(f - noise_f) < 25.0:                          # ±25Hz 이내면
                     is_noise = True                                  # 노이즈 처리
-                    break
+                    break                                            # 중단
             if not is_noise:                                         # 노이즈 아니면
                 clean_candidates_idx.append(i)                       # 후보로 채택
 
@@ -497,13 +497,19 @@ def audio_callback(indata, frames, time_info, status):               # 오디오
         if filling_elapsed < SPLASH_GUARD_TIME:
             return
 
-        # [Safety 2] 3.5초 전에는 EARLY_CEIL_HZ 이상 금지
-        if filling_elapsed < 3.5:
+        # [Safety 2] ceiling 결정(락 풀림 튐 방지: last=0이어도 안정값 기반 제한)
+        if filling_elapsed < 3.5:                                     # 초반(3.5초 전)
             current_ceil = EARLY_CEIL_HZ                              # 초반 상한 제한
-        elif last_tracked_freq > 0:
-            current_ceil = last_tracked_freq + 600                    # 추적값 기반 상한
         else:
-            current_ceil = FREQ_MAX_LIMIT                             # 기본 상한
+            base = float(last_tracked_freq)                           # 기본 기준 = last
+            if base <= 0 and last_stable_f > 0:                       # last가 없으면 최근 안정값
+                base = float(last_stable_f)                           # 재획득 기준
+            if base <= 0 and initial_stable_freq > 0:                 # 그래도 없으면 초기 안정값
+                base = float(initial_stable_freq)                     # 최소 기준
+            if base > 0:
+                current_ceil = min(FREQ_MAX_LIMIT, base + 600.0)      # last+600 방식 유지
+            else:
+                current_ceil = FREQ_MAX_LIMIT                         # 정말 아무 기준도 없을 때만 풀림
 
         # [Rising Floor]
         if last_tracked_freq > 400:
@@ -525,9 +531,14 @@ def audio_callback(indata, frames, time_info, status):               # 오디오
 
         if detected_f == 0:                                           # 실패면
             consecutive_loss_count += 1                               # 손실 카운트 증가
-            if consecutive_loss_count > 10:
-                last_tracked_freq = 0                                 # 장기 손실이면 리셋
-            return
+            if consecutive_loss_count > 10:                           # 장기 손실이면(락 붕괴 구간)
+                if last_stable_f > 0:                                 # 최근 안정값이 있으면
+                    last_tracked_freq = float(last_stable_f)          # last를 안정값으로 재부여(재획득 기반)
+                elif initial_stable_freq > 0:                         # 초기 안정값이라도 있으면
+                    last_tracked_freq = float(initial_stable_freq)    # last를 초기값으로 유지
+                else:
+                    last_tracked_freq *= 0.9                          # 아무것도 없으면 완만 감쇠(0 리셋 방지)
+            return                                                    # 실패 프레임은 종료
 
         consecutive_loss_count = 0                                    # 손실 리셋
 
