@@ -35,7 +35,7 @@ RELAY_ACTIVE_HIGH = True                                            # 릴레이 
 
 # [물리 상수]
 SOUND_SPEED = 34300.0                                               # 소리속도(cm/s)
-FLOW_RATE = 21.0                                                    # 유량(mL/s)
+FLOW_RATE = 21.5                                                    # 유량(mL/s)
 END_CORRECTION_K = 0.4                                              # 관구효과 보정 계수
 TARGET_AIR_CM = 3.0                                                 # 목표 공기층(cm)
 
@@ -529,7 +529,7 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
                             if 2.0 < temp_D < 15.0:
                                 diameter_candidates.append(temp_D)   # 후보 추가
                                 if len(diameter_candidates) >= 5:
-                                    median_D = float(np.median(list(diameter_candidates)[-5:]))  # 최근 5개 median
+                                    median_D = float(np.median(list(diameter_candidates)[-3:]))  # 최근 3개 median
                                     if current_diameter == 0:
                                         current_diameter = median_D  # 초기값
                                     else:
