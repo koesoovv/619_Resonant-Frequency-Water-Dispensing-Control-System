@@ -84,6 +84,11 @@ LPC_MIN_VALID_ENERGY = 1e-6                                         # 너무 작
 LPC_PEAK_PROM_RATIO = 0.15                                          # LPC 피크 prominence 비율(FFT와 비슷하게)
 
 # =========================================================
+# [★ 필터(하이패스) 1회 설계: 콜백마다 설계 금지]
+# =========================================================
+HP_SOS = signal.butter(4, 150, 'hp', fs=SAMPLE_RATE, output='sos')   # 150Hz 하이패스 SOS(전역 재사용)
+
+# =========================================================
 # [2. 전역 변수]
 # =========================================================
 history_time = []                                                   # 그래프 시간 히스토리
@@ -124,8 +129,8 @@ solenoid = OutputDevice(                                            # 솔레노�
     active_high=RELAY_ACTIVE_HIGH,                                  # 릴레이 논리 레벨 설정
     initial_value=False                                             # 시작 시 OFF
 )
-sw_on = Button(SW_ON_GPIO, pull_up=True, bounce_time=0.05)         # ON 스위치 입력 (누르면 GND)
-sw_off = Button(SW_OFF_GPIO, pull_up=True, bounce_time=0.05)       # OFF 스위치 입력 (누르면 GND)
+sw_on = Button(SW_ON_GPIO, pull_up=True, bounce_time=0.05)          # ON 스위치 입력 (누르면 GND)
+sw_off = Button(SW_OFF_GPIO, pull_up=True, bounce_time=0.05)        # OFF 스위치 입력 (누르면 GND)
 
 # =========================================================
 # [3. GPIO 제어 함수]
@@ -151,19 +156,39 @@ def save_to_csv(diameter, init_freq, target_f, final_freq):         # CSV 저장
     if init_freq > 0:                                               # 초기 주파수 유효하면
         init_air_len = (SOUND_SPEED / (4 * init_freq)) - (END_CORRECTION_K * diameter)  # 초기 공기층 계산
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")        # 타임스탬프
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")         # 타임스탬프
     row = [round(diameter, 4), round(init_freq, 1), round(init_air_len, 4),
            round(target_f, 1), round(final_freq, 1), timestamp]     # 저장 행 구성
     try:
-        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8-sig') as f:  # append
+        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8-sig') as f:      # append
             writer = csv.writer(f)                                  # CSV writer
             if not file_exists:                                     # 헤더가 없으면
                 writer.writerow(["Diameter(cm)", "Init_Freq(Hz)", "Init_Air_Len(cm)",
-                                 "Target_Freq(Hz)", "Stop_Freq(Hz)", "Timestamp"])  # 헤더
+                                 "Target_Freq(Hz)", "Stop_Freq(Hz)", "Timestamp"])    # 헤더
             writer.writerow(row)                                    # 데이터 저장
         print(f"\n[저장 완료] {CSV_FILENAME}")                       # 저장 완료 출력
     except Exception as e:
         print(f"\n[저장 실패] {e}")                                 # 저장 실패 출력
+
+# =========================================================
+# [5-0. 연속성 기반 피크 선택 유틸]  (★붙는 현상 완화 버전)
+# =========================================================
+def pick_peak_with_continuity(peak_freqs, peak_mags, last_freq):    # 크기+연속성 기반(완화 버전)
+    if len(peak_freqs) == 0:                                        # 후보 없으면
+        return 0.0                                                  # 실패
+    peak_freqs = np.asarray(peak_freqs)                             # 배열 변환
+    peak_mags  = np.asarray(peak_mags)                              # 배열 변환
+
+    if last_freq <= 0:                                              # 초기 구간
+        return float(peak_freqs[int(np.argmax(peak_mags))])         # 최대 피크
+
+    mags_n = peak_mags / (np.max(peak_mags) + 1e-12)                # 크기 정규화
+    alpha  = 1.0 / 800.0                                            # 거리 패널티 완화(★핵심)
+    score  = mags_n - alpha * np.abs(peak_freqs - last_freq)        # 점수
+
+    score += 0.15 * (peak_freqs > last_freq)                        # 상승 후보 가산(★핵심)
+
+    return float(peak_freqs[int(np.argmax(score))])                 # 최고 점수 선택
 
 # =========================================================
 # [5-A. LPC(선형예측) 유틸리티]
@@ -189,7 +214,7 @@ def levinson_durbin(r, order):                                      # Levinson-D
             break                                                   # 중단
     return a                                                        # AR 다항식 반환
 
-def lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil):  # LPC 스펙트럼 피크 추정
+def lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil, last_freq):  # LPC 스펙트럼 피크 추정(연속성 포함)
     x = filtered_chunk.astype(float)                                # float 변환
     if np.mean(x * x) < LPC_MIN_VALID_ENERGY:                       # 에너지가 너무 작으면
         return 0.0                                                  # 실패 반환
@@ -244,15 +269,14 @@ def lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil):  # LPC 
 
     clean_freqs = peak_freqs[clean_idx]                             # clean 주파수
     clean_mags = peak_mags[clean_idx]                               # clean 크기
-    dom = float(clean_freqs[int(np.argmax(clean_mags))])            # 가장 큰 피크 선택
-    return dom                                                      # LPC 기반 후보 반환
+    dom = pick_peak_with_continuity(clean_freqs, clean_mags, last_freq)     # 연속성 기반 선택
+    return float(dom)                                               # LPC 기반 후보 반환
 
 # =========================================================
 # [5-B. 알고리즘: 스마트 주파수 추적 (FFT 기본 + LPC 보조)]
 # =========================================================
 def get_smart_frequency(chunk, rate, last_freq, current_min, current_ceil):  # 주파수 추정 함수
-    sos = signal.butter(4, 150, 'hp', fs=rate, output='sos')        # 150Hz 하이패스
-    filtered_chunk = signal.sosfilt(sos, chunk)                     # 필터 적용
+    filtered_chunk = signal.sosfilt(HP_SOS, chunk)                  # 하이패스(전역 SOS 재사용)
 
     windowed = filtered_chunk * np.hamming(len(chunk))              # 창 적용
     fft_val = np.abs(np.fft.rfft(windowed))                         # FFT 크기
@@ -288,8 +312,8 @@ def get_smart_frequency(chunk, rate, last_freq, current_min, current_ceil):  # �
         else:
             clean_freqs = peak_freqs[clean_candidates_idx]          # clean 주파수
             clean_mags = peak_mags[clean_candidates_idx]            # clean 크기
-            dom_freq = float(clean_freqs[int(np.argmax(clean_mags))])  # 가장 큰 피크
-            fft_candidate = dom_freq                                # FFT 후보 확정
+            dom_freq = pick_peak_with_continuity(clean_freqs, clean_mags, last_freq)  # 연속성 기반 선택
+            fft_candidate = float(dom_freq)                         # FFT 후보 확정
 
     if fft_candidate > 0 and last_freq > 0:                         # 이전값이 있으면
         ratio = fft_candidate / last_freq                           # 비율 계산
@@ -308,7 +332,7 @@ def get_smart_frequency(chunk, rate, last_freq, current_min, current_ceil):  # �
             need_lpc = True                                         # LPC로 교차검증
 
         if need_lpc:                                                # LPC를 써야 하면
-            lpc_candidate = lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil)  # LPC 후보
+            lpc_candidate = lpc_peak_frequency(filtered_chunk, rate, current_min, current_ceil, last_freq)  # LPC 후보
             if lpc_candidate > 0:                                   # LPC가 성공하면
                 if last_freq > 0:                                   # 이전값이 있으면
                     ratio2 = lpc_candidate / last_freq              # 비율 계산
@@ -435,7 +459,7 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
                 peaks, _ = signal.find_peaks(valid_mag, prominence=np.max(valid_mag)*0.2)  # 피크
                 for p in peaks:                                     # 피크 순회
                     f_noise = valid_freqs[p]                        # 피크 주파수
-                    if not any(abs(f_noise - nf) < 20 for nf in noise_profile):  # 중복 제거
+                    if not any(abs(f_noise - nf) < 20 for nf in noise_profile):            # 중복 제거
                         noise_profile.append(f_noise)               # 노이즈 등록
             return                                                  # 노이즈 구간은 종료
 
@@ -455,7 +479,7 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
             if base <= 0 and initial_stable_freq > 0:
                 base = float(initial_stable_freq)                   # 초기 안정값 사용
             if base > 0:
-                current_ceil = min(FREQ_MAX_LIMIT, base + 600.0)    # last+600 방식
+                current_ceil = min(FREQ_MAX_LIMIT, base + 900.0)    # ★상한 여유 확대(600→900)
             else:
                 current_ceil = FREQ_MAX_LIMIT                       # 기준 없을 때만 전체 허용
 
@@ -481,6 +505,7 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
 
         if detected_f == 0:
             consecutive_loss_count += 1                             # 손실 카운트 증가
+            dynamic_min_limit = max(FREQ_MIN_LIMIT, dynamic_min_limit * 0.97)            # 하한 서서히 복원
             if consecutive_loss_count > 10:                         # 장기 손실 구간
                 if last_stable_f > 0:
                     last_tracked_freq = float(last_stable_f)        # 최근 안정값 재부여
@@ -493,13 +518,13 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
         consecutive_loss_count = 0                                  # 손실 리셋
 
         if last_tracked_freq > 0:
-            detected_f = last_tracked_freq * 0.7 + detected_f * 0.3  # 1차 평활
+            detected_f = last_tracked_freq * 0.4 + detected_f * 0.6 # ★상승 추종 강화(0.7/0.3 → 0.4/0.6)
 
         last_tracked_freq = detected_f                              # 추적값 업데이트
 
         freq_buffer.append(detected_f)                              # 버퍼 추가
-        if len(freq_buffer) > 5:
-            freq_buffer.pop(0)                                      # 최근 5개 유지
+        if len(freq_buffer) > 3:                                    # ★median 창 5→3
+            freq_buffer.pop(0)                                      # 최근 3개 유지
         stable_f = float(np.median(freq_buffer))                    # median으로 안정화
 
         with lock:
@@ -527,11 +552,11 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
                             temp_D *= DIAMETER_SCALE                # 지름 보정 적용
 
                             if 2.0 < temp_D < 15.0:
-                                diameter_candidates.append(temp_D)   # 후보 추가
+                                diameter_candidates.append(temp_D)  # 후보 추가
                                 if len(diameter_candidates) >= 5:
                                     median_D = float(np.median(list(diameter_candidates)[-3:]))  # 최근 3개 median
                                     if current_diameter == 0:
-                                        current_diameter = median_D  # 초기값
+                                        current_diameter = median_D # 초기값
                                     else:
                                         current_diameter = current_diameter * 0.9 + median_D * 0.1  # 저역통과
                                 else:
@@ -541,7 +566,7 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
                                 target_freq = SOUND_SPEED / (4 * target_L_effective)  # 목표 주파수
                                 calibration_done = True             # 캘리 완료
 
-        # [제어 로직]
+        # [제어 로직]  ※ 예측(미리 멈춤) 없음: stable_f가 목표를 만족해야 hits 누적
         if filling_elapsed > CONTROL_START_TIME and calibration_done:
             current_air = (SOUND_SPEED / (4 * stable_f)) - (END_CORRECTION_K * current_diameter)  # 공기층 계산
             with lock:
@@ -554,9 +579,10 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
                     consecutive_stop_hits -= 1                      # hits 감소(히스테리시스)
 
             if (current_time - last_print_time) >= PRINT_INTERVAL:
-                bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)  # 진행바 길이
-                progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len)  # ASCII 바
-                print(f"[제어] D:{current_diameter:.2f}cm | {stable_f:.0f}/{target_freq:.0f}Hz | [{progress_bar}]", end='\r')  # 콘솔 표시
+                bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)            # 진행바 길이
+                progress_bar = "#" * bar_len + "-" * (STOP_TRIGGER_COUNT - bar_len) # ASCII 바
+                print(f"[제어] D:{current_diameter:.2f}cm | {stable_f:.0f}/{target_freq:.0f}Hz | [{progress_bar}]",
+                      end='\r')                                   # 콘솔 표시
                 last_print_time = current_time                      # 출력 시간 갱신
 
             if consecutive_stop_hits >= STOP_TRIGGER_COUNT:
@@ -564,7 +590,7 @@ def audio_callback(indata, frames, time_info, status):              # 오디오 
                 solenoid_off()                                      # 솔레노이드 OFF
                 with lock:
                     is_filling = False                              # 주입 종료
-                    request_finish = True                           # 저장 요청
+                    request_finish = True                            # 저장 요청
                 return
 
     except Exception:
@@ -665,404 +691,404 @@ def run_kiosk_gui():
             pass                                                    # 예외 무시
         app.destroy()                                               # 창 종료
 
-    container = ctk.CTkFrame(app, fg_color=C_BG, corner_radius=0)   # 전체 컨테이너
-    container.pack(fill="both", expand=True, padx=20, pady=20)      # 배치
+    container = ctk.CTkFrame(app, fg_color=C_BG, corner_radius=0)    # 전체 컨테이너
+    container.pack(fill="both", expand=True, padx=20, pady=20)       # 배치
 
     card = ctk.CTkFrame(container, fg_color=C_CARD, corner_radius=20)  # 메인 카드
-    card.pack(fill="both", expand=True)                             # 배치
+    card.pack(fill="both", expand=True)                              # 배치
 
-    card.grid_rowconfigure(0, weight=0)                             # 헤더 고정
-    card.grid_rowconfigure(1, weight=1)                             # 본문 확장
-    card.grid_rowconfigure(2, weight=0)                             # 푸터 고정
-    card.grid_columnconfigure(0, weight=1)                          # 단일 열
+    card.grid_rowconfigure(0, weight=0)                              # 헤더 고정
+    card.grid_rowconfigure(1, weight=1)                              # 본문 확장
+    card.grid_rowconfigure(2, weight=0)                              # 푸터 고정
+    card.grid_columnconfigure(0, weight=1)                           # 단일 열
 
-    header = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)  # 헤더 프레임
-    header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10))  # 배치
-    header.grid_columnconfigure(0, weight=1)                        # 텍스트 영역 확장
+    header = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)   # 헤더 프레임
+    header.grid(row=0, column=0, sticky="ew", padx=24, pady=(24, 10)) # 배치
+    header.grid_columnconfigure(0, weight=1)                         # 텍스트 영역 확장
 
-    title = ctk.CTkLabel(                                           # 제목 라벨
+    title = ctk.CTkLabel(                                            # 제목 라벨
         header,
         text="주파수 기반 급수 제어 시스템",
         text_color=C_NAVY,
         font=ctk.CTkFont(family="Malgun Gothic", size=28, weight="bold")
     )
-    title.grid(row=0, column=0, sticky="w")                         # 배치
+    title.grid(row=0, column=0, sticky="w")                          # 배치
 
-    subtitle = ctk.CTkLabel(                                        # 부제 라벨
+    subtitle = ctk.CTkLabel(                                         # 부제 라벨
         header,
         text=f"GPIO Direct | SOL:{SOLENOID_GPIO} / ON_SW:{SW_ON_GPIO} / OFF_SW:{SW_OFF_GPIO}",
         text_color=C_MUTED,
         font=ctk.CTkFont(family="Malgun Gothic", size=13, weight="normal")
     )
-    subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))         # 배치
+    subtitle.grid(row=1, column=0, sticky="w", pady=(6, 0))          # 배치
 
     try:
-        pil_img = Image.open(LOGO_PATH)                             # 로고 파일 로드
-        logo_img = ctk.CTkImage(light_image=pil_img, size=LOGO_SIZE)  # CTk 이미지 생성
+        pil_img = Image.open(LOGO_PATH)                              # 로고 파일 로드
+        logo_img = ctk.CTkImage(light_image=pil_img, size=LOGO_SIZE) # CTk 이미지 생성
         ctk.CTkLabel(header, text="", image=logo_img, fg_color="transparent").place(relx=1.0, rely=0.0, anchor="ne")  # 우상단 배치
     except Exception:
         pass                                                        # 로고 실패 무시
 
-    body = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)    # 본문 프레임
+    body = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=16)     # 본문 프레임
     body.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 10))  # 배치
-    body.grid_rowconfigure(0, weight=1)                             # 본문 행 확장
-    body.grid_columnconfigure(0, weight=1)                          # 좌측 확장
-    body.grid_columnconfigure(1, weight=1)                          # 우측 확장
+    body.grid_rowconfigure(0, weight=1)                              # 본문 행 확장
+    body.grid_columnconfigure(0, weight=1)                           # 좌측 확장
+    body.grid_columnconfigure(1, weight=1)                           # 우측 확장
 
-    left = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=16)    # 좌측 패널
-    left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))         # 배치
+    left = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=16)     # 좌측 패널
+    left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))          # 배치
 
-    right = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=16)   # 우측 패널
-    right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))        # 배치
+    right = ctk.CTkFrame(body, fg_color=C_CARD, corner_radius=16)    # 우측 패널
+    right.grid(row=0, column=1, sticky="nsew", padx=(12, 0))         # 배치
 
     # ===== GPIO 정보 패널 =====
     gpio_info = ctk.CTkFrame(left, fg_color=C_CARD, corner_radius=16)  # GPIO 정보 카드
     gpio_info.pack(fill="x", pady=(0, 12))                           # 배치
     gpio_info.grid_columnconfigure(1, weight=1)                      # 값 영역 확장
 
-    ctk.CTkLabel(gpio_info, text="제어 방식", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))  # 라벨
-    ctk.CTkLabel(gpio_info, text="Raspberry Pi Direct", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=0, column=1, sticky="w", pady=(0, 8))  # 값
+    ctk.CTkLabel(gpio_info, text="제어 방식", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 8))
+    ctk.CTkLabel(gpio_info, text="Raspberry Pi Direct", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=0, column=1, sticky="w", pady=(0, 8))
 
-    ctk.CTkLabel(gpio_info, text="솔레노이드", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 12))  # 라벨
-    ctk.CTkLabel(gpio_info, text=f"BCM {SOLENOID_GPIO}", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=1, column=1, sticky="w")  # 값
+    ctk.CTkLabel(gpio_info, text="솔레노이드", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=1, column=0, sticky="w", padx=(0, 12))
+    ctk.CTkLabel(gpio_info, text=f"BCM {SOLENOID_GPIO}", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=1, column=1, sticky="w")
 
-    ctk.CTkLabel(gpio_info, text="ON 스위치", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(8, 0))  # 라벨
-    ctk.CTkLabel(gpio_info, text=f"BCM {SW_ON_GPIO}", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=2, column=1, sticky="w", pady=(8, 0))  # 값
+    ctk.CTkLabel(gpio_info, text="ON 스위치", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+    ctk.CTkLabel(gpio_info, text=f"BCM {SW_ON_GPIO}", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=2, column=1, sticky="w", pady=(8, 0))
 
-    ctk.CTkLabel(gpio_info, text="OFF 스위치", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(8, 0))  # 라벨
-    ctk.CTkLabel(gpio_info, text=f"BCM {SW_OFF_GPIO}", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=3, column=1, sticky="w", pady=(8, 0))  # 값
+    ctk.CTkLabel(gpio_info, text="OFF 스위치", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+    ctk.CTkLabel(gpio_info, text=f"BCM {SW_OFF_GPIO}", text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=3, column=1, sticky="w", pady=(8, 0))
 
-    ctk.CTkLabel(gpio_info, text="TRIGGER", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(8, 0))  # 라벨
+    ctk.CTkLabel(gpio_info, text="TRIGGER", text_color=C_TEXT, font=("Malgun Gothic", 14, "bold")).grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
     trig_txt = "HIGH" if RELAY_ACTIVE_HIGH else "LOW"               # 릴레이 트리거 문자열
-    ctk.CTkLabel(gpio_info, text=trig_txt, text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=4, column=1, sticky="w", pady=(8, 0))  # 값
+    ctk.CTkLabel(gpio_info, text=trig_txt, text_color=C_MUTED, font=("Malgun Gothic", 14)).grid(row=4, column=1, sticky="w", pady=(8, 0))
 
     btn_area = ctk.CTkFrame(left, fg_color=C_CARD, corner_radius=16)  # 버튼 영역
     btn_area.pack(fill="x", pady=(0, 12))                            # 배치
 
-    ctk.CTkButton(                                                   # ON 버튼
+    ctk.CTkButton(
         btn_area, text="ON  (주입 시작)", height=64, fg_color=C_NAVY, hover_color=C_NAVY_HOVER,
         font=("Malgun Gothic", 20, "bold"), corner_radius=18, command=gui_on
-    ).pack(fill="x", pady=(0, 10))                                   # 배치
+    ).pack(fill="x", pady=(0, 10))
 
-    ctk.CTkButton(                                                   # OFF 버튼
+    ctk.CTkButton(
         btn_area, text="OFF (주입 종료)", height=64, fg_color=C_CARD, hover_color="#F1F5F9",
         border_color="#CBD5E1", border_width=2, text_color=C_TEXT,
         font=("Malgun Gothic", 20, "bold"), corner_radius=18, command=gui_off
-    ).pack(fill="x")                                                 # 배치
+    ).pack(fill="x")
 
     tune = ctk.CTkFrame(left, fg_color=C_CARD, corner_radius=16)     # 튜닝 패널 프레임
     tune.pack(fill="both", expand=True)                              # 배치
     tune.grid_columnconfigure(0, weight=1)                           # 단일 열
 
-    ctk.CTkLabel(tune, text="튜닝 패널", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))  # 제목
+    ctk.CTkLabel(tune, text="튜닝 패널", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
 
-    DEFAULT_STOP_TRIGGER_COUNT = int(STOP_TRIGGER_COUNT)             # 기본값 저장
-    DEFAULT_CONTROL_START_TIME = float(CONTROL_START_TIME)           # 기본값 저장
-    DEFAULT_TARGET_AIR_CM = float(TARGET_AIR_CM)                     # 기본값 저장
-    DEFAULT_FREQ_MAX_LIMIT = int(FREQ_MAX_LIMIT)                     # 기본값 저장
-    DEFAULT_EARLY_CEIL_HZ = int(EARLY_CEIL_HZ)                       # 기본값 저장
+    DEFAULT_STOP_TRIGGER_COUNT = int(STOP_TRIGGER_COUNT)
+    DEFAULT_CONTROL_START_TIME = float(CONTROL_START_TIME)
+    DEFAULT_TARGET_AIR_CM = float(TARGET_AIR_CM)
+    DEFAULT_FREQ_MAX_LIMIT = int(FREQ_MAX_LIMIT)
+    DEFAULT_EARLY_CEIL_HZ = int(EARLY_CEIL_HZ)
 
-    lock_var = ctk.BooleanVar(value=True)                            # LOCK 스위치 상태
-    stop_cnt_var = ctk.IntVar(value=DEFAULT_STOP_TRIGGER_COUNT)      # 정지 카운트 변수
-    ctrl_start_var = ctk.DoubleVar(value=DEFAULT_CONTROL_START_TIME) # 제어 시작 변수
-    target_air_var = ctk.DoubleVar(value=DEFAULT_TARGET_AIR_CM)      # 목표 공기층 변수
-    fmax_var = ctk.IntVar(value=DEFAULT_FREQ_MAX_LIMIT)              # 최대 주파수 변수
-    early_ceil_var = ctk.IntVar(value=DEFAULT_EARLY_CEIL_HZ)         # 초반 상한 변수
-    lock_hint = ctk.StringVar(value="LOCK 상태: 변경 불가")           # 힌트 문자열
+    lock_var = ctk.BooleanVar(value=True)
+    stop_cnt_var = ctk.IntVar(value=DEFAULT_STOP_TRIGGER_COUNT)
+    ctrl_start_var = ctk.DoubleVar(value=DEFAULT_CONTROL_START_TIME)
+    target_air_var = ctk.DoubleVar(value=DEFAULT_TARGET_AIR_CM)
+    fmax_var = ctk.IntVar(value=DEFAULT_FREQ_MAX_LIMIT)
+    early_ceil_var = ctk.IntVar(value=DEFAULT_EARLY_CEIL_HZ)
+    lock_hint = ctk.StringVar(value="LOCK 상태: 변경 불가")
 
     def apply_tuning_from_vars():
         global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ, TARGET_AIR_CM
         global target_freq, current_diameter, calibration_done
 
         if lock_var.get():
-            return                                                  # LOCK이면 무시
+            return
 
-        STOP_TRIGGER_COUNT = int(stop_cnt_var.get())                # 정지 카운트 적용
-        CONTROL_START_TIME = float(ctrl_start_var.get())            # 제어 시작 적용
-        TARGET_AIR_CM = float(target_air_var.get())                 # 목표 공기층 적용
-        FREQ_MAX_LIMIT = int(fmax_var.get())                        # 최대 주파수 적용
-        EARLY_CEIL_HZ = int(early_ceil_var.get())                   # 초반 상한 적용
+        STOP_TRIGGER_COUNT = int(stop_cnt_var.get())
+        CONTROL_START_TIME = float(ctrl_start_var.get())
+        TARGET_AIR_CM = float(target_air_var.get())
+        FREQ_MAX_LIMIT = int(fmax_var.get())
+        EARLY_CEIL_HZ = int(early_ceil_var.get())
 
         with lock:
             if calibration_done and current_diameter > 0:
-                target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)  # 유효 길이
-                target_freq = float(SOUND_SPEED / (4 * target_L_effective))  # 목표 주파수 갱신
+                target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)
+                target_freq = float(SOUND_SPEED / (4 * target_L_effective))
 
     def on_lock_toggle():
-        is_locked = lock_var.get()                                  # LOCK 상태 읽기
-        lock_hint.set("LOCK 상태: 변경 불가" if is_locked else "UNLOCK 상태: 변경 가능")  # 힌트 갱신
-        state = "disabled" if is_locked else "normal"               # 위젯 상태 문자열
+        is_locked = lock_var.get()
+        lock_hint.set("LOCK 상태: 변경 불가" if is_locked else "UNLOCK 상태: 변경 가능")
+        state = "disabled" if is_locked else "normal"
 
-        stop_cnt_slider.configure(state=state)                      # 슬라이더 상태 적용
-        ctrl_start_slider.configure(state=state)                    # 슬라이더 상태 적용
-        target_air_slider.configure(state=state)                    # 슬라이더 상태 적용
-        early_ceil_slider.configure(state=state)                    # 슬라이더 상태 적용
-        fmax_slider.configure(state=state)                          # 슬라이더 상태 적용
+        stop_cnt_slider.configure(state=state)
+        ctrl_start_slider.configure(state=state)
+        target_air_slider.configure(state=state)
+        early_ceil_slider.configure(state=state)
+        fmax_slider.configure(state=state)
 
     def reset_to_defaults():
         global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ, TARGET_AIR_CM
         global target_freq, current_diameter, calibration_done
 
-        stop_cnt_var.set(DEFAULT_STOP_TRIGGER_COUNT)                # 변수 복원
-        ctrl_start_var.set(DEFAULT_CONTROL_START_TIME)              # 변수 복원
-        target_air_var.set(DEFAULT_TARGET_AIR_CM)                   # 변수 복원
-        fmax_var.set(DEFAULT_FREQ_MAX_LIMIT)                        # 변수 복원
-        early_ceil_var.set(DEFAULT_EARLY_CEIL_HZ)                   # 변수 복원
+        stop_cnt_var.set(DEFAULT_STOP_TRIGGER_COUNT)
+        ctrl_start_var.set(DEFAULT_CONTROL_START_TIME)
+        target_air_var.set(DEFAULT_TARGET_AIR_CM)
+        fmax_var.set(DEFAULT_FREQ_MAX_LIMIT)
+        early_ceil_var.set(DEFAULT_EARLY_CEIL_HZ)
 
-        stop_cnt_slider.set(DEFAULT_STOP_TRIGGER_COUNT)             # 슬라이더 복원
-        ctrl_start_slider.set(DEFAULT_CONTROL_START_TIME)           # 슬라이더 복원
-        target_air_slider.set(DEFAULT_TARGET_AIR_CM)                # 슬라이더 복원
-        fmax_slider.set(DEFAULT_FREQ_MAX_LIMIT)                     # 슬라이더 복원
-        early_ceil_slider.set(DEFAULT_EARLY_CEIL_HZ)                # 슬라이더 복원
+        stop_cnt_slider.set(DEFAULT_STOP_TRIGGER_COUNT)
+        ctrl_start_slider.set(DEFAULT_CONTROL_START_TIME)
+        target_air_slider.set(DEFAULT_TARGET_AIR_CM)
+        fmax_slider.set(DEFAULT_FREQ_MAX_LIMIT)
+        early_ceil_slider.set(DEFAULT_EARLY_CEIL_HZ)
 
-        STOP_TRIGGER_COUNT = DEFAULT_STOP_TRIGGER_COUNT             # 전역 적용
-        CONTROL_START_TIME = DEFAULT_CONTROL_START_TIME             # 전역 적용
-        TARGET_AIR_CM = DEFAULT_TARGET_AIR_CM                       # 전역 적용
-        FREQ_MAX_LIMIT = DEFAULT_FREQ_MAX_LIMIT                     # 전역 적용
-        EARLY_CEIL_HZ = DEFAULT_EARLY_CEIL_HZ                       # 전역 적용
+        STOP_TRIGGER_COUNT = DEFAULT_STOP_TRIGGER_COUNT
+        CONTROL_START_TIME = DEFAULT_CONTROL_START_TIME
+        TARGET_AIR_CM = DEFAULT_TARGET_AIR_CM
+        FREQ_MAX_LIMIT = DEFAULT_FREQ_MAX_LIMIT
+        EARLY_CEIL_HZ = DEFAULT_EARLY_CEIL_HZ
 
-        stop_cnt_val.set(f"{DEFAULT_STOP_TRIGGER_COUNT}")           # 라벨 복원
-        ctrl_start_val.set(f"{DEFAULT_CONTROL_START_TIME:.1f} s")   # 라벨 복원
-        target_air_val.set(f"{DEFAULT_TARGET_AIR_CM:.1f} cm")       # 라벨 복원
-        fmax_val.set(f"{DEFAULT_FREQ_MAX_LIMIT} Hz")                # 라벨 복원
-        early_ceil_val.set(f"{DEFAULT_EARLY_CEIL_HZ} Hz")           # 라벨 복원
+        stop_cnt_val.set(f"{DEFAULT_STOP_TRIGGER_COUNT}")
+        ctrl_start_val.set(f"{DEFAULT_CONTROL_START_TIME:.1f} s")
+        target_air_val.set(f"{DEFAULT_TARGET_AIR_CM:.1f} cm")
+        fmax_val.set(f"{DEFAULT_FREQ_MAX_LIMIT} Hz")
+        early_ceil_val.set(f"{DEFAULT_EARLY_CEIL_HZ} Hz")
 
         with lock:
             if calibration_done and current_diameter > 0:
-                target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)  # 유효 길이
-                target_freq = float(SOUND_SPEED / (4 * target_L_effective))  # 목표 주파수 재계산
+                target_L_effective = TARGET_AIR_CM + (END_CORRECTION_K * current_diameter)
+                target_freq = float(SOUND_SPEED / (4 * target_L_effective))
 
-        hit_var.set(f"확신(Hits) : 0/{STOP_TRIGGER_COUNT}")         # hits 라벨 갱신
-        set_status("튜닝 값 초기화(기본값 복귀)")                    # 상태 표시
+        hit_var.set(f"확신(Hits) : 0/{STOP_TRIGGER_COUNT}")
+        set_status("튜닝 값 초기화(기본값 복귀)")
 
-    lock_row = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)  # LOCK 행
-    lock_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))  # 배치
-    lock_row.grid_columnconfigure(0, weight=0)                      # 초기화 버튼
-    lock_row.grid_columnconfigure(1, weight=0)                      # 스위치
-    lock_row.grid_columnconfigure(2, weight=1)                      # 힌트 확장
+    lock_row = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
+    lock_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+    lock_row.grid_columnconfigure(0, weight=0)
+    lock_row.grid_columnconfigure(1, weight=0)
+    lock_row.grid_columnconfigure(2, weight=1)
 
-    ctk.CTkButton(                                                  # 초기화 버튼
+    ctk.CTkButton(
         lock_row, text="초기화", height=28, width=70,
         fg_color=C_CARD, hover_color="#EEF2FF",
         border_color="#CBD5E1", border_width=2,
         text_color=C_NAVY, font=("Malgun Gothic", 12, "bold"),
         command=reset_to_defaults
-    ).grid(row=0, column=0, sticky="w")                            # 배치
+    ).grid(row=0, column=0, sticky="w")
 
-    ctk.CTkSwitch(lock_row, text="LOCK", variable=lock_var, command=on_lock_toggle).grid(row=0, column=1, sticky="w", padx=(10, 12))  # LOCK 스위치
-    ctk.CTkLabel(lock_row, textvariable=lock_hint, text_color=C_MUTED, font=("Malgun Gothic", 12, "normal")).grid(row=0, column=2, sticky="w")  # 힌트
+    ctk.CTkSwitch(lock_row, text="LOCK", variable=lock_var, command=on_lock_toggle).grid(row=0, column=1, sticky="w", padx=(10, 12))
+    ctk.CTkLabel(lock_row, textvariable=lock_hint, text_color=C_MUTED, font=("Malgun Gothic", 12, "normal")).grid(row=0, column=2, sticky="w")
 
-    SLIDER_H = 18                                                   # 슬라이더 높이
+    SLIDER_H = 18
 
-    sec1 = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)    # 섹션1
-    sec1.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 0))   # 배치
-    sec1.grid_columnconfigure(0, weight=1)                          # 확장
+    sec1 = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
+    sec1.grid(row=2, column=0, sticky="ew", padx=12, pady=(6, 0))
+    sec1.grid_columnconfigure(0, weight=1)
 
-    ctk.CTkLabel(sec1, text="정지 확신 카운트 (STOP_TRIGGER_COUNT)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")  # 제목
-    stop_cnt_val = ctk.StringVar(value=str(DEFAULT_STOP_TRIGGER_COUNT))  # 값 문자열
-    ctk.CTkLabel(sec1, textvariable=stop_cnt_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))  # 값 라벨
+    ctk.CTkLabel(sec1, text="정지 확신 카운트 (STOP_TRIGGER_COUNT)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")
+    stop_cnt_val = ctk.StringVar(value=str(DEFAULT_STOP_TRIGGER_COUNT))
+    ctk.CTkLabel(sec1, textvariable=stop_cnt_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))
 
     def on_stop_cnt(v):
-        stop_cnt_val.set(f"{int(float(v))}")                        # 표시값 갱신
-        stop_cnt_var.set(int(float(v)))                             # 변수 갱신
-        apply_tuning_from_vars()                                    # 전역 반영
+        stop_cnt_val.set(f"{int(float(v))}")
+        stop_cnt_var.set(int(float(v)))
+        apply_tuning_from_vars()
 
-    stop_cnt_slider = ctk.CTkSlider(sec1, from_=5, to=30, number_of_steps=25, height=SLIDER_H, command=on_stop_cnt)  # 슬라이더
-    stop_cnt_slider.set(DEFAULT_STOP_TRIGGER_COUNT)                 # 초기값
-    stop_cnt_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))  # 배치
+    stop_cnt_slider = ctk.CTkSlider(sec1, from_=5, to=30, number_of_steps=25, height=SLIDER_H, command=on_stop_cnt)
+    stop_cnt_slider.set(DEFAULT_STOP_TRIGGER_COUNT)
+    stop_cnt_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-    sec2 = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)    # 섹션2
-    sec2.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 0))   # 배치
-    sec2.grid_columnconfigure(0, weight=1)                          # 확장
+    sec2 = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
+    sec2.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 0))
+    sec2.grid_columnconfigure(0, weight=1)
 
-    ctk.CTkLabel(sec2, text="제어 시작 시간 (CONTROL_START_TIME)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")  # 제목
-    ctrl_start_val = ctk.StringVar(value=f"{DEFAULT_CONTROL_START_TIME:.1f} s")  # 값 문자열
-    ctk.CTkLabel(sec2, textvariable=ctrl_start_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))  # 값 라벨
+    ctk.CTkLabel(sec2, text="제어 시작 시간 (CONTROL_START_TIME)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")
+    ctrl_start_val = ctk.StringVar(value=f"{DEFAULT_CONTROL_START_TIME:.1f} s")
+    ctk.CTkLabel(sec2, textvariable=ctrl_start_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))
 
     def on_ctrl_start(v):
-        ctrl_start_val.set(f"{float(v):.1f} s")                     # 표시값 갱신
-        ctrl_start_var.set(float(v))                                # 변수 갱신
-        apply_tuning_from_vars()                                    # 전역 반영
+        ctrl_start_val.set(f"{float(v):.1f} s")
+        ctrl_start_var.set(float(v))
+        apply_tuning_from_vars()
 
-    ctrl_start_slider = ctk.CTkSlider(sec2, from_=1.0, to=10.0, number_of_steps=90, height=SLIDER_H, command=on_ctrl_start)  # 슬라이더
-    ctrl_start_slider.set(DEFAULT_CONTROL_START_TIME)               # 초기값
-    ctrl_start_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))  # 배치
+    ctrl_start_slider = ctk.CTkSlider(sec2, from_=1.0, to=10.0, number_of_steps=90, height=SLIDER_H, command=on_ctrl_start)
+    ctrl_start_slider.set(DEFAULT_CONTROL_START_TIME)
+    ctrl_start_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-    sec3 = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)    # 섹션3
-    sec3.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 0))   # 배치
-    sec3.grid_columnconfigure(0, weight=1)                          # 확장
+    sec3 = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
+    sec3.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 0))
+    sec3.grid_columnconfigure(0, weight=1)
 
-    ctk.CTkLabel(sec3, text="남은 공기 기둥 (TARGET_AIR_CM)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")  # 제목
-    target_air_val = ctk.StringVar(value=f"{DEFAULT_TARGET_AIR_CM:.1f} cm")  # 값 문자열
-    ctk.CTkLabel(sec3, textvariable=target_air_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))  # 값 라벨
+    ctk.CTkLabel(sec3, text="남은 공기 기둥 (TARGET_AIR_CM)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")
+    target_air_val = ctk.StringVar(value=f"{DEFAULT_TARGET_AIR_CM:.1f} cm")
+    ctk.CTkLabel(sec3, textvariable=target_air_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))
 
     def on_target_air(v):
-        v2 = round(float(v), 1)                                     # 0.1 단위 반올림
-        target_air_val.set(f"{v2:.1f} cm")                          # 표시값 갱신
-        target_air_var.set(v2)                                      # 변수 갱신
-        apply_tuning_from_vars()                                    # 전역 반영
+        v2 = round(float(v), 1)
+        target_air_val.set(f"{v2:.1f} cm")
+        target_air_var.set(v2)
+        apply_tuning_from_vars()
 
-    target_air_slider = ctk.CTkSlider(sec3, from_=1.0, to=5.0, number_of_steps=40, height=SLIDER_H, command=on_target_air)  # 슬라이더
-    target_air_slider.set(DEFAULT_TARGET_AIR_CM)                    # 초기값
-    target_air_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))  # 배치
+    target_air_slider = ctk.CTkSlider(sec3, from_=1.0, to=5.0, number_of_steps=40, height=SLIDER_H, command=on_target_air)
+    target_air_slider.set(DEFAULT_TARGET_AIR_CM)
+    target_air_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-    bottom_row = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)  # 하단 2열 영역
-    bottom_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(10, 12))  # 배치
-    bottom_row.grid_columnconfigure(0, weight=1)                    # 좌측 확장
-    bottom_row.grid_columnconfigure(1, weight=1)                    # 우측 확장
+    bottom_row = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
+    bottom_row.grid(row=5, column=0, sticky="ew", padx=12, pady=(10, 12))
+    bottom_row.grid_columnconfigure(0, weight=1)
+    bottom_row.grid_columnconfigure(1, weight=1)
 
-    early_box = ctk.CTkFrame(bottom_row, fg_color=C_CARD, corner_radius=12)  # 초반 상한 박스
-    early_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))      # 배치
-    early_box.grid_columnconfigure(0, weight=1)                     # 확장
+    early_box = ctk.CTkFrame(bottom_row, fg_color=C_CARD, corner_radius=12)
+    early_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+    early_box.grid_columnconfigure(0, weight=1)
 
-    ctk.CTkLabel(early_box, text="초반 제한 상한 (EARLY_CEIL_HZ)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")  # 제목
-    early_ceil_val = ctk.StringVar(value=f"{DEFAULT_EARLY_CEIL_HZ} Hz")  # 값 문자열
-    ctk.CTkLabel(early_box, textvariable=early_ceil_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))  # 값 라벨
+    ctk.CTkLabel(early_box, text="초반 제한 상한 (EARLY_CEIL_HZ)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")
+    early_ceil_val = ctk.StringVar(value=f"{DEFAULT_EARLY_CEIL_HZ} Hz")
+    ctk.CTkLabel(early_box, textvariable=early_ceil_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))
 
     def on_early_ceil(v):
-        vv = int(float(v))                                          # 정수 변환
-        early_ceil_val.set(f"{vv} Hz")                              # 표시값 갱신
-        early_ceil_var.set(vv)                                      # 변수 갱신
-        apply_tuning_from_vars()                                    # 전역 반영
+        vv = int(float(v))
+        early_ceil_val.set(f"{vv} Hz")
+        early_ceil_var.set(vv)
+        apply_tuning_from_vars()
 
-    early_ceil_slider = ctk.CTkSlider(early_box, from_=300, to=1500, number_of_steps=120, height=SLIDER_H, command=on_early_ceil)  # 슬라이더
-    early_ceil_slider.set(DEFAULT_EARLY_CEIL_HZ)                    # 초기값
-    early_ceil_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))  # 배치
+    early_ceil_slider = ctk.CTkSlider(early_box, from_=300, to=1500, number_of_steps=120, height=SLIDER_H, command=on_early_ceil)
+    early_ceil_slider.set(DEFAULT_EARLY_CEIL_HZ)
+    early_ceil_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-    fmax_box = ctk.CTkFrame(bottom_row, fg_color=C_CARD, corner_radius=12)  # 최대 주파수 박스
-    fmax_box.grid(row=0, column=1, sticky="ew", padx=(10, 0))       # 배치
-    fmax_box.grid_columnconfigure(0, weight=1)                      # 확장
+    fmax_box = ctk.CTkFrame(bottom_row, fg_color=C_CARD, corner_radius=12)
+    fmax_box.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+    fmax_box.grid_columnconfigure(0, weight=1)
 
-    ctk.CTkLabel(fmax_box, text="최대 탐색 주파수 (FREQ_MAX_LIMIT)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")  # 제목
-    fmax_val = ctk.StringVar(value=f"{DEFAULT_FREQ_MAX_LIMIT} Hz")  # 값 문자열
-    ctk.CTkLabel(fmax_box, textvariable=fmax_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))  # 값 라벨
+    ctk.CTkLabel(fmax_box, text="최대 탐색 주파수 (FREQ_MAX_LIMIT)", text_color=C_TEXT, font=("Malgun Gothic", 13, "bold")).grid(row=0, column=0, sticky="w")
+    fmax_val = ctk.StringVar(value=f"{DEFAULT_FREQ_MAX_LIMIT} Hz")
+    ctk.CTkLabel(fmax_box, textvariable=fmax_val, text_color=C_MUTED, font=("Malgun Gothic", 12)).grid(row=1, column=0, sticky="w", pady=(0, 4))
 
     def on_fmax(v):
-        vv = int(float(v))                                          # 정수 변환
-        fmax_val.set(f"{vv} Hz")                                    # 표시값 갱신
-        fmax_var.set(vv)                                            # 변수 갱신
-        apply_tuning_from_vars()                                    # 전역 반영
+        vv = int(float(v))
+        fmax_val.set(f"{vv} Hz")
+        fmax_var.set(vv)
+        apply_tuning_from_vars()
 
-    fmax_slider = ctk.CTkSlider(fmax_box, from_=800, to=5000, number_of_steps=420, height=SLIDER_H, command=on_fmax)  # 슬라이더
-    fmax_slider.set(DEFAULT_FREQ_MAX_LIMIT)                         # 초기값
-    fmax_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))    # 배치
+    fmax_slider = ctk.CTkSlider(fmax_box, from_=800, to=5000, number_of_steps=420, height=SLIDER_H, command=on_fmax)
+    fmax_slider.set(DEFAULT_FREQ_MAX_LIMIT)
+    fmax_slider.grid(row=2, column=0, sticky="ew", pady=(2, 8))
 
-    on_lock_toggle()                                                # 초기 LOCK 상태 반영
+    on_lock_toggle()
 
-    prog_area = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)  # 진행도 영역
-    prog_area.pack(fill="x", pady=(0, 12))                          # 배치
+    prog_area = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
+    prog_area.pack(fill="x", pady=(0, 12))
 
-    ctk.CTkLabel(prog_area, text="정지 확신도", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(0, 8))  # 제목
-    progress = ctk.CTkProgressBar(prog_area, height=18, corner_radius=10, fg_color="#E5E7EB", progress_color=C_NAVY)  # 진행바
-    progress.set(0.0)                                               # 초기값
-    progress.pack(fill="x")                                         # 배치
+    ctk.CTkLabel(prog_area, text="정지 확신도", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(0, 8))
+    progress = ctk.CTkProgressBar(prog_area, height=18, corner_radius=10, fg_color="#E5E7EB", progress_color=C_NAVY)
+    progress.set(0.0)
+    progress.pack(fill="x")
 
-    stats = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)  # 통계 영역
-    stats.pack(fill="x", pady=(0, 12))                              # 배치
+    stats = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
+    stats.pack(fill="x", pady=(0, 12))
 
     def add_stat(p, v):
-        r = ctk.CTkFrame(p, fg_color=C_CARD, corner_radius=12)      # 한 줄 카드
-        r.pack(fill="x", pady=4)                                    # 배치
-        ctk.CTkLabel(r, textvariable=v, text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", padx=6)  # 텍스트
+        r = ctk.CTkFrame(p, fg_color=C_CARD, corner_radius=12)
+        r.pack(fill="x", pady=4)
+        ctk.CTkLabel(r, textvariable=v, text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", padx=6)
 
-    add_stat(stats, d_var)                                          # 지름 표시
-    add_stat(stats, f_var)                                          # 주파수 표시
-    add_stat(stats, tf_var)                                          # 목표 표시
-    add_stat(stats, air_var)                                        # 공기층 표시
-    add_stat(stats, hit_var)                                        # hits 표시
+    add_stat(stats, d_var)
+    add_stat(stats, f_var)
+    add_stat(stats, tf_var)
+    add_stat(stats, air_var)
+    add_stat(stats, hit_var)
 
-    plot_frame = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)  # 그래프 영역
-    plot_frame.pack(fill="both", expand=True)                       # 배치
+    plot_frame = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
+    plot_frame.pack(fill="both", expand=True)
 
-    ctk.CTkLabel(plot_frame, text="실시간 주파수 추적 그래프", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(0, 6))  # 제목
+    ctk.CTkLabel(plot_frame, text="실시간 주파수 추적 그래프", text_color=C_TEXT, font=("Malgun Gothic", 16, "bold")).pack(anchor="w", pady=(0, 6))
 
-    fig = Figure(figsize=(6.2, 3.0), dpi=100)                      # Figure 생성
-    ax = fig.add_subplot(111)                                       # 단일 축
-    ax.set_xlabel("t [s]")                                          # x축 이름
-    ax.set_ylabel("f [Hz]")                                         # y축 이름
-    ax.grid(True, alpha=0.3)                                        # 격자
-    fig.tight_layout(pad=3.0)                                       # 여백 정리
+    fig = Figure(figsize=(6.2, 3.0), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.set_xlabel("t [s]")
+    ax.set_ylabel("f [Hz]")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout(pad=3.0)
 
-    line_freq, = ax.plot([], [], linewidth=1.5)                     # 주파수 라인
-    target_line = ax.axhline(y=0, linestyle="--", alpha=0.8)        # 목표선
+    line_freq, = ax.plot([], [], linewidth=1.5)
+    target_line = ax.axhline(y=0, linestyle="--", alpha=0.8)
 
-    canvas = FigureCanvasTkAgg(fig, master=plot_frame)              # Tk 임베딩 캔버스
-    canvas.get_tk_widget().pack(fill="both", expand=True)           # 배치
+    canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+    canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def periodic_update():
         global request_finish
 
         with lock:
-            d = float(current_diameter)                              # 지름 복사
-            sf = float(last_stable_f)                                # 안정 주파수 복사
-            tf = float(target_freq)                                  # 목표 주파수 복사
-            air = float(last_current_air)                            # 공기층 복사
-            hits = int(consecutive_stop_hits)                        # hits 복사
-            do_finish = bool(request_finish)                         # 저장 요청 복사
+            d = float(current_diameter)
+            sf = float(last_stable_f)
+            tf = float(target_freq)
+            air = float(last_current_air)
+            hits = int(consecutive_stop_hits)
+            do_finish = bool(request_finish)
             if request_finish:
-                request_finish = False                               # 저장 요청 클리어
-            t_list = list(history_time)                              # 시간 히스토리 복사
-            f_list = list(history_freq)                              # 주파수 히스토리 복사
+                request_finish = False
+            t_list = list(history_time)
+            f_list = list(history_freq)
 
-        d_var.set(f"지름(D) : {d:.2f} cm" if d > 0 else "지름(D) : - cm")  # 라벨 업데이트
-        f_var.set(f"주파수(F) : {sf:.0f} Hz" if sf > 0 else "주파수(F) : - Hz")  # 라벨 업데이트
-        tf_var.set(f"목표(Target) : {tf:.0f} Hz" if tf > 0 else "목표(Target) : - Hz")  # 라벨 업데이트
-        air_var.set(f"공기층(Air) : {air:.2f} cm" if air != 0 else "공기층(Air) : - cm")  # 라벨 업데이트
-        hit_var.set(f"확신(Hits) : {hits}/{STOP_TRIGGER_COUNT}")     # 라벨 업데이트
+        d_var.set(f"지름(D) : {d:.2f} cm" if d > 0 else "지름(D) : - cm")
+        f_var.set(f"주파수(F) : {sf:.0f} Hz" if sf > 0 else "주파수(F) : - Hz")
+        tf_var.set(f"목표(Target) : {tf:.0f} Hz" if tf > 0 else "목표(Target) : - Hz")
+        air_var.set(f"공기층(Air) : {air:.2f} cm" if air != 0 else "공기층(Air) : - cm")
+        hit_var.set(f"확신(Hits) : {hits}/{STOP_TRIGGER_COUNT}")
 
-        progress.set(hits / float(max(1, STOP_TRIGGER_COUNT)))       # 진행바 업데이트
+        progress.set(hits / float(max(1, STOP_TRIGGER_COUNT)))
 
         if not t_list:
-            line_freq.set_data([], [])                               # 데이터 없음
-            target_line.set_ydata([0, 0])                            # 목표선 초기화
-            ax.set_xlim(0, 1)                                        # x축 기본
-            ax.set_ylim(FREQ_MIN_LIMIT, FREQ_MAX_LIMIT)              # y축 기본
-            canvas.draw_idle()                                       # 그리기 요청
+            line_freq.set_data([], [])
+            target_line.set_ydata([0, 0])
+            ax.set_xlim(0, 1)
+            ax.set_ylim(FREQ_MIN_LIMIT, FREQ_MAX_LIMIT)
+            canvas.draw_idle()
         else:
             if len(t_list) > PLOT_MAX_POINTS:
-                t_list = t_list[-PLOT_MAX_POINTS:]                   # 뒤쪽만 유지
-                f_list = f_list[-PLOT_MAX_POINTS:]                   # 뒤쪽만 유지
+                t_list = t_list[-PLOT_MAX_POINTS:]
+                f_list = f_list[-PLOT_MAX_POINTS:]
 
-            line_freq.set_data(t_list, f_list)                       # 라인 데이터 갱신
+            line_freq.set_data(t_list, f_list)
 
-            t_max = max(t_list)                                      # 최대 시간
-            ax.set_xlim(max(0, t_max - 30), max(5, t_max))           # 최근 30초 뷰
+            t_max = max(t_list)
+            ax.set_xlim(max(0, t_max - 30), max(5, t_max))
 
-            f_min, f_max = min(f_list), max(f_list)                  # 범위 계산
-            pad = max(50, 0.1 * (f_max - f_min))                     # 여유폭
-            ax.set_ylim(max(0, f_min - pad), f_max + pad)            # y축 자동
+            f_min, f_max = min(f_list), max(f_list)
+            pad = max(50, 0.1 * (f_max - f_min))
+            ax.set_ylim(max(0, f_min - pad), f_max + pad)
 
             if tf > 0:
-                target_line.set_ydata([tf, tf])                      # 목표선 갱신
-                target_line.set_alpha(0.9)                           # 보이기
+                target_line.set_ydata([tf, tf])
+                target_line.set_alpha(0.9)
             else:
-                target_line.set_alpha(0.0)                           # 숨기기
+                target_line.set_alpha(0.0)
 
-            canvas.draw_idle()                                       # 그리기 요청
+            canvas.draw_idle()
 
         if do_finish:
-            set_status("종료 → 결과 저장")                           # 상태 표시
+            set_status("종료 → 결과 저장")
             with lock:
-                init_f = float(initial_stable_freq)                  # 초기 주파수 복사
-            save_to_csv(d, init_f, tf, sf)                           # CSV 저장
+                init_f = float(initial_stable_freq)
+            save_to_csv(d, init_f, tf, sf)
 
-        app.after(100, periodic_update)                              # 100ms 주기 재호출
+        app.after(100, periodic_update)
 
-    footer = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)  # 푸터 프레임
-    footer.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 18))  # 배치
-    ctk.CTkLabel(footer, textvariable=status_var, text_color=C_MUTED, font=("Malgun Gothic", 14, "normal")).pack(anchor="w")  # 상태 라벨
+    footer = ctk.CTkFrame(card, fg_color=C_CARD, corner_radius=20)
+    footer.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 18))
+    ctk.CTkLabel(footer, textvariable=status_var, text_color=C_MUTED, font=("Malgun Gothic", 14, "normal")).pack(anchor="w")
 
     # ===== 물리 스위치 이벤트 연결 =====
-    sw_on.when_pressed = gui_on                                      # GPIO3 눌리면 ON 시작
-    sw_off.when_pressed = gui_off                                    # GPIO5 눌리면 OFF 종료
+    sw_on.when_pressed = gui_on
+    sw_off.when_pressed = gui_off
 
-    app.protocol("WM_DELETE_WINDOW", on_close)                       # 종료 이벤트 연결
+    app.protocol("WM_DELETE_WINDOW", on_close)
 
-    solenoid_off()                                                   # 시작 시 안전 OFF
-    ensure_audio_stream()                                            # 오디오 스트림 준비
-    set_status("GPIO 제어 모드 준비 완료")                           # 상태 표시
-    periodic_update()                                                # 주기 업데이트 시작
-    app.mainloop()                                                   # GUI 메인루프
+    solenoid_off()
+    ensure_audio_stream()
+    set_status("GPIO 제어 모드 준비 완료")
+    periodic_update()
+    app.mainloop()
 
 if __name__ == "__main__":
-    run_kiosk_gui()                                                  # 프로그램 시작
+    run_kiosk_gui()
