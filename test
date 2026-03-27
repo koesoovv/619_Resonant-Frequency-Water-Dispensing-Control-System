@@ -63,7 +63,7 @@ PLOT_MAX_POINTS     = 2000
 # [★ LPC 설정]
 # =========================================================
 LPC_ORDER           = 16
-LPC_DS_FACTOR       = 5
+LPC_DS_FACTOR       = 10
 LPC_DS_RATE         = SAMPLE_RATE // LPC_DS_FACTOR   # 8820 Hz
 LPC_FRAME_MS        = 25
 LPC_HOP_MS          = 10
@@ -74,7 +74,7 @@ LPC_PEAK_PROM       = 0.3
 # =========================================================
 # [★ LOESS 설정]
 # =========================================================
-LOESS_FRAC          = 0.5
+LOESS_FRAC          = 0.3
 LOESS_DEGREE        = 1
 
 # =========================================================
@@ -526,7 +526,7 @@ def audio_callback(indata, frames, time_info, status):
             current_ceil = EARLY_CEIL_HZ
         else:
             base = _last if _last > 0 else (_last_s if _last_s > 0 else _init)
-            current_ceil = min(FREQ_MAX_LIMIT, base + 900.0) if base > 0 else FREQ_MAX_LIMIT
+            current_ceil = min(FREQ_MAX_LIMIT, base + 1500.0) if base > 0 else FREQ_MAX_LIMIT
 
         # ── Rising Floor ──
         if _last > 400:
