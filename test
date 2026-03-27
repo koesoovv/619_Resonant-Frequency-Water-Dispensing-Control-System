@@ -46,7 +46,7 @@ EARLY_CEIL_HZ       = 1000
 CALIBRATION_CUTOFF_RATIO = 0.90   # 하위 호환용으로 유지, 현재는 미사용
 FREQ_MIN_LIMIT      = 200
 NOISE_CALIBRATION_TIME   = 1.0
-SPLASH_GUARD_TIME        = 2.0
+SPLASH_GUARD_TIME        = 2.5
 
 SAMPLE_RATE         = 44100
 CHUNK_SIZE          = 4096
@@ -62,14 +62,14 @@ PLOT_MAX_POINTS     = 2000
 # =========================================================
 # [★ LPC 설정]
 # =========================================================
-LPC_ORDER           = 12
+LPC_ORDER           = 16
 LPC_DS_FACTOR       = 5
 LPC_DS_RATE         = SAMPLE_RATE // LPC_DS_FACTOR   # 8820 Hz
 LPC_FRAME_MS        = 25
 LPC_HOP_MS          = 10
-LPC_NFFT            = 2048
+LPC_NFFT            = 4096
 LPC_MIN_ENERGY      = 1e-8
-LPC_PEAK_PROM       = 0.10
+LPC_PEAK_PROM       = 0.3
 
 # =========================================================
 # [★ LOESS 설정]
@@ -89,7 +89,7 @@ MIN_SLOPE_CUTOFF = (16 * FLOW_RATE) / (np.pi * SOUND_SPEED * (10.0 ** 2)) * 0.3
 # 예) 현재 target=1800Hz이고 new_tf=1200Hz면 변화율=-33% → 차단
 #     현재 target=1800Hz이고 new_tf=1520Hz면 변화율=-16% → 허용
 # =========================================================
-TARGET_MAX_CHANGE_RATIO = 0.20   # 한 스텝에 최대 ±20% 변화 허용
+TARGET_MAX_CHANGE_RATIO = 0.25   # 한 스텝에 최대 ±20% 변화 허용
 
 # =========================================================
 # [★ v3 신규: 즉시 정지 트리거 비율]
@@ -247,7 +247,7 @@ def levinson_durbin(r, order):
 # [7. LPC 메인 주파수 추출]
 # =========================================================
 def lpc_main_frequency(chunk, last_freq, f_min, f_max):
-    x = signal.sosfilt(HP_SOS, chunk.astype(float))
+    x = chunk.astype(float)
 
     x_ds  = signal.decimate(x, LPC_DS_FACTOR, ftype='fir')
     sr_ds = LPC_DS_RATE
@@ -416,6 +416,7 @@ def start_filling_local() -> None:
     global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
     global current_diameter, target_freq, initial_stable_freq
     global request_finish, last_stable_f, last_current_air, dynamic_min_limit, noise_profile
+    global max_freq_seen, hard_stop_counter
 
     with lock:
         is_filling           = True
@@ -479,6 +480,7 @@ def audio_callback(indata, frames, time_info, status):
     global request_finish, last_stable_f, last_current_air, initial_stable_freq
     global last_print_time, dynamic_min_limit, noise_profile
     global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ
+    global max_freq_seen, hard_stop_counter
 
     if not is_filling:
         return
@@ -577,7 +579,9 @@ def audio_callback(indata, frames, time_info, status):
                     detected_f = _last * 0.3 + detected_f * 0.7
             else:
                 # 기존 v3 로직 유지
-                if ratio > 1.4 or ratio < 0.65:
+                if ratio < 0.65:
+                    detected_f = _last * 0.95 + detected_f * 0.05
+                elif ratio > 1.4 and (_tf_ema <= 0 or detected_f > _tf_ema * 1.15):
                     detected_f = _last * 0.95 + detected_f * 0.05
                 else:
                     detected_f = _last * 0.3 + detected_f * 0.7
