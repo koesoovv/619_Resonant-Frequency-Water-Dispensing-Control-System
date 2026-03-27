@@ -34,15 +34,16 @@ TARGET_AIR_CM       = 3.0
 
 STOP_OFFSET_HZ      = 0
 DIAMETER_SCALE      = 1.0
-CALC_START_TIME     = 3.0              # 지름 계산 시작 (filling_elapsed 기준)
+CALC_START_TIME     = 3.0
 
 # 가변 튜닝 파라미터
-STOP_TRIGGER_COUNT  = 10
+# ★ v3: STOP_TRIGGER_COUNT 10 → 5 (늦은 정지 개선)
+STOP_TRIGGER_COUNT  = 5
 CONTROL_START_TIME  = 4.0
-FREQ_MAX_LIMIT      = 3000             # ★ 3500 → 3000 (불필요한 고역 탐색 제거)
+FREQ_MAX_LIMIT      = 3000
 EARLY_CEIL_HZ       = 1000
 
-CALIBRATION_CUTOFF_RATIO = 0.90
+CALIBRATION_CUTOFF_RATIO = 0.90   # 하위 호환용으로 유지, 현재는 미사용
 FREQ_MIN_LIMIT      = 200
 NOISE_CALIBRATION_TIME   = 1.0
 SPLASH_GUARD_TIME        = 2.0
@@ -59,13 +60,13 @@ PLOT_UPDATE_MS      = 200
 PLOT_MAX_POINTS     = 2000
 
 # =========================================================
-# [★ LPC 설정 - PDF 정방향: LPC 메인 추출]
+# [★ LPC 설정]
 # =========================================================
-LPC_ORDER           = 12      # 다운샘플 후 8820 Hz 기준 차수 (음성처리 표준)
-LPC_DS_FACTOR       = 5       # 44100 / 5 = 8820 Hz
+LPC_ORDER           = 12
+LPC_DS_FACTOR       = 5
 LPC_DS_RATE         = SAMPLE_RATE // LPC_DS_FACTOR   # 8820 Hz
-LPC_FRAME_MS        = 25      # 25ms 단구간 프레임 (음성 LPC 표준)
-LPC_HOP_MS          = 10      # 10ms hop
+LPC_FRAME_MS        = 25
+LPC_HOP_MS          = 10
 LPC_NFFT            = 2048
 LPC_MIN_ENERGY      = 1e-8
 LPC_PEAK_PROM       = 0.10
@@ -73,11 +74,32 @@ LPC_PEAK_PROM       = 0.10
 # =========================================================
 # [★ LOESS 설정]
 # =========================================================
-LOESS_FRAC          = 0.5     # bandwidth (전체 데이터의 50%)
-LOESS_DEGREE        = 1       # 1차 다항식 (선형 LOESS)
+LOESS_FRAC          = 0.5
+LOESS_DEGREE        = 1
 
 # =========================================================
-# [전역 필터: 콜백마다 설계 금지]
+# [★ slope 최솟값 (v2 유지): D=10cm 기대 slope의 30%]
+# =========================================================
+MIN_SLOPE_CUTOFF = (16 * FLOW_RATE) / (np.pi * SOUND_SPEED * (10.0 ** 2)) * 0.3
+
+# =========================================================
+# [★ v3 신규: target 안정성 가드 비율]
+# target_freq가 한 번에 이 비율 이상 변하면 무시
+# calibration_frozen 제거 후 급격한 target 점프를 방지
+# 예) 현재 target=1800Hz이고 new_tf=1200Hz면 변화율=-33% → 차단
+#     현재 target=1800Hz이고 new_tf=1520Hz면 변화율=-16% → 허용
+# =========================================================
+TARGET_MAX_CHANGE_RATIO = 0.20   # 한 스텝에 최대 ±20% 변화 허용
+
+# =========================================================
+# [★ v3 신규: 즉시 정지 트리거 비율]
+# stable_f가 target의 이 배수를 초과하면 카운트 무시하고 즉시 정지
+# → STOP_TRIGGER_COUNT를 다 채우기 전에도 오버슈트가 크면 바로 멈춤
+# =========================================================
+HARD_STOP_RATIO = 1.05
+
+# =========================================================
+# [전역 필터]
 # =========================================================
 HP_SOS = signal.butter(4, 150, 'hp', fs=SAMPLE_RATE, output='sos')
 
@@ -95,7 +117,7 @@ freq_buffer         = []
 is_filling          = False
 filling_start_time  = 0.0
 calibration_done    = False
-calibration_frozen  = False
+# ★ v3: calibration_frozen 전역 변수 제거 (로직 전체 삭제)
 
 target_freq         = 0.0
 current_diameter    = 0.0
@@ -115,6 +137,8 @@ last_print_time     = 0.0
 audio_stream        = None
 lock                = threading.Lock()
 PRINT_INTERVAL      = 0.1
+hard_stop_counter = 0
+max_freq_seen = 0
 
 solenoid = OutputDevice(SOLENOID_GPIO, active_high=RELAY_ACTIVE_HIGH, initial_value=False)
 sw_on    = Button(SW_ON_GPIO,  pull_up=True, bounce_time=0.05)
@@ -135,7 +159,6 @@ def solenoid_off() -> None:
     except Exception as e:
         print(f"\n[GPIO OFF 실패] {e}")
 
-# ★ GPIO 블로킹을 콜백에서 분리 - 별도 스레드에서 OFF 실행
 def solenoid_off_async() -> None:
     threading.Thread(target=solenoid_off, daemon=True).start()
 
@@ -163,18 +186,9 @@ def save_to_csv(diameter, init_freq, target_f, final_freq):
         print(f"\n[저장 실패] {e}")
 
 # =========================================================
-# [5. LOESS 평활화 - PDF 명시 기법]
-# ★ 원본코드에 없던 기능. PDF p.12의 LOESS 평활화 구현
+# [5. LOESS 평활화 - PDF p.12]
 # =========================================================
 def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
-    """
-    LOWESS (Locally Weighted Scatterplot Smoothing)
-    PDF: "LOESS 알고리즘을 적용해 다항식으로 평활화" (p.12)
-
-    x, y : 1D array-like
-    frac : bandwidth (0~1, 이웃 데이터 비율)
-    degree: 1=선형 LOESS (PDF 방식)
-    """
     n = len(x)
     if n < 4:
         return np.array(y, dtype=float)
@@ -193,11 +207,9 @@ def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
             smoothed[i] = np.mean(y[idx])
             continue
 
-        # tricube 가중치: w(d) = (1 - |d/h|³)³
         u = dist[idx] / max_d
         w = (1.0 - u ** 3) ** 3
 
-        # 가중 최소자승 (WLS)
         X = np.column_stack([x[idx] ** p for p in range(degree + 1)])
         W = np.diag(w)
         try:
@@ -210,15 +222,9 @@ def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
     return smoothed
 
 # =========================================================
-# [6. Levinson-Durbin - numpy 최적화]
-# ★ 원본은 O(n²) 순수 파이썬 루프 → numpy 내적 활용
+# [6. Levinson-Durbin - v1 shape 버그 수정 유지]
 # =========================================================
 def levinson_durbin(r, order):
-    """
-    Levinson-Durbin 알고리즘
-    r: 자기상관 배열 r[0]..r[order]
-    반환: AR 계수 [1, a1, ..., aOrder]
-    """
     e = float(r[0])
     if e <= 0:
         return None
@@ -227,39 +233,27 @@ def levinson_durbin(r, order):
     a[0] = 1.0
 
     for k in range(1, order + 1):
-        # numpy 내적으로 누적항 계산 (순수 파이썬 루프 대비 ~10x 빠름)
         acc  = float(np.dot(a[1:k], r[k - 1:0:-1]))
         lam  = -(r[k] + acc) / (e + 1e-12)
 
-        # in-place 대칭 업데이트 (numpy RHS 먼저 평가 → 동시성 보장)
-        a[1:k + 1] += lam * a[k - 1::-1][1:k + 1]   # j=1..k-1 업데이트
+        if k > 1:
+            a[1:k] = a[1:k] + lam * a[k - 1:0:-1]
         a[k]  = lam
         e    *= max(1.0 - lam * lam, 1e-12)
 
-    return a   # a[0]=1 포함
+    return a
 
 # =========================================================
-# [7. LPC 메인 주파수 추출 - PDF 정방향]
-# ★ 원본: FFT 메인 + LPC 보조
-# ★ 수정: LPC 메인 (다운샘플 → 단구간 프레임 → Levinson → 1/|A| 피크)
+# [7. LPC 메인 주파수 추출]
 # =========================================================
 def lpc_main_frequency(chunk, last_freq, f_min, f_max):
-    """
-    PDF p.12: "LPC를 이용해 기주공명의 1배 진동수를 정확히 추출"
-
-    핵심 변경:
-    - 44100 Hz → 8820 Hz 다운샘플 (10x 계산 감소, 저역 분해능 향상)
-    - 단구간 프레임 (25ms) → 프레임별 LPC → 중앙값으로 안정화
-    """
     x = signal.sosfilt(HP_SOS, chunk.astype(float))
 
-    # [1] 다운샘플: 44100 → 8820 Hz (FIR 안티앨리어싱 포함)
     x_ds  = signal.decimate(x, LPC_DS_FACTOR, ftype='fir')
-    sr_ds = LPC_DS_RATE   # 8820 Hz
+    sr_ds = LPC_DS_RATE
 
-    # [2] 단구간 프레임 분할 (25ms 프레임, 10ms hop)
-    fl    = int(LPC_FRAME_MS  / 1000 * sr_ds)   # 220 samples
-    hop   = int(LPC_HOP_MS    / 1000 * sr_ds)   # 88 samples
+    fl    = int(LPC_FRAME_MS  / 1000 * sr_ds)
+    hop   = int(LPC_HOP_MS    / 1000 * sr_ds)
     frames = [x_ds[i:i + fl] for i in range(0, len(x_ds) - fl, hop)]
 
     if not frames:
@@ -267,12 +261,10 @@ def lpc_main_frequency(chunk, last_freq, f_min, f_max):
 
     cands = []
     for frame in frames:
-        # [3] 에너지 필터 (너무 작은 프레임 건너뜀)
         energy = float(np.mean(frame ** 2))
         if energy < LPC_MIN_ENERGY:
             continue
 
-        # [4] Hamming 창 + 편향 자기상관
         frame = frame * np.hamming(len(frame))
         r = np.array([
             np.dot(frame[:len(frame) - k], frame[k:]) / len(frame)
@@ -282,23 +274,19 @@ def lpc_main_frequency(chunk, last_freq, f_min, f_max):
         if r[0] < 1e-12:
             continue
 
-        # [5] Levinson-Durbin → AR 계수
         a = levinson_durbin(r, LPC_ORDER)
         if a is None:
             continue
 
-        # [6] 1/|A(e^jw)| 스펙트럼 (LPC 포먼트 스펙트럼)
         A    = np.fft.rfft(a, n=LPC_NFFT)
         mag  = 1.0 / (np.abs(A) + 1e-12)
         freqs = np.fft.rfftfreq(LPC_NFFT, d=1.0 / sr_ds)
 
-        # [7] 관심 대역 마스킹
         mask = (freqs >= f_min) & (freqs <= min(f_max, sr_ds / 2 - 50))
         if not np.any(mask):
             continue
         vf, vm = freqs[mask], mag[mask]
 
-        # [8] 피크 탐색 (노이즈 프로파일 제거 포함)
         prom     = vm.max() * LPC_PEAK_PROM
         peaks, _ = signal.find_peaks(vm, prominence=prom, distance=4)
         if len(peaks) == 0:
@@ -306,18 +294,16 @@ def lpc_main_frequency(chunk, last_freq, f_min, f_max):
 
         pf, pm = vf[peaks], vm[peaks]
 
-        # 노이즈 주파수 제거
         clean = [i for i, f in enumerate(pf)
                  if not any(abs(f - nf) < 25.0 for nf in noise_profile)]
         if not clean:
             continue
         pf, pm = pf[clean], pm[clean]
 
-        # [9] 연속성 + 상승 편향 점수 (PDF: 기주공명은 물이 차면서 단조 증가)
         pm_n  = pm / (pm.max() + 1e-12)
         if last_freq > 0:
             score = pm_n - (1.0 / 600.0) * np.abs(pf - last_freq)
-            score += 0.20 * (pf > last_freq)   # 상승 후보 가산
+            score += 0.20 * (pf > last_freq)
         else:
             score = pm_n
         cands.append(float(pf[np.argmax(score)]))
@@ -325,14 +311,12 @@ def lpc_main_frequency(chunk, last_freq, f_min, f_max):
     if not cands:
         return 0.0
 
-    return float(np.median(cands))   # 프레임 중앙값으로 최종 안정화
+    return float(np.median(cands))
 
 # =========================================================
-# [8. FFT 보조 추출 - 검증/백업용]
-# ★ 원본: FFT 메인, LPC 보조 → 역할 교체
+# [8. FFT 보조 추출]
 # =========================================================
 def fft_backup_frequency(chunk, last_freq, f_min, f_max):
-    """FFT 백업 추출기 (LPC 실패 시 또는 교차검증용)"""
     windowed = chunk * np.hamming(len(chunk))
     fft_val  = np.abs(np.fft.rfft(windowed))
     freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
@@ -363,20 +347,13 @@ def fft_backup_frequency(chunk, last_freq, f_min, f_max):
     return float(pf[np.argmax(score)])
 
 # =========================================================
-# [9. 메인 주파수 추정 - LPC 우선, FFT 보조]
-# ★ 원본 get_smart_frequency 재설계
+# [9. 메인 주파수 추정]
 # =========================================================
 def get_frequency(chunk, last_freq, f_min, f_max):
-    """
-    PDF 방향: LPC를 주 알고리즘으로 사용
-    LPC 실패 또는 비정상 시 FFT 보조
-    """
     filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
 
-    # [1] LPC 메인 추출
     lpc_f = lpc_main_frequency(filtered, last_freq, f_min, f_max)
 
-    # 배음 보정 (3배, 5배 튐 방지)
     if last_freq > 0 and lpc_f > 0:
         ratio = lpc_f / last_freq
         if   2.7 <= ratio <= 3.3: lpc_f /= 3.0
@@ -384,9 +361,8 @@ def get_frequency(chunk, last_freq, f_min, f_max):
         elif ratio > 2.5:         lpc_f  = 0.0
 
     if lpc_f > 0:
-        return float(lpc_f)   # LPC 성공
+        return float(lpc_f)
 
-    # [2] FFT 보조 (LPC 실패 시)
     fft_f = fft_backup_frequency(filtered, last_freq, f_min, f_max)
 
     if last_freq > 0 and fft_f > 0:
@@ -398,36 +374,30 @@ def get_frequency(chunk, last_freq, f_min, f_max):
     return float(fft_f)
 
 # =========================================================
-# [10. LOESS → LSM 강건 회귀 - PDF 정방향]
-# ★ 원본: RANSAC-like 잔차 컷만 사용
-# ★ 수정: LOESS 평활화 먼저 적용 후 LSM (PDF p.12 2단계 파이프라인)
+# [10. LOESS → LSM 강건 회귀]
+# v2 MIN_SLOPE_CUTOFF 유지
 # =========================================================
 def robust_slope_loess_lsm(times, inv_freqs):
-    """
-    PDF p.12: "LOESS 방법으로 평활화하고 최소자승법(LMS)을 이용해 회귀 분석"
-
-    파이프라인:
-      raw 1/f 데이터 → [LOESS 평활화] → [LSM 직선 피팅] → slope(a) 반환
-    """
     if len(times) < 12:
         return None, 0.0
 
     x = np.array(times,     dtype=float)
     y = np.array(inv_freqs, dtype=float)
 
-    # [1단계] LOESS 평활화 (물방울 튐 등 이상값 제거)
     y_smooth = loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE)
 
-    # [2단계] LSM 직선 피팅 (평활화된 데이터에 적용)
     try:
         p   = np.polyfit(x, y_smooth, 1)
         res = np.abs(y_smooth - (p[0] * x + p[1]))
-        # 75퍼센타일 inlier 컷 (원본 70에서 소폭 완화)
         mask = res <= np.percentile(res, 75)
         if mask.sum() < 8:
             return None, 0.0
 
         slope, intercept = np.polyfit(x[mask], y_smooth[mask], 1)
+
+        if abs(slope) < MIN_SLOPE_CUTOFF:
+            return None, 0.0
+
         y_pred = slope * x[mask] + intercept
         ss_res = np.sum((y_smooth[mask] - y_pred)  ** 2)
         ss_tot = np.sum((y_smooth[mask] - y_smooth[mask].mean()) ** 2)
@@ -440,7 +410,7 @@ def robust_slope_loess_lsm(times, inv_freqs):
 # [11. 제어 로직]
 # =========================================================
 def start_filling_local() -> None:
-    global is_filling, filling_start_time, calibration_done, calibration_frozen
+    global is_filling, filling_start_time, calibration_done
     global freq_buffer, reg_time_buffer, reg_inv_freq_buffer, diameter_candidates
     global history_time, history_freq
     global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
@@ -451,7 +421,7 @@ def start_filling_local() -> None:
         is_filling           = True
         filling_start_time   = time.time()
         calibration_done     = False
-        calibration_frozen   = False
+        # ★ v3: calibration_frozen 초기화 제거
         freq_buffer          = []
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
@@ -469,6 +439,8 @@ def start_filling_local() -> None:
         last_current_air         = 0.0
         dynamic_min_limit        = FREQ_MIN_LIMIT
         noise_profile            = []
+        hard_stop_counter = 0
+        max_freq_seen = 0
 
     print("\n>>> [1단계] 배경 소음 측정 (1초)...")
 
@@ -482,15 +454,24 @@ def stop_filling_local(save_result: bool) -> None:
 
 # =========================================================
 # [12. 오디오 콜백]
-# 주요 수정:
-#   - get_frequency (LPC 우선) 호출로 교체
-#   - robust_slope_loess_lsm (LOESS+LSM) 호출로 교체
-#   - solenoid_off_async() 로 GPIO 블로킹 분리
-#   - current_diameter EMA 가중치 0.1 → 0.3 (수렴 속도 개선)
-#   - calibration_frozen 재검증 조건 추가
+#
+# v3 변경 사항:
+#   [A] calibration_frozen 완전 제거
+#       → 대신 target_freq 업데이트 시 ±20% 안정성 가드 적용
+#       → D가 점진적으로 수렴하면서 target도 자연스럽게 수렴
+#       → 이미지 2~5에서 target이 1400~1883Hz로 고정되던 문제 해결
+#
+#   [B] freq_buffer 크기 3 → 5
+#       → 더 넓은 median 창으로 spike 완화
+#
+#   [C] STOP_TRIGGER_COUNT 10 → 5 (상단 상수 변경)
+#       + HARD_STOP_RATIO(1.05) 초과 시 즉시 정지
+#       → 늦은 정지 개선 (이미지 1: 1368Hz→1290Hz 수준으로 개선 예상)
+#
+#   [D] v2 유지: Levinson shape 버그 fix, spike EMA, D범위 2~10cm, MIN_SLOPE_CUTOFF
 # =========================================================
 def audio_callback(indata, frames, time_info, status):
-    global is_filling, filling_start_time, calibration_done, calibration_frozen
+    global is_filling, filling_start_time, calibration_done
     global target_freq, current_diameter
     global freq_buffer, reg_time_buffer, reg_inv_freq_buffer, diameter_candidates
     global history_time, history_freq
@@ -499,7 +480,6 @@ def audio_callback(indata, frames, time_info, status):
     global last_print_time, dynamic_min_limit, noise_profile
     global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ
 
-    # 빠른 탈출: 주입 중이 아니면 즉시 반환 (lock 최소화)
     if not is_filling:
         return
 
@@ -512,7 +492,7 @@ def audio_callback(indata, frames, time_info, status):
         with lock:
             elapsed = current_time - filling_start_time
 
-        # ── [Phase 1] 배경 소음 프로파일 수집 ──────────────────
+        # ── [Phase 1] 배경 소음 프로파일 수집 ──
         if elapsed < NOISE_CALIBRATION_TIME:
             windowed = chunk * np.hamming(len(chunk))
             fft_val  = np.abs(np.fft.rfft(windowed))
@@ -530,14 +510,14 @@ def audio_callback(indata, frames, time_info, status):
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
-        # ── [Phase 2] 물 튐 구간 무시 ──────────────────────────
+        # ── [Phase 2] 물 튐 구간 무시 ──
         if filling_elapsed < SPLASH_GUARD_TIME:
             return
 
-        # ── ceiling 결정 ────────────────────────────────────────
+        # ── ceiling 결정 ──
         with lock:
-            _last = float(last_tracked_freq)
-            _init = float(initial_stable_freq)
+            _last   = float(last_tracked_freq)
+            _init   = float(initial_stable_freq)
             _last_s = float(last_stable_f)
 
         if filling_elapsed < 3.5:
@@ -546,7 +526,7 @@ def audio_callback(indata, frames, time_info, status):
             base = _last if _last > 0 else (_last_s if _last_s > 0 else _init)
             current_ceil = min(FREQ_MAX_LIMIT, base + 900.0) if base > 0 else FREQ_MAX_LIMIT
 
-        # ── Rising Floor ────────────────────────────────────────
+        # ── Rising Floor ──
         if _last > 400:
             new_floor = _last * 0.7
             if new_floor > dynamic_min_limit:
@@ -557,7 +537,7 @@ def audio_callback(indata, frames, time_info, status):
         if _tf > 0 and dynamic_min_limit > _tf * 0.85:
             dynamic_min_limit = _tf * 0.85
 
-        # ── [★ LPC 메인 주파수 추출] ────────────────────────────
+        # ── LPC 메인 주파수 추출 ──
         detected_f = get_frequency(chunk, _last, dynamic_min_limit, current_ceil)
 
         if detected_f < dynamic_min_limit or detected_f == 0:
@@ -581,13 +561,31 @@ def audio_callback(indata, frames, time_info, status):
 
         consecutive_loss_count = 0
 
-        # EMA (LPC 신뢰도 높으므로 new 가중치 증가: 0.6 → 0.7)
+        # ── [v2 유지] spike EMA 앵커 방지 ──
         if _last > 0:
-            detected_f = _last * 0.3 + detected_f * 0.7
+            ratio = detected_f / _last
+            with lock:
+                _tf_ema = float(target_freq)
+
+            if _tf_ema > 0 and _last > _tf_ema * 0.80:
+                # target 80% 이상 구간: 10% 이상 하락은 노이즈로 간주
+                if ratio < 0.90:
+                    detected_f = _last * 0.98      # 거의 현재값 유지
+                elif ratio > 1.4:
+                    detected_f = _last * 0.95 + detected_f * 0.05
+                else:
+                    detected_f = _last * 0.3 + detected_f * 0.7
+            else:
+                # 기존 v3 로직 유지
+                if ratio > 1.4 or ratio < 0.65:
+                    detected_f = _last * 0.95 + detected_f * 0.05
+                else:
+                    detected_f = _last * 0.3 + detected_f * 0.7
         last_tracked_freq = detected_f
 
+        # ── [★ v3] freq_buffer 크기 5 (뾰족한 spike 완화) ──
         freq_buffer.append(detected_f)
-        if len(freq_buffer) > 3:
+        if len(freq_buffer) > 5:
             freq_buffer.pop(0)
         stable_f = float(np.median(freq_buffer))
 
@@ -595,73 +593,83 @@ def audio_callback(indata, frames, time_info, status):
             history_time.append(filling_elapsed)
             history_freq.append(detected_f)
             last_stable_f = stable_f
-            # ★ initial_stable_freq: SPLASH_GUARD_TIME 이후 첫 번째 안정값만 사용
             if filling_elapsed > SPLASH_GUARD_TIME and initial_stable_freq == 0:
                 initial_stable_freq = stable_f
-
-        # ── [데이터 수집 & 직경 계산] ───────────────────────────
+                
+        if stable_f > max_freq_seen:
+            max_freq_seen = stable_f
+            
         with lock:
-            _init_f  = float(initial_stable_freq)
-            _calib_f = bool(calibration_frozen)
-            _calib_d = bool(calibration_done)
-            _cur_d   = float(current_diameter)
+            _tf_now = float(target_freq)
+        if _tf_now > 0 and max_freq_seen > _tf_now * 0.75:
+            hard_floor = max_freq_seen * 0.88
+            if stable_f < hard_floor:
+                stable_f = hard_floor
+
+        # ── [데이터 수집 & 직경 계산] ──────────────────────────────
+        # ★ v3: calibration_frozen 로직 완전 제거
+        #        항상 D 업데이트 시도 (target 안정성 가드가 급격한 변화를 막음)
+        with lock:
+            _init_f = float(initial_stable_freq)
+            _cur_d  = float(current_diameter)
 
         if filling_elapsed > CALC_START_TIME:
+            if _init_f > 0 and stable_f > _init_f * 1.02:
+                reg_time_buffer.append(filling_elapsed)
+                reg_inv_freq_buffer.append(1.0 / stable_f)
 
-            # ★ calibration_frozen 재검증: 목표 주파수를 이미 크게 초과하면 동결 해제
-            if _calib_f and _tf > 0 and stable_f > _tf * 1.15:
-                with lock:
-                    calibration_frozen = False
-                    _calib_f = False
+                if len(reg_time_buffer) > 12:
+                    s_a, r_sq = robust_slope_loess_lsm(
+                        list(reg_time_buffer), list(reg_inv_freq_buffer)
+                    )
 
-            if stable_f > (_tf * CALIBRATION_CUTOFF_RATIO) and _tf > 0:
-                with lock:
-                    calibration_frozen = True
-                _calib_f = True
-
-            if not _calib_f:
-                if _init_f > 0 and stable_f > _init_f * 1.02:
-                    reg_time_buffer.append(filling_elapsed)
-                    reg_inv_freq_buffer.append(1.0 / stable_f)
-
-                    if len(reg_time_buffer) > 12:
-                        # ★ LOESS → LSM (원본: 단순 잔차 컷 polyfit)
-                        s_a, r_sq = robust_slope_loess_lsm(
-                            list(reg_time_buffer), list(reg_inv_freq_buffer)
+                    if s_a is not None and abs(s_a) > 1e-9 and r_sq > 0.82:
+                        temp_D = np.sqrt(
+                            (16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs(s_a))
                         )
+                        temp_D *= DIAMETER_SCALE
 
-                        if s_a is not None and abs(s_a) > 1e-9 and r_sq > 0.75:
-                            temp_D = np.sqrt(
-                                (16 * FLOW_RATE) / (np.pi * SOUND_SPEED * abs(s_a))
-                            )
-                            temp_D *= DIAMETER_SCALE
-
-                            if 2.0 < temp_D < 15.0:
-                                diameter_candidates.append(temp_D)
-                                if len(diameter_candidates) >= 5:
-                                    med_D = float(np.median(list(diameter_candidates)[-5:]))
-                                    with lock:
-                                        if current_diameter == 0:
-                                            current_diameter = med_D
-                                        else:
-                                            # ★ EMA 가중치 0.1 → 0.3 (수렴 속도 개선)
-                                            current_diameter = current_diameter * 0.7 + med_D * 0.3
-                                        _cur_d = float(current_diameter)
-                                else:
-                                    with lock:
-                                        current_diameter = float(temp_D)
-                                        _cur_d = float(temp_D)
-
-                                target_L_eff = TARGET_AIR_CM + (END_CORRECTION_K * _cur_d)
-                                new_tf = SOUND_SPEED / (4 * target_L_eff)
+                        # [v2 유지] D 유효 범위 2~10cm
+                        if 2.0 < temp_D < 10.0:
+                            diameter_candidates.append(temp_D)
+                            if len(diameter_candidates) >= 7:
+                                med_D = float(np.median(list(diameter_candidates)[-7:]))
                                 with lock:
-                                    target_freq      = new_tf
-                                    calibration_done = True
+                                    if current_diameter == 0:
+                                        current_diameter = med_D
+                                    else:
+                                        current_diameter = current_diameter * 0.6 + med_D * 0.4
+                                    _cur_d = float(current_diameter)
+                            else:
+                                with lock:
+                                    current_diameter = float(temp_D)
+                                    _cur_d = float(temp_D)
 
-        # ── [제어 로직] ─────────────────────────────────────────
+                            target_L_eff = TARGET_AIR_CM + (END_CORRECTION_K * _cur_d)
+                            new_tf = SOUND_SPEED / (4 * target_L_eff)
+
+                            # ── [★ v3] target 안정성 가드 ──────────────────
+                            # calibration_frozen 대체:
+                            # target이 0이면 무조건 설정.
+                            # target이 있으면 ±20% 이내 변화만 허용.
+                            # → 초반 잘못된 D로 target이 1800Hz로 설정돼도
+                            #   다음 스텝에서 최대 20%씩 점진 수렴 가능
+                            # → calibration_frozen처럼 완전히 잠기지 않으므로
+                            #   D가 9.6cm로 수렴하면 target도 ~1252Hz로 수렴
+                            with lock:
+                                if target_freq == 0:
+                                    target_freq = new_tf
+                                else:
+                                    change_ratio = abs(new_tf - target_freq) / target_freq
+                                    if change_ratio <= TARGET_MAX_CHANGE_RATIO:
+                                        target_freq = new_tf
+                                    # else: 이번 D 추정값은 변화가 너무 커서 무시
+                                calibration_done = True
+
+        # ── [제어 로직] ──
         with lock:
-            _tf2   = float(target_freq)
-            _cd    = bool(calibration_done)
+            _tf2    = float(target_freq)
+            _cd     = bool(calibration_done)
             _cur_d2 = float(current_diameter)
 
         if filling_elapsed > CONTROL_START_TIME and _cd:
@@ -669,11 +677,22 @@ def audio_callback(indata, frames, time_info, status):
             with lock:
                 last_current_air = float(current_air)
 
+            # ── [★ v3] 정상 카운트 (STOP_TRIGGER_COUNT=5) ──
             if stable_f >= (_tf2 + STOP_OFFSET_HZ):
                 consecutive_stop_hits += 1
             else:
                 if consecutive_stop_hits > 0:
                     consecutive_stop_hits -= 1
+
+            # ── [★ v3] 하드스톱: 5% 오버슈트 즉시 정지 ──────────
+            # STOP_TRIGGER_COUNT를 다 채우기 전에도 오버슈트가 크면 바로 멈춤
+            # → 이미지 1처럼 target=1250Hz인데 1368Hz까지 올라가는 문제 방지
+            if _tf2 > 0 and stable_f >= _tf2 * HARD_STOP_RATIO:
+                hard_stop_counter += 1
+                if hard_stop_counter >= 2:
+                    consecutive_stop_hits = STOP_TRIGGER_COUNT
+                else:
+                    hard_stop_counter = 0
 
             if (current_time - last_print_time) >= PRINT_INTERVAL:
                 bar_len = min(consecutive_stop_hits, STOP_TRIGGER_COUNT)
@@ -683,7 +702,6 @@ def audio_callback(indata, frames, time_info, status):
 
             if consecutive_stop_hits >= STOP_TRIGGER_COUNT:
                 print(f"\n[완료] 목표 도달! 최종 D: {_cur_d2:.4f} cm")
-                # ★ solenoid_off_async: GPIO 블로킹을 콜백에서 분리
                 solenoid_off_async()
                 with lock:
                     is_filling     = False
@@ -694,9 +712,7 @@ def audio_callback(indata, frames, time_info, status):
         return
 
 # =========================================================
-# [13. 오디오 스트림 - ON 버튼 누를 때만 시작]
-# ★ 원본: GUI 초기화 시 무조건 시작
-# ★ 수정: 처음 ON 눌릴 때 한 번만 생성
+# [13. 오디오 스트림]
 # =========================================================
 def ensure_audio_stream():
     global audio_stream
@@ -752,7 +768,7 @@ def run_kiosk_gui():
         with lock:
             if is_filling:
                 return
-        ensure_audio_stream()   # ★ ON 누를 때 스트림 시작
+        ensure_audio_stream()
         start_filling_local()
         set_status("배경 소음 측정 중... (1초 후 펌프 작동)")
 
@@ -933,9 +949,9 @@ def run_kiosk_gui():
     ctk.CTkLabel(lock_row, textvariable=lock_hint, text_color=C_MUTED,
                  font=("Malgun Gothic", 12)).grid(row=0, column=2, sticky="w")
 
-    SH = 18   # 슬라이더 높이
+    SH = 18
     sliders_config = [
-        (2, "정지 확신 카운트 (STOP_TRIGGER_COUNT)",  stop_cnt_var,   5,   30,  25,
+        (2, "정지 확신 카운트 (STOP_TRIGGER_COUNT)",  stop_cnt_var,   3,   20,  17,
          lambda v: (stop_cnt_var.set(int(float(v))), apply_tuning())),
         (3, "제어 시작 시간 (CONTROL_START_TIME)",    ctrl_start_var, 1.0, 10.0, 90,
          lambda v: (ctrl_start_var.set(float(v)), apply_tuning())),
@@ -1071,7 +1087,6 @@ def run_kiosk_gui():
     app.protocol("WM_DELETE_WINDOW", on_close)
 
     solenoid_off()
-    # ★ 스트림은 ON 버튼 누를 때 시작 (원본: 여기서 무조건 시작)
     set_status("GPIO 제어 모드 준비 완료")
     periodic_update()
     app.mainloop()
