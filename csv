@@ -1,0 +1,22 @@
+from datetime import datetime
+import csv
+import os
+from smart_water_core import CSV_FILENAME, SOUND_SPEED, END_CORRECTION_K
+
+def save_to_csv(diameter, init_freq, target_f, final_freq):
+    file_exists = os.path.isfile(CSV_FILENAME)
+    init_air_len = 0
+    if init_freq > 0:
+        init_air_len = SOUND_SPEED / (4 * init_freq) - END_CORRECTION_K * diameter
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    row = [round(diameter, 4), round(init_freq, 1), round(init_air_len, 4), round(target_f, 1), round(final_freq, 1), timestamp]
+    try:
+        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['Diameter(cm)', 'Init_Freq(Hz)', 'Init_Air_Len(cm)', 'Target_Freq(Hz)', 'Stop_Freq(Hz)', 'Timestamp'])
+            writer.writerow(row)
+        print(f'\n[저장 완료] {CSV_FILENAME}')
+    except Exception as e:
+        print(f'\n[저장 실패] {e}')
+
