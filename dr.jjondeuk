@@ -601,7 +601,7 @@ def audio_callback(indata, frames, time_info, status):
                     with lock:
                         _tf_cap = float(target_freq)
                     if _tf_cap > 0:
-                        blended = min(blended, _tf_cap * 0.98)
+                        blended = min(blended, _tf_cap * 1.01)
                     detected_f = blended
 
         last_tracked_freq = detected_f
