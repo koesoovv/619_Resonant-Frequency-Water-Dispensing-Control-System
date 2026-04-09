@@ -1,22 +1,71 @@
-from datetime import datetime
-import csv
-import os
-from smart_water_core import CSV_FILENAME, SOUND_SPEED, END_CORRECTION_K
+from datetime import datetime                                      # 현재 시간 저장용
+import csv                                                         # CSV 저장용
+import os                                                          # 파일 존재 여부 확인용
+from smart_water_core import CSV_FILENAME, SOUND_SPEED, END_CORRECTION_K  # 공통 상수 불러오기
 
-def save_to_csv(diameter, init_freq, target_f, final_freq):
-    file_exists = os.path.isfile(CSV_FILENAME)
-    init_air_len = 0
-    if init_freq > 0:
-        init_air_len = SOUND_SPEED / (4 * init_freq) - END_CORRECTION_K * diameter
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    row = [round(diameter, 4), round(init_freq, 1), round(init_air_len, 4), round(target_f, 1), round(final_freq, 1), timestamp]
-    try:
-        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(['Diameter(cm)', 'Init_Freq(Hz)', 'Init_Air_Len(cm)', 'Target_Freq(Hz)', 'Stop_Freq(Hz)', 'Timestamp'])
-            writer.writerow(row)
-        print(f'\n[저장 완료] {CSV_FILENAME}')
-    except Exception as e:
-        print(f'\n[저장 실패] {e}')
 
+def save_to_csv(                                                   # CSV 저장 함수
+    diameter, init_freq, target_f, final_freq,                    # 기본 측정값
+    r2_final=0.0,                                                 # 회귀 R²
+    total_samples=0,                                              # 총 샘플 수
+    theory_intercept=0.0,                                         # 회귀선 t=0 절편
+    stand_type="unknown",                                         # 받침대 종류
+    stand_height_cm=0.0,                                          # 받침대 높이
+):
+    file_exists = os.path.isfile(CSV_FILENAME)                    # 기존 CSV 존재 여부 확인
+
+    if theory_intercept > 1e-6 and diameter > 0:                  # 회귀 외삽값 사용 가능하면
+        f_at_t0 = 1.0 / theory_intercept                          # t=0에서의 추정 주파수
+        init_air_len = SOUND_SPEED / (4 * f_at_t0) - END_CORRECTION_K * diameter  # 초기 공기층 계산
+        init_air_source = '회귀 외삽'                              # 계산 기준 표시용
+    elif init_freq > 0 and diameter > 0:                          # 아니면 초기 주파수 기반 계산
+        init_air_len = SOUND_SPEED / (4 * init_freq) - END_CORRECTION_K * diameter  # fallback 계산
+        init_air_source = '초기 주파수'                            # 계산 기준 표시용
+    else:                                                         # 둘 다 계산 불가하면
+        init_air_len = 0.0                                        # 0으로 저장
+        init_air_source = '계산 불가'                              # 계산 기준 표시용
+
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')      # 저장 시각 문자열 생성
+
+    header = [                                                    # CSV 헤더
+        'Diameter(cm)',                                           # 추정 지름
+        'Init_Freq(Hz)',                                          # 초기 주파수
+        'Init_Air_Len(cm)',                                       # 초기 공기층 길이
+        'Target_Freq(Hz)',                                        # 목표 주파수
+        'Stop_Freq(Hz)',                                          # 정지 주파수
+        'Total_Samples',                                          # 총 샘플 수
+        'Reg_R2',                                                 # 회귀 적합도
+        'Stand_Type',                                             # 받침대 종류
+        'Stand_Height(cm)',                                       # 받침대 높이
+        'Timestamp',                                              # 저장 시각
+    ]
+
+    row = [                                                       # 실제 저장할 한 줄 데이터
+        round(diameter, 4),                                       # 지름 반올림
+        round(init_freq, 1),                                      # 초기 주파수 반올림
+        round(init_air_len, 4),                                   # 초기 공기층 길이 반올림
+        round(target_f, 1),                                       # 목표 주파수 반올림
+        round(final_freq, 1),                                     # 정지 주파수 반올림
+        total_samples,                                            # 총 샘플 수
+        round(r2_final, 4),                                       # R² 반올림
+        stand_type,                                               # 받침대 종류
+        stand_height_cm,                                          # 받침대 높이
+        timestamp,                                                # 저장 시각
+    ]
+
+    try:                                                          # 저장 시도
+        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8-sig') as f:  # CSV 파일 열기
+            writer = csv.writer(f)                                # writer 생성
+            if not file_exists:                                   # 파일이 처음 생성되는 경우
+                writer.writerow(header)                           # 헤더 먼저 저장
+            writer.writerow(row)                                  # 데이터 한 줄 저장
+
+        print(f'\n[저장 완료] {CSV_FILENAME}')                    # 저장 완료 메시지
+        print(
+            f'  Init_Air={init_air_len:.2f}cm '                   # 초기 공기층 출력
+            f'({init_air_source})'                                # 계산 기준 출력
+            f' | Samples={total_samples}'                         # 샘플 수 출력
+            f' | R²={r2_final:.4f}'                               # R² 출력
+        )
+    except Exception as e:                                        # 예외 발생 시
+        print(f'\n[저장 실패] {e}')                              # 오류 메시지 출력
