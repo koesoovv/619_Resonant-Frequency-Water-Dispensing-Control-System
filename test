@@ -1,4 +1,4 @@
-# smart_water_core.py  ── 개선판 v5.21
+# smart_water_core.py  ── 개선판 v5.22
 #
 # ═══ v5.21 변경 사항 ════════════════════════════════════════════════
 # [v5.21-SPLASH] 큰 비커 스플래시 오염 대응 — 3개 연동 수정
@@ -107,7 +107,13 @@ TRACKING_ENTRY_HZ       = 1200
 TRACKING_ENTRY_MULT     = 1.3
 TRACKING_MODE_THRESHOLD = 20
 TRACKING_BAND_HZ        = 500
-TRACKING_FLOOR_RATIO    = 0.90
+TRACKING_FLOOR_RATIO    = 0.78
+TRACKING_DROP_HARD_RATIO = 0.78
+TRACKING_RISE_LIMIT_HZ   = 18.0
+TRACKING_STABLE_BUF      = 5
+
+# ── 배음 보정 설정 ────────────────────────────────────────────────────
+ALLOW_EVEN_HARMONIC_CORRECTION = False
 
 # ── 초기 구간 보호 ───────────────────────────────────────────────────
 EARLY_NOISE_SEC = 6.0
@@ -379,29 +385,33 @@ def fft_backup_frequency(chunk, last_freq, f_min, f_max):
     return float(pf[np.argmax(score)])
 
 
-def _harmonic_correct(f: float, ref: float) -> float:
+def _harmonic_correct(f: float, ref: float, allow_even: bool = ALLOW_EVEN_HARMONIC_CORRECTION) -> float:
     if ref <= 0 or f <= 0:
         return f
     ratio = f / ref
+
+    # 한쪽 막힘 관의 이상적 공명 모드는 홀수차가 우선입니다.
+    # 따라서 3배, 5배는 보정하고, 2배 부근은 기본적으로 보정하지 않고 버립니다.
+    # 실측 환경에서 2배 성분은 실제 기본모드보다 구조음/낙수음/오검출일 가능성이 더 큽니다.
     if 2.7 <= ratio <= 3.3:
         return f / 3.0
-    elif 1.8 <= ratio <= 2.2:
-        return f / 2.0
     elif 4.7 <= ratio <= 5.3:
         return f / 5.0
+    elif 1.85 <= ratio <= 2.15:
+        return f / 2.0 if allow_even else 0.0
     elif ratio > REG_HARMONIC_UPPER:
         return 0.0
     return f
 
 
-def get_frequency(chunk, last_freq, f_min, f_max):
+def get_frequency(chunk, last_freq, f_min, f_max, allow_even: bool = ALLOW_EVEN_HARMONIC_CORRECTION):
     filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
     lpc_f = lpc_main_frequency(filtered, last_freq, f_min, f_max)
-    lpc_f = _harmonic_correct(lpc_f, last_freq)
+    lpc_f = _harmonic_correct(lpc_f, last_freq, allow_even=allow_even)
     if lpc_f > 0:
         return float(lpc_f)
     fft_f = fft_backup_frequency(filtered, last_freq, f_min, f_max)
-    fft_f = _harmonic_correct(fft_f, last_freq)
+    fft_f = _harmonic_correct(fft_f, last_freq, allow_even=allow_even)
     return float(fft_f)
 
 
@@ -725,7 +735,7 @@ def audio_callback(indata, frames, time_info, status):
                 dynamic_min_limit = _tf * 0.85
 
         # ── 4단계: 주파수 검출 ───────────────────────────────────────
-        detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
+        detected_f = get_frequency(chunk, _last, current_floor, current_ceil, allow_even=False)
 
         if detected_f < current_floor or detected_f == 0:
             detected_f = 0.0
@@ -794,8 +804,11 @@ def audio_callback(indata, frames, time_info, status):
                     detected_f = _last * (1 - alpha_det) + detected_f * alpha_det
 
         # ── 속도 제한 ─────────────────────────────────────────────
-        if not tracking_mode and _last > 0 and detected_f > _last:
-            max_rise = RATE_LIMIT_FINAL_HZ if in_final else RATE_LIMIT_NORMAL_HZ
+        if _last > 0 and detected_f > _last:
+            if tracking_mode:
+                max_rise = TRACKING_RISE_LIMIT_HZ
+            else:
+                max_rise = RATE_LIMIT_FINAL_HZ if in_final else RATE_LIMIT_NORMAL_HZ
             if detected_f - _last > max_rise:
                 detected_f = _last + max_rise
 
