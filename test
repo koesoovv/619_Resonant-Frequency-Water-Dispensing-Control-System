@@ -51,25 +51,25 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 20.5
+FLOW_RATE        = 21.5
 END_CORRECTION_K = 0.4
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
 TARGET_AIR_CM           = 3.0
 STOP_OFFSET_HZ          = 0
-DIAMETER_SCALE          = 1.0
+DIAMETER_SCALE          = 1.15
 CALC_START_TIME         = 3.0
 DIAM_CALC_END_TIME      = 25.0
-CONTROL_START_TIME      = 4.0
-STOP_TRIGGER_COUNT      = 5
+CONTROL_START_TIME      = 5.0
+STOP_TRIGGER_COUNT      = 10
 TARGET_MAX_CHANGE_RATIO = 0.25
-STOP_ADVANCE_CM         = 0.5
+STOP_ADVANCE_CM         = 0.1
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
 EARLY_CEIL_HZ            = 1000
 FREQ_MIN_LIMIT           = 300
-CALIBRATION_CUTOFF_RATIO = 0.9
+CALIBRATION_CUTOFF_RATIO = 0.7
 
 # ── 녹음/타이밍 ──────────────────────────────────────────────────────
 NOISE_CALIBRATION_TIME = 1.0
