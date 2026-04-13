@@ -96,7 +96,7 @@ LPC_NFFT         = 4096
 LPC_MIN_ENERGY   = 1e-8
 LPC_PEAK_PROM    = 0.18
 LPC_CONTINUITY_W = 600.0
-LPC_RISE_BIAS    = 0.05
+LPC_RISE_BIAS    = 0.0
 
 # ── LOESS 파라미터 ────────────────────────────────────────────────────
 LOESS_FRAC   = 0.35
@@ -121,8 +121,8 @@ INIT_RISE_CONFIRM_N   = 12     # 연속 비하락 청크 수 (≈1.1초)
 INIT_REANCHOR_RATIO   = 0.99   # stable_f < init * 이 값 → init 하향
 
 # ── EMA alpha ────────────────────────────────────────────────────────
-EMA_ALPHA_NORMAL    = 0.35
-EMA_ALPHA_FINAL     = 0.68
+EMA_ALPHA_NORMAL    = 0.25
+EMA_ALPHA_FINAL     = 0.35
 FINAL_APPROACH_MULT = 1.5
 
 # ── 트래킹 adaptive EMA ──────────────────────────────────────────────
@@ -134,15 +134,15 @@ FINAL_TRACKING_RISE_ALPHA  = 0.45
 TRACKING_EMA_BIGRISE_ALPHA = 0.25
 
 # ── Hz/청크 속도 제한 ────────────────────────────────────────────────
-RATE_LIMIT_NORMAL_HZ  = 50.0
+RATE_LIMIT_NORMAL_HZ  = 25.0
 RATE_LIMIT_FINAL_HZ   = 300.0
 SPIKE_RATIO_THRESHOLD = 1.30
 
 # ── 이론 곡선 가이드 ─────────────────────────────────────────────────
-THEORY_GUIDE_ALPHA        = 0.40
-THEORY_GUIDE_MARGIN       = 0.25
-THEORY_GUIDE_ALPHA_FINAL  = 0.50
-THEORY_GUIDE_MARGIN_FINAL = 0.375
+THEORY_GUIDE_ALPHA        = 0.25
+THEORY_GUIDE_MARGIN       = 0.15
+THEORY_GUIDE_ALPHA_FINAL  = 0.25
+THEORY_GUIDE_MARGIN_FINAL = 0.25
 
 # ── D 안정화 ─────────────────────────────────────────────────────────
 DIAM_CAND_MAXLEN   = 15
