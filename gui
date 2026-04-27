@@ -21,14 +21,11 @@ def run_kiosk_gui():                                                # GUI 실행
     app.title('주파수 기반 급수 제어 시스템')                         # 창 제목
     app.configure(fg_color=C_BG)                                    # 배경색 설정
 
-    if core.USE_CENTER:                                             # 화면 중앙 배치 여부
-        sw = app.winfo_screenwidth()                                # 화면 가로 길이
-        sh = app.winfo_screenheight()                               # 화면 세로 길이
-        app.geometry(f'{core.WIN_W}x{core.WIN_H}+{max(0, (sw - core.WIN_W) // 2)}+{max(0, (sh - core.WIN_H) // 2)}')  # 중앙 배치
-    else:
-        app.geometry(f'{core.WIN_W}x{core.WIN_H}+{core.WIN_X}+{core.WIN_Y}')  # 지정 위치 배치
+    ctk.set_widget_scaling(0.67)
+    ctk.set_window_scaling(0.67)
 
-    app.minsize(core.WIN_W, core.WIN_H)                             # 최소 창 크기
+    app.geometry('1280x650+0+0')
+    app.minsize(720, 360)
 
     status_var   = ctk.StringVar(value='GPIO 제어 모드 준비됨')      # 상태 문구
     d_var        = ctk.StringVar(value='지름(D) : - cm')            # 지름 표시
