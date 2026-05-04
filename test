@@ -52,14 +52,14 @@ END_CORRECTION_K = 0.4
 TARGET_AIR_CM           = 3.0
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
-CALC_START_TIME         = 3.0
-DIAM_CALC_END_TIME      = 15.0
+CALC_START_TIME         = 5.0
+DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 4.0
-STOP_TRIGGER_COUNT      = 5
+STOP_TRIGGER_COUNT      = 3
 TARGET_MAX_CHANGE_RATIO = 0.25
 # 솔레노이드 지연 + EMA 지연 보상: 목표보다 이 값만큼 먼저 정지 트리거
 # 실험 후 물이 많이 남으면 줄이고, 넘치면 늘리세요 (단위: cm)
-STOP_ADVANCE_CM         = 0.0
+STOP_ADVANCE_CM         = -0.3
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
@@ -853,7 +853,7 @@ def audio_callback(indata, frames, time_info, status):
                 
         if stable_f > peak_lock_floor:
             peak_lock_floor = stable_f
-        if peak_lock_floor > 0 and stable_f < peak_lock_floot * 0.90:
+        if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
             stable_f = peak_lock_floor * 0.90
 
         # ── 7단계: tracking 모드 진입 판정 ──────────────────────────
