@@ -1,4 +1,4 @@
-# smart_water_core.py  ── 개선판 v5.20-core-fix
+# smart_water_core.py  ── 개선판 v5.21-diameter-lock-fix
 #
 # 핵심 수정
 # 1. LPC 단독 우선 채택 제거: LPC/FFT 후보를 동시에 만들고 통합 점수로 선택
@@ -8,6 +8,7 @@
 # 5. dynamic floor와 단조 증가 보호 완화: 오검출 후 복구 가능하게 변경
 # 6. 고역통과 필터 상태 zi 유지: chunk 경계 과도응답 감소
 # 7. 초기 주파수는 단일 샘플이 아니라 후보 누적 안정성으로 확정
+# 8. 지름 잠금은 후보 개수만 보지 않고 후보 안정도/R²/회귀시간/주파수 상승률까지 확인
 
 import numpy as np
 import sounddevice as sd
@@ -184,15 +185,22 @@ THEORY_GUIDE_MARGIN_FINAL = 0.30
 
 
 # ════════════════════════════════════════════════════════════════════
-# D 안정화
+# D 안정화 / 잠금 조건
 # ════════════════════════════════════════════════════════════════════
-DIAM_CAND_MAXLEN   = 24
-DIAM_CAND_MIN      = 10
-DIAM_EMA_KEEP      = 0.88
-DIAM_EMA_NEW       = 0.12
-DIAM_OUTLIER_RATIO = 0.22
-DIAM_EMA_KEEP_POST = 0.97
-DIAM_EMA_NEW_POST  = 0.03
+DIAM_CAND_MAXLEN           = 28
+DIAM_CAND_MIN              = 12      # 개수만으로 잠그지 않음. 아래 품질 조건까지 통과해야 함
+DIAM_EMA_KEEP              = 0.82
+DIAM_EMA_NEW               = 0.18
+DIAM_OUTLIER_RATIO         = 0.22
+DIAM_EMA_KEEP_POST         = 0.985
+DIAM_EMA_NEW_POST          = 0.015
+DIAM_LOCK_RECENT_N         = 10      # 최근 후보 N개의 안정도 확인
+DIAM_LOCK_STD_RATIO        = 0.055   # 최근 D 후보 표준편차/중앙값 5.5% 이하일 때만 잠금
+DIAM_LOCK_R2_MIN           = 0.92    # 잠금용 R² 기준은 일반 회귀 기준보다 높게
+DIAM_LOCK_MIN_REG_POINTS   = 36      # 회귀 데이터가 너무 적으면 잠그지 않음
+DIAM_LOCK_MIN_SPAN_SEC     = 4.0     # 회귀 구간 시간이 너무 짧으면 잠그지 않음
+DIAM_LOCK_MIN_RISE_RATIO   = 0.10    # 회귀 구간에서 주파수가 최소 10% 이상 상승해야 함
+DIAM_OUTLIER_RESET_N       = 5       # 잠금 전 이상치가 연속으로 나오면 후보 목록 초기화
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -304,6 +312,7 @@ spike_blocked_count   = 0
 history_freq_snapshot = []
 init_air_len_cm       = 0.0
 diameter_ready        = False
+_diam_outlier_rejects = 0
 
 _stag_start_time    = 0.0
 _stag_active        = False
@@ -769,11 +778,52 @@ def theory_freq(t: float) -> float:
 # ════════════════════════════════════════════════════════════════════
 # 회귀 워커 스레드
 # ════════════════════════════════════════════════════════════════════
+def _diam_lock_quality(times, inv_freqs, cand_list, r_sq):
+    """지름 후보가 충분히 정확해 보일 때만 잠그기 위한 품질 검사."""
+    if len(cand_list) < DIAM_CAND_MIN:
+        return False, 'cand 부족'
+
+    if len(times) < DIAM_LOCK_MIN_REG_POINTS:
+        return False, f'reg 부족({len(times)}<{DIAM_LOCK_MIN_REG_POINTS})'
+
+    if r_sq < DIAM_LOCK_R2_MIN:
+        return False, f'r² 낮음({r_sq:.3f}<{DIAM_LOCK_R2_MIN})'
+
+    x = np.array(times, dtype=float)
+    y = np.array(inv_freqs, dtype=float)
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    span = float(x[-1] - x[0]) if len(x) >= 2 else 0.0
+    if span < DIAM_LOCK_MIN_SPAN_SEC:
+        return False, f'회귀시간 짧음({span:.1f}s<{DIAM_LOCK_MIN_SPAN_SEC}s)'
+
+    f_start = 1.0 / (y[0] + 1e-12)
+    f_end   = 1.0 / (y[-1] + 1e-12)
+    rise_ratio = (f_end - f_start) / (f_start + 1e-12)
+
+    if rise_ratio < DIAM_LOCK_MIN_RISE_RATIO:
+        return False, f'주파수상승 부족({rise_ratio*100:.1f}%<{DIAM_LOCK_MIN_RISE_RATIO*100:.0f}%)'
+
+    recent = np.array(cand_list[-DIAM_LOCK_RECENT_N:], dtype=float)
+    if len(recent) < DIAM_LOCK_RECENT_N:
+        return False, f'최근D 부족({len(recent)}<{DIAM_LOCK_RECENT_N})'
+
+    med = float(np.median(recent))
+    std_ratio = float(np.std(recent) / (med + 1e-12))
+
+    if std_ratio > DIAM_LOCK_STD_RATIO:
+        return False, f'D흔들림 큼({std_ratio*100:.1f}%>{DIAM_LOCK_STD_RATIO*100:.1f}%)'
+
+    return True, f'OK span={span:.1f}s rise={rise_ratio*100:.1f}% Dstd={std_ratio*100:.1f}%'
+
+
 def _regression_worker():
     global current_diameter, target_freq, calibration_done
     global theory_slope, theory_intercept, theory_locked
     global init_air_len_cm, last_r2, diameter_candidates
-    global diameter_ready
+    global diameter_ready, _diam_outlier_rejects
 
     while True:
         _reg_event.wait(timeout=1.0)
@@ -800,12 +850,23 @@ def _regression_worker():
             else:
                 print(f'\n[회귀] slope={s_a:.7f} | r²={r_sq:.4f}')
 
+        # 이론 곡선 잠금도 너무 빨리 걸리지 않도록 회귀 데이터 품질을 추가 확인한다.
         with lock:
-            if s_a is not None and r_sq > THEORY_LOCK_R2 and not theory_locked:
+            reg_len_for_lock = len(reg_time_buffer)
+            reg_span_for_lock = (reg_time_buffer[-1] - reg_time_buffer[0]) if len(reg_time_buffer) >= 2 else 0.0
+
+        if (
+            s_a is not None
+            and r_sq > THEORY_LOCK_R2
+            and reg_len_for_lock >= DIAM_LOCK_MIN_REG_POINTS
+            and reg_span_for_lock >= DIAM_LOCK_MIN_SPAN_SEC
+            and not theory_locked
+        ):
+            with lock:
                 theory_slope = s_a
                 theory_intercept = s_b
                 theory_locked = True
-                print(f'\n[★ 이론 곡선 잠금] slope={s_a:.7f} r²={r_sq:.3f}')
+                print(f'\n[★ 이론 곡선 잠금] slope={s_a:.7f} r²={r_sq:.3f} span={reg_span_for_lock:.1f}s')
 
         if s_a is None or abs(s_a) <= 1e-9 or r_sq <= LSM_R2_MIN:
             with lock:
@@ -822,8 +883,11 @@ def _regression_worker():
 
         with lock:
             cand_list = list(diameter_candidates)
+            locked_now = bool(diameter_ready)
 
-        if len(cand_list) >= 4:
+        # 잠금 전에는 잘못된 초기 후보가 median을 오염시킬 수 있으므로,
+        # 이상치가 연속으로 나오면 후보 목록을 초기화해서 복구 가능하게 한다.
+        if len(cand_list) >= 6:
             cur_med = float(np.median(cand_list))
             outlier = abs(temp_D - cur_med) / (cur_med + 1e-12) > DIAM_OUTLIER_RATIO
         else:
@@ -831,19 +895,28 @@ def _regression_worker():
             cur_med = temp_D
 
         if outlier:
-            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm ±{DIAM_OUTLIER_RATIO*100:.0f}%, 무시)')
+            with lock:
+                _diam_outlier_rejects += 1
+                reject_n = int(_diam_outlier_rejects)
+                locked_now = bool(diameter_ready)
+
+                if not locked_now and reject_n >= DIAM_OUTLIER_RESET_N:
+                    diameter_candidates.clear()
+                    current_diameter = 0.0
+                    _diam_outlier_rejects = 0
+                    print(f'\n[D후보 리셋] 초기 후보가 틀렸을 가능성 → cand 초기화')
+
+            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm ±{DIAM_OUTLIER_RATIO*100:.0f}%, reject={reject_n})')
             continue
 
         with lock:
+            _diam_outlier_rejects = 0
             last_r2 = r_sq
             diameter_candidates.append(temp_D)
-            _new_cnt = len(diameter_candidates)
+            cand_list = list(diameter_candidates)
+            _new_cnt = len(cand_list)
 
-            if not diameter_ready and _new_cnt >= DIAM_CAND_MIN:
-                diameter_ready = True
-                print(f'\n[★ 지름 준비 완료] cand={_new_cnt} (>={DIAM_CAND_MIN})')
-
-            med_D = float(np.median(list(diameter_candidates)))
+            med_D = float(np.median(cand_list))
 
             if current_diameter == 0:
                 current_diameter = med_D
@@ -852,29 +925,42 @@ def _regression_worker():
             else:
                 current_diameter = current_diameter * DIAM_EMA_KEEP + med_D * DIAM_EMA_NEW
 
+            lock_ok, lock_reason = _diam_lock_quality(times, inv_freqs, cand_list, r_sq)
+
+            if not diameter_ready:
+                if lock_ok:
+                    diameter_ready = True
+                    current_diameter = med_D
+                    print(f'\n[★ 지름 잠금 완료] D={med_D:.3f}cm | cand={_new_cnt} | {lock_reason}')
+                elif _new_cnt >= DIAM_CAND_MIN:
+                    print(f'\n[D잠금 보류] D_med={med_D:.3f}cm | cand={_new_cnt} | {lock_reason}')
+
             _cur_d = float(current_diameter)
 
-            if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
-                est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
+            # 용기 높이와 목표 주파수는 지름이 잠긴 뒤에만 확정한다.
+            # 잠기기 전 target을 만들면 잘못된 D가 제어 판단에 섞인다.
+            if diameter_ready:
+                if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
+                    est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
 
-                if est > 0.5:
-                    init_air_len_cm = est
-                    print(f'\n[★ 용기 높이 확정] {est:.2f} cm')
+                    if est > 0.5:
+                        init_air_len_cm = est
+                        print(f'\n[★ 용기 높이 확정] {est:.2f} cm')
 
-            target_L_eff = TARGET_AIR_CM + END_CORRECTION_K * _cur_d
-            new_tf = SOUND_SPEED / (4 * target_L_eff) + STOP_OFFSET_HZ
+                target_L_eff = TARGET_AIR_CM + END_CORRECTION_K * _cur_d
+                new_tf = SOUND_SPEED / (4 * target_L_eff) + STOP_OFFSET_HZ
 
-            if target_freq == 0:
-                target_freq = new_tf
-            else:
-                change_ratio = abs(new_tf - target_freq) / (target_freq + 1e-12)
-
-                if change_ratio <= TARGET_MAX_CHANGE_RATIO:
+                if target_freq == 0:
                     target_freq = new_tf
+                else:
+                    change_ratio = abs(new_tf - target_freq) / (target_freq + 1e-12)
 
-            if diameter_ready and not calibration_done:
-                calibration_done = True
-                print(f'\n[★ 캘리브레이션 완료] D={_cur_d:.3f}cm | target_f={target_freq:.0f}Hz')
+                    if change_ratio <= TARGET_MAX_CHANGE_RATIO:
+                        target_freq = new_tf
+
+                if not calibration_done:
+                    calibration_done = True
+                    print(f'\n[★ 캘리브레이션 완료] D={_cur_d:.3f}cm | target_f={target_freq:.0f}Hz')
 
         if _new_cnt % 5 == 0:
             print(f'\n[D갱신] D={_cur_d:.3f}cm | cand={_new_cnt} | r²={r_sq:.4f}')
@@ -899,7 +985,7 @@ def start_filling_local() -> None:
     global theory_slope, theory_intercept, theory_locked
     global _prev_buf_median, _freeze_count
     global last_r2, spike_blocked_count, history_freq_snapshot
-    global init_air_len_cm, diameter_ready
+    global init_air_len_cm, diameter_ready, _diam_outlier_rejects
     global _stag_start_time, _stag_active, _explore_candidate, _explore_confirm
 
     with lock:
@@ -942,6 +1028,7 @@ def start_filling_local() -> None:
         history_freq_snapshot = []
         init_air_len_cm = 0.0
         diameter_ready = False
+        _diam_outlier_rejects = 0
         _stag_start_time = 0.0
         _stag_active = False
         _explore_candidate = 0.0
@@ -1087,7 +1174,7 @@ def audio_callback(indata, frames, time_info, status):
     global theory_slope, theory_intercept, theory_locked
     global _prev_buf_median, _freeze_count
     global last_r2, spike_blocked_count, history_freq_snapshot
-    global init_air_len_cm, diameter_ready
+    global init_air_len_cm, diameter_ready, _diam_outlier_rejects
     global _stag_start_time, _stag_active, _explore_candidate, _explore_confirm
 
     if not is_filling:
