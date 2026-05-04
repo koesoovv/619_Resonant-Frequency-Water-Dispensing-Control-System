@@ -1,35 +1,13 @@
-# smart_water_core.py  ── 개선판 v5.26
+# smart_water_core.py  ── 개선판 v5.20-core-fix
 #
-# ═══ v5.26 변경 사항 ════════════════════════════════════════════════
-#
-# [v5.26-RAWSTOP] 정지 판단용 별도 주파수 트랙 도입
-#   · theory guide 미적용 주파수(pre_theory_f)를 별도 버퍼로 추적
-#   · 정지 판단(step 9)에 raw_stable_f 사용
-#   · theory guide가 주파수를 과대 견인해서 조기 정지하는 문제 해결
-#
-# [v5.26-NOTHFIN] final approach 시 이론 곡선 가이드 비활성화
-#   · in_final 구간에서 theory guide alpha=0
-#   · 후반 유량 감소를 이론 곡선이 보상 못함 → 과대 견인 원천 차단
-#
-# [v5.26-QUAD] 2차 회귀 fallback
-#   · 선형 R² < 임계 시 2차 다항식 fit 시도
-#   · 2차 fit의 시작점 접선 기울기를 slope로 사용
-#   · 유량 비선형(후반 감소)을 자연스럽게 처리
-#
-# [v5.26-COMP] 정지 판단 보상항
-#   · current_air 계산 시 D에 비례한 보상항 추가
-#   · 큰 비커일수록 end correction 불확실성이 크므로 비례 보상
-#
-# ═══ v5.25 유지 사항 ════════════════════════════════════════════════
-# [v5.25-MONO-REG] 단조 필터 (하강 구간 reg 차단)
-# [v5.25-WLSM]    시간 가중 회귀
-# [v5.25-REEVAL]   D 재평가 메커니즘
-# [v5.24-DCONF]    live/confirmed 지름 분리
-# [v5.23-1CM]      1cm 타깃 제어 보강
-# [v5.21-SPLASH]   init_confirmed 메커니즘
-# [v5.20-BIGCUP]   시간 적응형 reg 진입, 적응형 R²
-# [v5.18-THREAD]   회귀 워커 스레드 분리
-#
+# 핵심 수정
+# 1. LPC 단독 우선 채택 제거: LPC/FFT 후보를 동시에 만들고 통합 점수로 선택
+# 2. 주파수 분리: raw_f / reg_f / stable_f / stop_f 역할 분리
+# 3. 지름 회귀는 stable_f가 아니라 reg_f 사용
+# 4. target cap으로 검출 주파수를 바꾸지 않음
+# 5. dynamic floor와 단조 증가 보호 완화: 오검출 후 복구 가능하게 변경
+# 6. 고역통과 필터 상태 zi 유지: chunk 경계 과도응답 감소
+# 7. 초기 주파수는 단일 샘플이 아니라 후보 누적 안정성으로 확정
 
 import numpy as np
 import sounddevice as sd
@@ -39,61 +17,63 @@ import threading
 from collections import deque
 from gpiozero import OutputDevice, Button
 
-# ── 파일/GPIO 설정 ──────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# 파일/GPIO 설정
+# ════════════════════════════════════════════════════════════════════
 CSV_FILENAME      = 'experiment_results.csv'
 INPUT_DEVICE      = 0
+
 SOLENOID_GPIO     = 7
 SW_ON_GPIO        = 3
 SW_OFF_GPIO       = 5
 RELAY_ACTIVE_HIGH = True
 
-# ── 물리 상수 ────────────────────────────────────────────────────────
-SOUND_SPEED      = 34300.0
-FLOW_RATE        = 21.5
-END_CORRECTION_K = 0.4
 
-# ── 제어 파라미터 ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# 물리 상수
+# ════════════════════════════════════════════════════════════════════
+SOUND_SPEED      = 34300.0       # cm/s
+FLOW_RATE        = 17.5          # mL/s, 사용자 측정값 기준
+END_CORRECTION_K = 0.4           # 관구효과 보정계수
+
+
+# ════════════════════════════════════════════════════════════════════
+# 제어 파라미터
+# ════════════════════════════════════════════════════════════════════
 TARGET_AIR_CM           = 3.0
 STOP_OFFSET_HZ          = 0
-DIAMETER_SCALE          = 1.0
+DIAMETER_SCALE          = 1.0     # 유량이 맞다면 임의 보정값은 1.0으로 시작해야 함
+
 CALC_START_TIME         = 3.0
-DIAM_CALC_END_TIME      = 25.0
-CONTROL_START_TIME      = 5.0
-STOP_TRIGGER_COUNT      = 10
+CONTROL_START_TIME      = 4.0
+STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
-STOP_ADVANCE_CM         = 0.1
+STOP_ADVANCE_CM         = 0.2
+CONTROL_MIN_REG_POINTS  = 30
 
-# ── [v5.26-COMP] 정지 보상 파라미터 ──────────────────────────────────
-# current_air += STOP_COMP_BASE + STOP_COMP_PER_CM * D
-# D=5cm → +0.15cm, D=9cm → +0.27cm 보상
-STOP_COMP_BASE   = 0.0
-STOP_COMP_PER_CM = 0.03
 
-# ── 타깃별 final 제어 보강 (특히 1cm) ───────────────────────────────
-ONE_CM_TARGET_THRESHOLD      = 1.5
-ONE_CM_CONTROL_START_TIME    = 4.0
-ONE_CM_STOP_TRIGGER_COUNT    = 4
-ONE_CM_STOP_ADVANCE_CM       = 0.28
-ONE_CM_BUF_SIZE_FINAL        = 2
-ONE_CM_EMA_ALPHA_FINAL       = 0.60
-ONE_CM_FINAL_APPROACH_MULT   = 2.0
-ONE_CM_FINAL_TRACKING_ALPHA  = 0.70
-ONE_CM_FAST_STOP_MARGIN_CM   = 0.08
-ONE_CM_FAST_STOP_HIT_BONUS   = 2
-
-# ── 주파수 탐색 범위 ─────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# 주파수 탐색 범위
+# ════════════════════════════════════════════════════════════════════
 FREQ_MAX_LIMIT           = 3000
-EARLY_CEIL_HZ            = 1000
-FREQ_MIN_LIMIT           = 300
-CALIBRATION_CUTOFF_RATIO = 0.7
+EARLY_CEIL_HZ            = 1200    # 기존 800은 실제 기본파/초기 상승을 막을 수 있어 완화
+FREQ_MIN_LIMIT           = 200     # 큰 컵/긴 공기층 초기 기본파를 놓치지 않도록 완화
+CALIBRATION_CUTOFF_RATIO = 0.9
 
-# ── 녹음/타이밍 ──────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# 녹음/타이밍
+# ════════════════════════════════════════════════════════════════════
 NOISE_CALIBRATION_TIME = 1.0
 SPLASH_GUARD_TIME      = 2.5
-SAMPLE_RATE  = 44100
-CHUNK_SIZE   = 4096
+SAMPLE_RATE            = 44100
+CHUNK_SIZE             = 4096
 
-# ── 디스플레이 (gui_app.py 호환) ─────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# 디스플레이 설정
+# ════════════════════════════════════════════════════════════════════
 LOGO_PATH       = '/home/kimcapybara/venv/DEU.png'
 LOGO_SIZE       = (70, 70)
 WIN_W, WIN_H    = 800, 480
@@ -102,146 +82,200 @@ USE_CENTER      = False
 PLOT_UPDATE_MS  = 200
 PLOT_MAX_POINTS = 2000
 
-# ── LPC 파라미터 ─────────────────────────────────────────────────────
-LPC_ORDER        = 16
+
+# ════════════════════════════════════════════════════════════════════
+# LPC 파라미터
+# ════════════════════════════════════════════════════════════════════
+LPC_ORDER        = 18       # 22는 피크가 과하게 날카로워 배음/구조물 공진 고착 위험이 있어 완화
 LPC_DS_FACTOR    = 5
 LPC_DS_RATE      = SAMPLE_RATE // LPC_DS_FACTOR
 LPC_FRAME_MS     = 25
 LPC_HOP_MS       = 10
 LPC_NFFT         = 4096
 LPC_MIN_ENERGY   = 1e-8
-LPC_PEAK_PROM    = 0.18
-LPC_CONTINUITY_W = 600.0
-LPC_RISE_BIAS    = 0.0
+LPC_PEAK_PROM    = 0.10
+LPC_MAX_PEAKS    = 6
 
-# ── LOESS 파라미터 ────────────────────────────────────────────────────
-LOESS_FRAC   = 0.35
+
+# ════════════════════════════════════════════════════════════════════
+# FFT 파라미터
+# ════════════════════════════════════════════════════════════════════
+FFT_PEAK_PROM    = 0.10
+FFT_MAX_PEAKS    = 8
+FFT_MIN_PEAK_SEP = 8
+
+
+# ════════════════════════════════════════════════════════════════════
+# 후보 선택 파라미터
+# ════════════════════════════════════════════════════════════════════
+CONTINUITY_WEIGHT        = 0.28    # 이전값 근처 가산점. 기존처럼 강제 감점으로 쓰지 않음
+CONTINUITY_WIDTH_HZ      = 450.0
+RISE_BIAS_WEIGHT         = 0.04
+SOURCE_AGREE_BONUS       = 0.25
+HARMONIC_PENALTY         = 0.12
+JUMP_STRONG_AMP_RATIO    = 0.75    # 강한 피크는 continuity보다 우선 허용
+REG_MAX_JUMP_RATIO       = 0.22
+REG_MEDIAN_GATE_RATIO    = 0.18
+RAW_LOSS_HOLD_N          = 8
+RECOVERY_FULLSCAN_EVERY  = 6
+
+
+# ════════════════════════════════════════════════════════════════════
+# LOESS 파라미터
+# ════════════════════════════════════════════════════════════════════
+LOESS_FRAC   = 0.30
 LOESS_DEGREE = 1
 
-# ── tracking 파라미터 ────────────────────────────────────────────────
-TRACKING_ENTRY_HZ        = 1200
-TRACKING_ENTRY_MULT      = 1.3
-TRACKING_MODE_THRESHOLD  = 20
-TRACKING_BAND_HZ         = 500
-TRACKING_FLOOR_RATIO     = 0.78
-TRACKING_DROP_HARD_RATIO = 0.78
-TRACKING_RISE_LIMIT_HZ   = 18.0
-TRACKING_STABLE_BUF      = 5
 
-# ── 배음 보정 설정 ────────────────────────────────────────────────────
-ALLOW_EVEN_HARMONIC_CORRECTION = False
+# ════════════════════════════════════════════════════════════════════
+# tracking 파라미터
+# ════════════════════════════════════════════════════════════════════
+TRACKING_ENTRY_HZ       = 1200
+TRACKING_ENTRY_MULT     = 1.6
+TRACKING_MODE_THRESHOLD = 20
+TRACKING_BAND_HZ        = 800
+TRACKING_FLOOR_RATIO    = 0.72     # 기존 0.90은 복구를 막기 쉬움
 
-# ── 초기 구간 보호 ───────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# 초기 구간 보호
+# ════════════════════════════════════════════════════════════════════
 EARLY_NOISE_SEC = 6.0
 EARLY_BUF_SIZE  = 9
-MONO_DROP_RATIO = 0.85
 
-# ── init 확정 파라미터 ────────────────────────────────────────────────
-INIT_RISE_CONFIRM_N   = 12
-INIT_REANCHOR_RATIO   = 0.99
 
-# ── EMA alpha ────────────────────────────────────────────────────────
-EMA_ALPHA_NORMAL    = 0.25
-EMA_ALPHA_FINAL     = 0.35
+# ════════════════════════════════════════════════════════════════════
+# 단조 증가 보호
+# ════════════════════════════════════════════════════════════════════
+MAX_ALLOWED_DROP_HZ      = 90.0    # 기존 15Hz는 오검출 복구를 막음
+MAX_DROP_HZ_AFTER_LOCK   = 35.0
+
+
+# ════════════════════════════════════════════════════════════════════
+# EMA alpha
+# ════════════════════════════════════════════════════════════════════
+EMA_ALPHA_NORMAL    = 0.28
+EMA_ALPHA_FINAL     = 0.58
 FINAL_APPROACH_MULT = 1.5
 
-# ── 트래킹 adaptive EMA ──────────────────────────────────────────────
-TRACKING_EMA_SPIKE_ALPHA   = 0.05
-TRACKING_EMA_RISE2_ALPHA   = 0.08
-TRACKING_EMA_RISE1_ALPHA   = 0.15
-TRACKING_EMA_FALL_ALPHA    = 0.35
-FINAL_TRACKING_RISE_ALPHA  = 0.45
-TRACKING_EMA_BIGRISE_ALPHA = 0.25
 
-# ── Hz/청크 속도 제한 ────────────────────────────────────────────────
-RATE_LIMIT_NORMAL_HZ  = 25.0
-RATE_LIMIT_FINAL_HZ   = 300.0
-SPIKE_RATIO_THRESHOLD = 1.30
+# ════════════════════════════════════════════════════════════════════
+# 회귀용 EMA
+# ════════════════════════════════════════════════════════════════════
+REG_EMA_ALPHA_NORMAL = 0.45
+REG_EMA_ALPHA_FINAL  = 0.65
 
-# ── 이론 곡선 가이드 ─────────────────────────────────────────────────
-THEORY_GUIDE_ALPHA        = 0.25
-THEORY_GUIDE_MARGIN       = 0.15
-THEORY_GUIDE_ALPHA_FINAL  = 0.0    # [v5.26-NOTHFIN] final에서 비활성화
-THEORY_GUIDE_MARGIN_FINAL = 0.25
 
-# ── D 안정화 / 확정 ───────────────────────────────────────────────────
-DIAM_CAND_MAXLEN        = 20
-DIAM_CAND_MIN           = 10
-DIAM_EMA_KEEP           = 0.95
-DIAM_EMA_NEW            = 0.05
-DIAM_OUTLIER_RATIO      = 0.20
-DIAM_CONFIRM_RECENT_N   = 8
-DIAM_CONFIRM_SPREAD_MAX = 0.05
-DIAM_CONFIRM_MIN_ELAPSED = 8.0
+# ════════════════════════════════════════════════════════════════════
+# Hz/청크 속도 제한
+# ════════════════════════════════════════════════════════════════════
+RATE_LIMIT_NORMAL_HZ  = 90.0
+RATE_LIMIT_FINAL_HZ   = 260.0
+SPIKE_RATIO_THRESHOLD = 1.35
 
-# ── D 재평가 파라미터 ────────────────────────────────────────────────
-REEVAL_DEVIATION_RATIO  = 0.15
-REEVAL_CONSECUTIVE_N    = 5
-REEVAL_INTERVAL_SEC     = 2.0
-REEVAL_MAX_COUNT        = 3
 
-# ── 시간 가중 회귀 파라미터 ──────────────────────────────────────────
-WLSM_DECAY_RATE = 0.05
+# ════════════════════════════════════════════════════════════════════
+# 이론 곡선 가이드
+# ════════════════════════════════════════════════════════════════════
+THEORY_GUIDE_ALPHA        = 0.22   # 검출값을 이론선에 너무 세게 끌지 않음
+THEORY_GUIDE_MARGIN       = 0.22
+THEORY_GUIDE_ALPHA_FINAL  = 0.32
+THEORY_GUIDE_MARGIN_FINAL = 0.30
 
-# ── [v5.26-QUAD] 2차 회귀 fallback ──────────────────────────────────
-QUAD_FALLBACK_R2_THRESH = 0.80   # 선형 R² < 이 값 → 2차 시도
-QUAD_MIN_POINTS         = 15     # 2차 fit 최소 데이터 포인트
 
-# ── LSM / 데이터 충분성 ───────────────────────────────────────────────
-LSM_R2_MIN         = 0.88
-REG_MIN_POINTS     = 12
-THEORY_LOCK_R2     = 0.92
-LSM_R2_MIN_WEAK    = 0.75
-LSM_SLOPE_WEAK_THR = 5e-6
+# ════════════════════════════════════════════════════════════════════
+# D 안정화
+# ════════════════════════════════════════════════════════════════════
+DIAM_CAND_MAXLEN   = 24
+DIAM_CAND_MIN      = 10
+DIAM_EMA_KEEP      = 0.88
+DIAM_EMA_NEW       = 0.12
+DIAM_OUTLIER_RATIO = 0.22
+DIAM_EMA_KEEP_POST = 0.97
+DIAM_EMA_NEW_POST  = 0.03
 
-# ── spike gate ───────────────────────────────────────────────────────
-REG_SPIKE_GATE = 0.15
 
-# ── 단조 필터 허용 오차 ──────────────────────────────────────────────
-REG_MONO_TOLERANCE = 0.002
+# ════════════════════════════════════════════════════════════════════
+# LSM / 데이터 충분성
+# ════════════════════════════════════════════════════════════════════
+LSM_R2_MIN     = 0.86
+REG_MIN_POINTS = 20
+THEORY_LOCK_R2 = 0.91
 
-# ── REG harmonic upper ──────────────────────────────────────────────
-REG_HARMONIC_UPPER = 2.5
 
-# ── REG 진입 하한 시간 적응형 ──────────────────────────────────────────
-REG_ENTRY_EARLY_MULT = 1.005
-REG_ENTRY_LATE_MULT  = 1.001
-REG_ENTRY_RELAX_TIME = 8.0
+# ════════════════════════════════════════════════════════════════════
+# spike gate
+# ════════════════════════════════════════════════════════════════════
+REG_SPIKE_GATE = 0.20
 
-# ── 피크 고착 감지 ────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# 피크 고착 감지
+# ════════════════════════════════════════════════════════════════════
 FREEZE_RESET_N = 8
 BUF_SIZE_FINAL = 3
 
-# ── [v5.26-RAWSTOP] 정지 판단용 별도 버퍼 크기 ─────────────────────────
-RAW_STOP_BUF_SIZE = 5
 
-# ── init_stable 최소 주파수 ──────────────────────────────────────────
-INIT_STABLE_MIN_HZ = 350
+# ════════════════════════════════════════════════════════════════════
+# init_stable 최소 주파수
+# ════════════════════════════════════════════════════════════════════
+INIT_STABLE_MIN_HZ     = 300
+INIT_CONFIRM_N         = 7
+INIT_CONFIRM_SPREAD_HZ = 80.0
 
-# ── 기타 ────────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# 정체 감지 / 탐색 FFT
+# ════════════════════════════════════════════════════════════════════
+ENABLE_STAG_EXPLORE = True
+
+STAG_WINDOW_SEC     = 3.0
+STAG_BAND_HZ        = 18.0
+STAG_MIN_ELAPSED    = 5.5
+EXPLORE_CONFIRM_N   = 3
+EXPLORE_RISE_RATIO  = 1.05
+EXPLORE_SEARCH_MULT = 2.2
+EXPLORE_MAX_JUMP_RATIO = 0.55
+
+TARGET_HARD_CAP_RATIO = 1.10      # 검출값 변경에는 사용하지 않고 제어 판단 참고용으로만 사용
+
+
+# ════════════════════════════════════════════════════════════════════
+# 기타
+# ════════════════════════════════════════════════════════════════════
 MIN_SLOPE_CUTOFF = 16 * FLOW_RATE / (np.pi * SOUND_SPEED * 15.0**2) * 0.3
 PRINT_INTERVAL   = 0.1
 
-# ── 고역통과 필터 ────────────────────────────────────────────────────
-HP_SOS = signal.butter(4, 150, 'hp', fs=SAMPLE_RATE, output='sos')
 
-# ── 전역 상태 변수 ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# 고역통과 필터
+# ════════════════════════════════════════════════════════════════════
+HP_SOS = signal.butter(4, 150, 'hp', fs=SAMPLE_RATE, output='sos')
+_hp_zi = None
+
+
+# ════════════════════════════════════════════════════════════════════
+# 전역 상태 변수
+# ════════════════════════════════════════════════════════════════════
 history_time        = []
-history_freq        = []
-reg_time_buffer     = deque(maxlen=200)
-reg_inv_freq_buffer = deque(maxlen=200)
+history_freq        = []          # GUI/제어 표시용 stable_f
+history_raw_freq    = []          # 디버그용 raw_f
+history_reg_freq    = []          # 회귀용 reg_f
+reg_time_buffer     = deque(maxlen=220)
+reg_inv_freq_buffer = deque(maxlen=220)
 diameter_candidates = deque(maxlen=DIAM_CAND_MAXLEN)
 freq_buffer         = deque()
-raw_stop_buffer     = deque()     # [v5.26-RAWSTOP]
+reg_freq_buffer     = deque(maxlen=7)
+init_candidate_buf  = deque(maxlen=INIT_CONFIRM_N)
 
 is_filling              = False
 filling_start_time      = 0.0
 calibration_done        = False
 target_freq             = 0.0
 current_diameter        = 0.0
-confirmed_diameter      = 0.0
-last_diam_spread        = 999.0
-last_tracked_freq       = 0.0
+last_tracked_freq       = 0.0      # 제어용 stable 기준. GUI 호환을 위해 유지
+last_raw_freq           = 0.0      # 검출 후보 기준
+last_reg_freq           = 0.0      # 회귀 기준
 consecutive_loss_count  = 0
 consecutive_stop_hits   = 0
 initial_stable_freq     = 0.0
@@ -267,268 +301,455 @@ _freeze_count    = 0
 
 last_r2               = 0.0
 spike_blocked_count   = 0
-mono_blocked_count    = 0
 history_freq_snapshot = []
 init_air_len_cm       = 0.0
+diameter_ready        = False
 
-init_confirmed  = False
-init_rise_count = 0
-
-reeval_deviate_count = 0
-reeval_last_time     = 0.0
-reeval_total_count   = 0
+_stag_start_time    = 0.0
+_stag_active        = False
+_explore_candidate  = 0.0
+_explore_confirm    = 0
 
 _reg_event = threading.Event()
 
-# ── GPIO 초기화 ──────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════
+# GPIO 초기화
+# ════════════════════════════════════════════════════════════════════
 solenoid = OutputDevice(SOLENOID_GPIO, active_high=RELAY_ACTIVE_HIGH, initial_value=False)
-sw_on    = Button(SW_ON_GPIO,  pull_up=True, bounce_time=0.05)
+sw_on    = Button(SW_ON_GPIO, pull_up=True, bounce_time=0.05)
 sw_off   = Button(SW_OFF_GPIO, pull_up=True, bounce_time=0.05)
 
 
 # ════════════════════════════════════════════════════════════════════
-#  GPIO 제어
+# GPIO 제어
 # ════════════════════════════════════════════════════════════════════
 def solenoid_on():
-    try: solenoid.on()
-    except Exception as e: print(f'\n[GPIO ON 실패] {e}')
+    try:
+        solenoid.on()
+    except Exception as e:
+        print(f'\n[GPIO ON 실패] {e}')
+
 
 def solenoid_off():
-    try: solenoid.off()
-    except Exception as e: print(f'\n[GPIO OFF 실패] {e}')
+    try:
+        solenoid.off()
+    except Exception as e:
+        print(f'\n[GPIO OFF 실패] {e}')
+
 
 def solenoid_off_async():
     threading.Thread(target=solenoid_off, daemon=True).start()
 
 
 # ════════════════════════════════════════════════════════════════════
-#  수학 유틸리티
+# 수학 유틸리티
 # ════════════════════════════════════════════════════════════════════
 def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
     n = len(x)
+
     if n < 4:
         return np.array(y, dtype=float)
+
     x = np.array(x, dtype=float)
     y = np.array(y, dtype=float)
     smoothed = np.zeros(n)
-    h_width  = max(int(np.ceil(frac * n)), degree + 2)
+    h_width = max(int(np.ceil(frac * n)), degree + 2)
+
     for i in range(n):
-        dist  = np.abs(x - x[i])
-        idx   = np.argsort(dist)[:h_width]
+        dist = np.abs(x - x[i])
+        idx = np.argsort(dist)[:h_width]
         max_d = dist[idx[-1]]
+
         if max_d < 1e-10:
             smoothed[i] = np.mean(y[idx])
             continue
+
         u = dist[idx] / max_d
         w = (1.0 - u**3)**3
         X = np.column_stack([x[idx]**p for p in range(degree + 1)])
         W = np.diag(w)
+
         try:
-            XtW  = X.T @ W
+            XtW = X.T @ W
             coef = np.linalg.lstsq(XtW @ X, XtW @ y[idx], rcond=None)[0]
             smoothed[i] = sum(coef[p] * x[i]**p for p in range(degree + 1))
         except Exception:
             smoothed[i] = y[i]
+
     return smoothed
 
 
 def levinson_durbin(r, order):
     e = float(r[0])
+
     if e <= 0:
         return None
+
     a = np.zeros(order + 1, dtype=float)
     a[0] = 1.0
+
     for k in range(1, order + 1):
         acc = float(np.dot(a[1:k], r[k - 1:0:-1]))
         lam = -(r[k] + acc) / (e + 1e-12)
+
         if k > 1:
             a[1:k] = a[1:k] + lam * a[k - 1:0:-1]
-        a[k]  = lam
-        e    *= max(1.0 - lam * lam, 1e-12)
+
+        a[k] = lam
+        e *= max(1.0 - lam * lam, 1e-12)
+
     return a
 
 
+def _reset_hp_filter_state():
+    global _hp_zi
+    _hp_zi = signal.sosfilt_zi(HP_SOS) * 0.0
+
+
+def _hp_filter_continuous(chunk):
+    global _hp_zi
+
+    if _hp_zi is None:
+        _reset_hp_filter_state()
+
+    y, _hp_zi = signal.sosfilt(HP_SOS, chunk.astype(float), zi=_hp_zi)
+    return y
+
+
+def _is_noise_freq(f):
+    return any(abs(f - nf) < 25.0 for nf in noise_profile)
+
+
+def _unique_candidates(cands, merge_hz=18.0):
+    if not cands:
+        return []
+
+    cands = sorted(cands, key=lambda c: c['score'], reverse=True)
+    merged = []
+
+    for cand in cands:
+        f = cand['f']
+        if f <= 0:
+            continue
+
+        matched = None
+        for m in merged:
+            if abs(m['f'] - f) <= merge_hz:
+                matched = m
+                break
+
+        if matched is None:
+            merged.append(dict(cand))
+        else:
+            total_w = matched['score'] + cand['score'] + 1e-12
+            matched['f'] = (matched['f'] * matched['score'] + f * cand['score']) / total_w
+            matched['score'] = max(matched['score'], cand['score']) + 0.08
+            matched['src'] = matched['src'] + '+' + cand['src']
+
+    return sorted(merged, key=lambda c: c['score'], reverse=True)
+
+
 # ════════════════════════════════════════════════════════════════════
-#  주파수 검출
+# 주파수 후보 추출
 # ════════════════════════════════════════════════════════════════════
-def lpc_main_frequency(chunk, last_freq, f_min, f_max):
-    x_ds  = signal.decimate(chunk.astype(float), LPC_DS_FACTOR, ftype='fir')
+def lpc_frequency_candidates(filtered_chunk, f_min, f_max):
+    x_ds = signal.decimate(filtered_chunk.astype(float), LPC_DS_FACTOR, ftype='fir')
     sr_ds = LPC_DS_RATE
-    fl    = int(LPC_FRAME_MS / 1000 * sr_ds)
-    hop   = int(LPC_HOP_MS  / 1000 * sr_ds)
-    frames = [x_ds[i:i + fl] for i in range(0, len(x_ds) - fl, hop)]
-    if not frames:
-        return 0.0
-    cands = []
-    for frame in frames:
+
+    fl = int(LPC_FRAME_MS / 1000 * sr_ds)
+    hop = int(LPC_HOP_MS / 1000 * sr_ds)
+
+    if len(x_ds) < fl:
+        return []
+
+    all_cands = []
+
+    for start in range(0, len(x_ds) - fl, hop):
+        frame = x_ds[start:start + fl]
+
         if float(np.mean(frame**2)) < LPC_MIN_ENERGY:
             continue
+
         frame = frame * np.hamming(len(frame))
         r = np.array([
             np.dot(frame[:len(frame) - k], frame[k:]) / len(frame)
             for k in range(LPC_ORDER + 1)
         ])
+
         if r[0] < 1e-12:
             continue
+
         a = levinson_durbin(r, LPC_ORDER)
+
         if a is None:
             continue
-        A   = np.fft.rfft(a, n=LPC_NFFT)
+
+        A = np.fft.rfft(a, n=LPC_NFFT)
         mag = 1.0 / (np.abs(A) + 1e-12)
         freqs = np.fft.rfftfreq(LPC_NFFT, d=1.0 / sr_ds)
-        mask  = (freqs >= f_min) & (freqs <= min(f_max, sr_ds / 2 - 50))
+        mask = (freqs >= f_min) & (freqs <= min(f_max, sr_ds / 2 - 50))
+
         if not np.any(mask):
             continue
-        vf, vm   = freqs[mask], mag[mask]
-        prom     = vm.max() * LPC_PEAK_PROM
+
+        vf = freqs[mask]
+        vm = mag[mask]
+        prom = vm.max() * LPC_PEAK_PROM
         peaks, _ = signal.find_peaks(vm, prominence=prom, distance=4)
+
         if len(peaks) == 0:
-            peaks = np.array([np.argmax(vm)])
-        pf, pm = vf[peaks], vm[peaks]
-        clean  = [i for i, f in enumerate(pf)
-                  if not any(abs(f - nf) < 25.0 for nf in noise_profile)]
-        if not clean:
+            peaks = np.array([int(np.argmax(vm))])
+
+        peak_items = []
+        for p in peaks:
+            f = float(vf[p])
+            if _is_noise_freq(f):
+                continue
+            peak_items.append((f, float(vm[p])))
+
+        if not peak_items:
             continue
-        pf, pm = pf[clean], pm[clean]
-        pm_n   = pm / (pm.max() + 1e-12)
-        if last_freq > 0:
-            score = pm_n - (1.0 / LPC_CONTINUITY_W) * np.abs(pf - last_freq)
-            if LPC_RISE_BIAS > 0:
-                score += LPC_RISE_BIAS * (pf > last_freq)
-        else:
-            score = pm_n
-        cands.append(float(pf[np.argmax(score)]))
-    return float(np.median(cands)) if cands else 0.0
+
+        peak_items = sorted(peak_items, key=lambda x: x[1], reverse=True)[:LPC_MAX_PEAKS]
+        max_amp = max(a for _, a in peak_items) + 1e-12
+
+        for f, amp in peak_items:
+            all_cands.append({
+                'f': f,
+                'amp': amp / max_amp,
+                'src': 'LPC',
+                'score': amp / max_amp,
+                'harm': 1,
+            })
+
+    return _unique_candidates(all_cands)[:LPC_MAX_PEAKS]
 
 
-def fft_backup_frequency(chunk, last_freq, f_min, f_max):
-    windowed = chunk * np.hamming(len(chunk))
-    fft_val  = np.abs(np.fft.rfft(windowed))
-    freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
-    mask     = (freqs >= f_min) & (freqs <= f_max)
+def fft_frequency_candidates(filtered_chunk, f_min, f_max):
+    windowed = filtered_chunk * np.hamming(len(filtered_chunk))
+    fft_val = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(len(filtered_chunk), d=1.0 / SAMPLE_RATE)
+    mask = (freqs >= f_min) & (freqs <= f_max)
+
+    if not np.any(mask):
+        return []
+
+    vf = freqs[mask]
+    vm = fft_val[mask]
+    prom = vm.max() * FFT_PEAK_PROM
+    peaks, _ = signal.find_peaks(vm, prominence=prom, distance=FFT_MIN_PEAK_SEP)
+
+    if len(peaks) == 0:
+        peaks = np.array([int(np.argmax(vm))])
+
+    peak_items = []
+    for p in peaks:
+        f = float(vf[p])
+        if _is_noise_freq(f):
+            continue
+        peak_items.append((f, float(vm[p])))
+
+    if not peak_items:
+        return []
+
+    peak_items = sorted(peak_items, key=lambda x: x[1], reverse=True)[:FFT_MAX_PEAKS]
+    max_amp = max(a for _, a in peak_items) + 1e-12
+
+    cands = []
+    for f, amp in peak_items:
+        cands.append({
+            'f': f,
+            'amp': amp / max_amp,
+            'src': 'FFT',
+            'score': amp / max_amp,
+            'harm': 1,
+        })
+
+    return _unique_candidates(cands)[:FFT_MAX_PEAKS]
+
+
+def _add_harmonic_variants(cands, f_min, f_max):
+    out = []
+
+    for c in cands:
+        out.append(dict(c))
+
+        for h in (2, 3, 4, 5):
+            fh = c['f'] / h
+            if f_min <= fh <= f_max:
+                out.append({
+                    'f': fh,
+                    'amp': c['amp'] * (0.82 - 0.06 * h),
+                    'src': c['src'] + f'/H{h}',
+                    'score': max(c['score'] - HARMONIC_PENALTY * h, 0.05),
+                    'harm': h,
+                })
+
+    return _unique_candidates(out)
+
+
+def _agreement_bonus(cands):
+    if not cands:
+        return []
+
+    for c in cands:
+        src = c['src']
+        f = c['f']
+        has_lpc = 'LPC' in src
+        has_fft = 'FFT' in src
+
+        if has_lpc and has_fft:
+            c['score'] += SOURCE_AGREE_BONUS
+            continue
+
+        for other in cands:
+            if other is c:
+                continue
+
+            other_src = other['src']
+            if ('LPC' in src and 'FFT' in other_src) or ('FFT' in src and 'LPC' in other_src):
+                if abs(other['f'] - f) <= max(25.0, f * 0.035):
+                    c['score'] += SOURCE_AGREE_BONUS * 0.8
+                    break
+
+    return cands
+
+
+def select_frequency_candidate(filtered_chunk, ref_freq, f_min, f_max, allow_jump=True):
+    lpc_cands = lpc_frequency_candidates(filtered_chunk, f_min, f_max)
+    fft_cands = fft_frequency_candidates(filtered_chunk, f_min, f_max)
+
+    all_cands = []
+    all_cands.extend(lpc_cands)
+    all_cands.extend(fft_cands)
+    all_cands = _add_harmonic_variants(all_cands, f_min, f_max)
+    all_cands = _agreement_bonus(all_cands)
+
+    if not all_cands:
+        return 0.0, {'lpc': 0.0, 'fft': 0.0, 'src': 'NONE', 'candidates': []}
+
+    max_amp = max(c['amp'] for c in all_cands) + 1e-12
+
+    for c in all_cands:
+        f = c['f']
+        amp_n = c['amp'] / max_amp
+        score = 0.72 * c['score'] + 0.28 * amp_n
+
+        if ref_freq > 0:
+            dist = abs(f - ref_freq)
+            cont = np.exp(-dist / CONTINUITY_WIDTH_HZ)
+            score += CONTINUITY_WEIGHT * cont
+
+            if f > ref_freq:
+                score += RISE_BIAS_WEIGHT
+
+            ratio = f / ref_freq
+            strong_peak = amp_n >= JUMP_STRONG_AMP_RATIO
+
+            if not allow_jump and (ratio > 1.8 or ratio < 0.55) and not strong_peak:
+                score -= 0.65
+
+            if ratio > 2.8 and c.get('harm', 1) == 1 and not strong_peak:
+                score -= 0.40
+
+        if c.get('harm', 1) > 1:
+            score -= HARMONIC_PENALTY * (c['harm'] - 1)
+
+        c['final_score'] = float(score)
+
+    all_cands = sorted(all_cands, key=lambda c: c['final_score'], reverse=True)
+    chosen = all_cands[0]
+
+    best_lpc = lpc_cands[0]['f'] if lpc_cands else 0.0
+    best_fft = fft_cands[0]['f'] if fft_cands else 0.0
+
+    debug = {
+        'lpc': float(best_lpc),
+        'fft': float(best_fft),
+        'src': chosen['src'],
+        'candidates': [(round(c['f'], 1), round(c['final_score'], 3), c['src']) for c in all_cands[:6]],
+    }
+
+    return float(chosen['f']), debug
+
+
+def fft_explore_rising(filtered_chunk, current_f, f_max):
+    if current_f <= 0:
+        return 0.0
+
+    windowed = filtered_chunk * np.hamming(len(filtered_chunk))
+    fft_val = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(len(filtered_chunk), d=1.0 / SAMPLE_RATE)
+
+    search_min = current_f * 1.03
+    search_max = min(f_max, current_f * EXPLORE_SEARCH_MULT, current_f * (1 + EXPLORE_MAX_JUMP_RATIO))
+    mask = (freqs >= search_min) & (freqs <= search_max)
+
     if not np.any(mask):
         return 0.0
-    vf, vm   = freqs[mask], fft_val[mask]
-    peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.15, distance=10)
+
+    vf = freqs[mask]
+    vm = fft_val[mask]
+    peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.12, distance=10)
+
     if len(peaks) == 0:
-        return float(vf[np.argmax(vm)])
-    pf, pm = vf[peaks], vm[peaks]
-    clean  = [i for i, f in enumerate(pf)
-              if not any(abs(f - nf) < 25.0 for nf in noise_profile)]
+        idx = int(np.argmax(vm))
+        if vm[idx] < np.max(fft_val) * 0.08:
+            return 0.0
+        return float(vf[idx])
+
+    pf = vf[peaks]
+    pm = vm[peaks]
+    clean = [i for i, f in enumerate(pf) if not _is_noise_freq(float(f))]
+
     if not clean:
-        clean = list(range(len(pf)))
-    pf, pm = pf[clean], pm[clean]
-    pm_n   = pm / (pm.max() + 1e-12)
-    if last_freq > 0:
-        score = pm_n - (1.0 / 800.0) * np.abs(pf - last_freq)
-        if LPC_RISE_BIAS > 0:
-            score += LPC_RISE_BIAS * (pf > last_freq)
-    else:
-        score = pm_n
-    return float(pf[np.argmax(score)])
-
-
-def _harmonic_correct(f: float, ref: float, allow_even: bool = ALLOW_EVEN_HARMONIC_CORRECTION) -> float:
-    if ref <= 0 or f <= 0:
-        return f
-    ratio = f / ref
-    if 2.7 <= ratio <= 3.3:
-        return f / 3.0
-    elif 4.7 <= ratio <= 5.3:
-        return f / 5.0
-    elif 1.85 <= ratio <= 2.15:
-        return f / 2.0 if allow_even else 0.0
-    elif ratio > REG_HARMONIC_UPPER:
         return 0.0
-    return f
 
-
-def get_frequency(chunk, last_freq, f_min, f_max, allow_even: bool = ALLOW_EVEN_HARMONIC_CORRECTION):
-    filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
-    lpc_f = lpc_main_frequency(filtered, last_freq, f_min, f_max)
-    lpc_f = _harmonic_correct(lpc_f, last_freq, allow_even=allow_even)
-    if lpc_f > 0:
-        return float(lpc_f)
-    fft_f = fft_backup_frequency(filtered, last_freq, f_min, f_max)
-    fft_f = _harmonic_correct(fft_f, last_freq, allow_even=allow_even)
-    return float(fft_f)
+    pf = pf[clean]
+    pm = pm[clean]
+    return float(pf[int(np.argmax(pm))])
 
 
 # ════════════════════════════════════════════════════════════════════
-#  [v5.26-QUAD] 회귀: 선형 + 2차 fallback
+# 회귀 기반 D 추정
 # ════════════════════════════════════════════════════════════════════
 def robust_slope_loess_lsm(times, inv_freqs):
-    """LOESS + 시간 가중 LSM. 선형 R² 부족 시 2차 접선 fallback."""
-    if len(times) < 8:
+    if len(times) < 12:
         return None, 0.0, 0.0
-    x = np.array(times,     dtype=float)
+
+    x = np.array(times, dtype=float)
     y = np.array(inv_freqs, dtype=float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
     y_smooth = loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE)
+
     try:
-        # 1차 fit → 이상치 제거
-        p   = np.polyfit(x, y_smooth, 1)
+        p = np.polyfit(x, y_smooth, 1)
         res = np.abs(y_smooth - (p[0] * x + p[1]))
         mask = res <= np.percentile(res, 75)
-        if mask.sum() < 6:
+
+        if mask.sum() < 8:
             return None, 0.0, 0.0
 
-        xm = x[mask]
-        ym = y_smooth[mask]
+        slope, intercept = np.polyfit(x[mask], y_smooth[mask], 1)
 
-        # 시간 가중치
-        t_start = xm[0]
-        weights = np.exp(-WLSM_DECAY_RATE * (xm - t_start))
-
-        # ── 선형 가중 LSM ────────────────────────────────────────
-        W_diag = np.diag(weights)
-        X_lin  = np.column_stack([xm, np.ones_like(xm)])
-        XtW    = X_lin.T @ W_diag
-        try:
-            coef_lin = np.linalg.lstsq(XtW @ X_lin, XtW @ ym, rcond=None)[0]
-        except Exception:
-            coef_lin = np.polyfit(xm, ym, 1)
-        slope_lin, intercept_lin = float(coef_lin[0]), float(coef_lin[1])
-
-        y_pred_lin = slope_lin * xm + intercept_lin
-        wm = np.average(ym, weights=weights)
-        ss_res_lin = np.sum(weights * (ym - y_pred_lin)**2)
-        ss_tot_lin = np.sum(weights * (ym - wm)**2)
-        r2_lin     = 1.0 - ss_res_lin / (ss_tot_lin + 1e-12)
-
-        # ── [v5.26-QUAD] 2차 fallback ────────────────────────────
-        slope_out     = slope_lin
-        intercept_out = intercept_lin
-        r2_out        = r2_lin
-        used_quad     = False
-
-        if r2_lin < QUAD_FALLBACK_R2_THRESH and len(xm) >= QUAD_MIN_POINTS:
-            try:
-                X_quad = np.column_stack([xm**2, xm, np.ones_like(xm)])
-                XtW_q  = X_quad.T @ W_diag
-                coef_q = np.linalg.lstsq(XtW_q @ X_quad, XtW_q @ ym, rcond=None)[0]
-                a2, a1, a0 = float(coef_q[0]), float(coef_q[1]), float(coef_q[2])
-
-                y_pred_q = a2 * xm**2 + a1 * xm + a0
-                ss_res_q = np.sum(weights * (ym - y_pred_q)**2)
-                r2_q     = 1.0 - ss_res_q / (ss_tot_lin + 1e-12)
-
-                # 2차 R²가 선형보다 유의미하게 나은 경우
-                if r2_q > r2_lin + 0.02 and r2_q > _adaptive_r2_min(abs(a1)) * 0.9:
-                    # 시작점 접선 기울기 = 2*a2*t_start + a1
-                    tangent_slope = 2.0 * a2 * t_start + a1
-                    tangent_intercept = a0 + a2 * t_start**2  # y at t_start 근사
-                    slope_out     = tangent_slope
-                    intercept_out = tangent_intercept
-                    r2_out        = r2_q
-                    used_quad     = True
-                    print(f'\n[회귀-QUAD] 2차 fit 채택: a2={a2:.2e} tangent_slope={tangent_slope:.6f} r²={r2_q:.4f} (linear r²={r2_lin:.4f})')
-            except Exception:
-                pass
-
-        if abs(slope_out) < MIN_SLOPE_CUTOFF:
+        if slope >= 0:
             return None, 0.0, 0.0
 
-        return slope_out, intercept_out, r2_out
+        if abs(slope) < MIN_SLOPE_CUTOFF:
+            return None, 0.0, 0.0
+
+        y_pred = slope * x[mask] + intercept
+        ss_res = np.sum((y_smooth[mask] - y_pred)**2)
+        ss_tot = np.sum((y_smooth[mask] - y_smooth[mask].mean())**2)
+        r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+
+        return float(slope), float(intercept), float(r2)
+
     except Exception:
         return None, 0.0, 0.0
 
@@ -536,99 +757,23 @@ def robust_slope_loess_lsm(times, inv_freqs):
 def theory_freq(t: float) -> float:
     if not theory_locked:
         return 0.0
+
     denom = theory_slope * t + theory_intercept
+
     if denom <= 1e-6:
         return 0.0
+
     return 1.0 / denom
 
 
-def _adaptive_r2_min(slope_abs: float) -> float:
-    if slope_abs <= LSM_SLOPE_WEAK_THR:
-        return LSM_R2_MIN_WEAK
-    return LSM_R2_MIN
-
-
-def _reg_entry_mult(filling_elapsed: float) -> float:
-    if filling_elapsed < REG_ENTRY_RELAX_TIME:
-        return REG_ENTRY_EARLY_MULT
-    t_ratio = min(1.0, (filling_elapsed - REG_ENTRY_RELAX_TIME)
-                       / (DIAM_CALC_END_TIME - REG_ENTRY_RELAX_TIME))
-    return REG_ENTRY_EARLY_MULT + t_ratio * (REG_ENTRY_LATE_MULT - REG_ENTRY_EARLY_MULT)
-
-
-def _is_tight_target() -> bool:
-    return TARGET_AIR_CM <= ONE_CM_TARGET_THRESHOLD
-
-
-def _control_start_time() -> float:
-    return ONE_CM_CONTROL_START_TIME if _is_tight_target() else CONTROL_START_TIME
-
-
-def _stop_trigger_need() -> int:
-    return ONE_CM_STOP_TRIGGER_COUNT if _is_tight_target() else STOP_TRIGGER_COUNT
-
-
-def _stop_advance_cm() -> float:
-    return ONE_CM_STOP_ADVANCE_CM if _is_tight_target() else STOP_ADVANCE_CM
-
-
-def _final_approach_mult() -> float:
-    return ONE_CM_FINAL_APPROACH_MULT if _is_tight_target() else FINAL_APPROACH_MULT
-
-
-def _ema_alpha_final() -> float:
-    return ONE_CM_EMA_ALPHA_FINAL if _is_tight_target() else EMA_ALPHA_FINAL
-
-
-def _final_tracking_rise_alpha() -> float:
-    return ONE_CM_FINAL_TRACKING_ALPHA if _is_tight_target() else FINAL_TRACKING_RISE_ALPHA
-
-
-def _final_buf_size() -> int:
-    return ONE_CM_BUF_SIZE_FINAL if _is_tight_target() else BUF_SIZE_FINAL
-
-
-def _fast_stop_margin_cm() -> float:
-    return ONE_CM_FAST_STOP_MARGIN_CM if _is_tight_target() else 0.0
-
-
-def _fast_stop_hit_bonus() -> int:
-    return ONE_CM_FAST_STOP_HIT_BONUS if _is_tight_target() else 1
-
-
-def _recent_diam_spread(cands):
-    if len(cands) < max(4, DIAM_CONFIRM_RECENT_N // 2):
-        return None
-    recent = list(cands)[-min(len(cands), DIAM_CONFIRM_RECENT_N):]
-    med = float(np.median(recent))
-    if med <= 1e-9:
-        return None
-    return float(np.std(recent) / (med + 1e-12))
-
-
-def _diam_confirm_ready(cands, elapsed: float):
-    spread = _recent_diam_spread(cands)
-    ready = False
-    if len(cands) >= DIAM_CAND_MAXLEN:
-        ready = True
-    elif (
-        len(cands) >= DIAM_CAND_MIN
-        and elapsed >= DIAM_CONFIRM_MIN_ELAPSED
-        and spread is not None
-        and spread <= DIAM_CONFIRM_SPREAD_MAX
-    ):
-        ready = True
-    return ready, spread
-
-
 # ════════════════════════════════════════════════════════════════════
-#  회귀 워커 스레드
+# 회귀 워커 스레드
 # ════════════════════════════════════════════════════════════════════
 def _regression_worker():
-    global current_diameter, confirmed_diameter, target_freq, calibration_done
+    global current_diameter, target_freq, calibration_done
     global theory_slope, theory_intercept, theory_locked
-    global init_air_len_cm, last_r2, diameter_candidates, last_diam_spread
-    global reeval_deviate_count, reeval_last_time, reeval_total_count
+    global init_air_len_cm, last_r2, diameter_candidates
+    global diameter_ready
 
     while True:
         _reg_event.wait(timeout=1.0)
@@ -637,13 +782,11 @@ def _regression_worker():
         with lock:
             if not is_filling:
                 continue
-            _filling_elapsed = time.time() - filling_start_time - NOISE_CALIBRATION_TIME
-            times      = list(reg_time_buffer)
-            inv_freqs  = list(reg_inv_freq_buffer)
-            _init_f    = float(initial_stable_freq)
-            _live_d    = float(current_diameter)
-            _conf_d    = float(confirmed_diameter)
-            _diam_done = bool(calibration_done)
+
+            times = list(reg_time_buffer)
+            inv_freqs = list(reg_inv_freq_buffer)
+            _init_f = float(initial_stable_freq)
+            _cur_d = float(current_diameter)
 
         if len(times) <= REG_MIN_POINTS:
             continue
@@ -651,123 +794,90 @@ def _regression_worker():
         s_a, s_b, r_sq = robust_slope_loess_lsm(times, inv_freqs)
 
         if s_a is not None:
-            if _live_d > 0:
-                q_implied = abs(s_a) * np.pi * SOUND_SPEED * _live_d**2 / 16
-                print(f'\n[회귀] slope={s_a:.6f} | r²={r_sq:.4f} | 역산Q={q_implied:.1f}ml/s (설정Q={FLOW_RATE})')
+            if _cur_d > 0:
+                q_implied = abs(s_a) * np.pi * SOUND_SPEED * _cur_d**2 / 16
+                print(f'\n[회귀] slope={s_a:.7f} | r²={r_sq:.4f} | 역산Q={q_implied:.1f}ml/s (설정Q={FLOW_RATE})')
             else:
-                print(f'\n[회귀] slope={s_a:.6f} | r²={r_sq:.4f}')
+                print(f'\n[회귀] slope={s_a:.7f} | r²={r_sq:.4f}')
 
         with lock:
             if s_a is not None and r_sq > THEORY_LOCK_R2 and not theory_locked:
-                theory_slope     = s_a
+                theory_slope = s_a
                 theory_intercept = s_b
-                theory_locked    = True
-                print(f'\n[★ 이론 곡선 잠금] slope={s_a:.6f} r²={r_sq:.3f}')
+                theory_locked = True
+                print(f'\n[★ 이론 곡선 잠금] slope={s_a:.7f} r²={r_sq:.3f}')
 
-        if s_a is None or abs(s_a) <= 1e-9:
+        if s_a is None or abs(s_a) <= 1e-9 or r_sq <= LSM_R2_MIN:
             with lock:
                 if s_a is not None:
                     last_r2 = r_sq
-            continue
-
-        r2_threshold = _adaptive_r2_min(abs(s_a))
-        if r_sq <= r2_threshold:
-            with lock:
-                last_r2 = r_sq
-            if r_sq > 0.6:
-                print(f'\n[회귀] r²={r_sq:.4f} < 적응임계={r2_threshold:.2f} (slope={s_a:.2e}), D 미채택')
             continue
 
         temp_D = np.sqrt(16 * FLOW_RATE / (np.pi * SOUND_SPEED * abs(s_a)))
         temp_D *= DIAMETER_SCALE
 
         if not (2.0 < temp_D < 15.0):
+            print(f'\n[D범위제외] temp_D={temp_D:.2f}cm → 물리 안전범위 밖')
             continue
 
         with lock:
             cand_list = list(diameter_candidates)
 
-        if len(cand_list) >= 3:
+        if len(cand_list) >= 4:
             cur_med = float(np.median(cand_list))
-            outlier = abs(temp_D - cur_med) / cur_med > DIAM_OUTLIER_RATIO
+            outlier = abs(temp_D - cur_med) / (cur_med + 1e-12) > DIAM_OUTLIER_RATIO
         else:
             outlier = False
             cur_med = temp_D
 
         if outlier:
-            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm ±20%, 무시)')
+            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm ±{DIAM_OUTLIER_RATIO*100:.0f}%, 무시)')
             continue
 
         with lock:
             last_r2 = r_sq
             diameter_candidates.append(temp_D)
+            _new_cnt = len(diameter_candidates)
 
-            _new_cnt     = len(diameter_candidates)
-            _elapsed_now = time.time() - filling_start_time - NOISE_CALIBRATION_TIME
-            cand_vals    = list(diameter_candidates)
+            if not diameter_ready and _new_cnt >= DIAM_CAND_MIN:
+                diameter_ready = True
+                print(f'\n[★ 지름 준비 완료] cand={_new_cnt} (>={DIAM_CAND_MIN})')
 
-            med_D = float(np.median(cand_vals))
+            med_D = float(np.median(list(diameter_candidates)))
+
             if current_diameter == 0:
                 current_diameter = med_D
+            elif diameter_ready:
+                current_diameter = current_diameter * DIAM_EMA_KEEP_POST + med_D * DIAM_EMA_NEW_POST
             else:
                 current_diameter = current_diameter * DIAM_EMA_KEEP + med_D * DIAM_EMA_NEW
-            _live_d_now = float(current_diameter)
 
-            ready_now, cand_spread = _diam_confirm_ready(cand_vals, _elapsed_now)
-            last_diam_spread = 999.0 if cand_spread is None else float(cand_spread)
+            _cur_d = float(current_diameter)
 
-            if init_air_len_cm == 0.0 and _init_f > 0 and _live_d_now > 0 and _new_cnt >= DIAM_CAND_MIN:
-                est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _live_d_now
+            if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
+                est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
+
                 if est > 0.5:
                     init_air_len_cm = est
                     print(f'\n[★ 용기 높이 확정] {est:.2f} cm')
 
-            if not _diam_done and ready_now:
-                confirmed_diameter = _live_d_now
-                target_L_eff = TARGET_AIR_CM + END_CORRECTION_K * confirmed_diameter
-                new_tf = SOUND_SPEED / (4 * target_L_eff)
-                if target_freq == 0:
-                    target_freq = new_tf
-                else:
-                    change_ratio = abs(new_tf - target_freq) / target_freq
-                    if change_ratio <= TARGET_MAX_CHANGE_RATIO:
-                        target_freq = new_tf
-                calibration_done = True
-                reeval_deviate_count = 0
-                reeval_last_time     = _elapsed_now
-                spread_txt = f'{cand_spread * 100:.1f}%' if cand_spread is not None else 'N/A'
-                print(
-                    f'\n[★ 지름 확정] live={_live_d_now:.3f}cm | confirmed={confirmed_diameter:.3f}cm'
-                    f' | cand={_new_cnt} | spread={spread_txt} | t={_elapsed_now:.1f}s | r²={r_sq:.3f}'
-                )
+            target_L_eff = TARGET_AIR_CM + END_CORRECTION_K * _cur_d
+            new_tf = SOUND_SPEED / (4 * target_L_eff) + STOP_OFFSET_HZ
 
-            elif _diam_done and reeval_total_count < REEVAL_MAX_COUNT:
-                if _elapsed_now - reeval_last_time >= REEVAL_INTERVAL_SEC:
-                    reeval_last_time = _elapsed_now
-                    deviation = abs(_live_d_now - confirmed_diameter) / (confirmed_diameter + 1e-12)
-                    if deviation > REEVAL_DEVIATION_RATIO:
-                        reeval_deviate_count += 1
-                        print(
-                            f'\n[D재평가] 괴리 감지 {reeval_deviate_count}/{REEVAL_CONSECUTIVE_N}'
-                            f' | live={_live_d_now:.3f}cm vs conf={confirmed_diameter:.3f}cm'
-                            f' | diff={deviation*100:.1f}%'
-                        )
-                        if reeval_deviate_count >= REEVAL_CONSECUTIVE_N:
-                            old_conf = confirmed_diameter
-                            confirmed_diameter = _live_d_now
-                            target_L_eff = TARGET_AIR_CM + END_CORRECTION_K * confirmed_diameter
-                            new_tf = SOUND_SPEED / (4 * target_L_eff)
-                            target_freq = new_tf
-                            reeval_deviate_count = 0
-                            reeval_total_count  += 1
-                            print(
-                                f'\n[★ 지름 재확정 #{reeval_total_count}]'
-                                f' {old_conf:.3f}→{confirmed_diameter:.3f}cm'
-                                f' | target_f={target_freq:.0f}Hz'
-                                f' | t={_elapsed_now:.1f}s'
-                            )
-                    else:
-                        reeval_deviate_count = max(0, reeval_deviate_count - 1)
+            if target_freq == 0:
+                target_freq = new_tf
+            else:
+                change_ratio = abs(new_tf - target_freq) / (target_freq + 1e-12)
+
+                if change_ratio <= TARGET_MAX_CHANGE_RATIO:
+                    target_freq = new_tf
+
+            if diameter_ready and not calibration_done:
+                calibration_done = True
+                print(f'\n[★ 캘리브레이션 완료] D={_cur_d:.3f}cm | target_f={target_freq:.0f}Hz')
+
+        if _new_cnt % 5 == 0:
+            print(f'\n[D갱신] D={_cur_d:.3f}cm | cand={_new_cnt} | r²={r_sq:.4f}')
 
 
 _reg_worker_thread = threading.Thread(target=_regression_worker, daemon=True)
@@ -775,127 +885,243 @@ _reg_worker_thread.start()
 
 
 # ════════════════════════════════════════════════════════════════════
-#  급수 시작/종료
+# 급수 시작/종료
 # ════════════════════════════════════════════════════════════════════
 def start_filling_local() -> None:
     global is_filling, filling_start_time, calibration_done
-    global freq_buffer, raw_stop_buffer
-    global reg_time_buffer, reg_inv_freq_buffer
-    global diameter_candidates, history_time, history_freq
-    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
-    global current_diameter, confirmed_diameter, target_freq, initial_stable_freq
+    global freq_buffer, reg_freq_buffer, reg_time_buffer, reg_inv_freq_buffer, init_candidate_buf
+    global diameter_candidates, history_time, history_freq, history_raw_freq, history_reg_freq
+    global last_tracked_freq, last_raw_freq, last_reg_freq
+    global consecutive_loss_count, consecutive_stop_hits
+    global current_diameter, target_freq, initial_stable_freq
     global request_finish, last_stable_f, last_current_air, dynamic_min_limit, noise_profile
     global max_freq_seen, tracking_mode, tracking_mode_hits
     global theory_slope, theory_intercept, theory_locked
     global _prev_buf_median, _freeze_count
-    global last_r2, spike_blocked_count, mono_blocked_count
-    global history_freq_snapshot
-    global init_air_len_cm
-    global init_confirmed, init_rise_count, last_diam_spread
-    global reeval_deviate_count, reeval_last_time, reeval_total_count
+    global last_r2, spike_blocked_count, history_freq_snapshot
+    global init_air_len_cm, diameter_ready
+    global _stag_start_time, _stag_active, _explore_candidate, _explore_confirm
 
     with lock:
-        is_filling              = True
-        filling_start_time      = time.time()
-        calibration_done        = False
-        freq_buffer             = deque()
-        raw_stop_buffer         = deque()
+        is_filling = True
+        filling_start_time = time.time()
+        calibration_done = False
+        freq_buffer = deque()
+        reg_freq_buffer.clear()
+        init_candidate_buf.clear()
         reg_time_buffer.clear()
         reg_inv_freq_buffer.clear()
         diameter_candidates.clear()
-        history_time            = []
-        history_freq            = []
-        last_tracked_freq       = 0.0
-        consecutive_loss_count  = 0
-        consecutive_stop_hits   = 0
-        initial_stable_freq     = 0.0
-        current_diameter        = 0.0
-        confirmed_diameter      = 0.0
-        target_freq             = 0.0
-        request_finish          = False
-        last_stable_f           = 0.0
-        last_current_air        = 0.0
-        dynamic_min_limit       = FREQ_MIN_LIMIT
-        noise_profile           = []
-        max_freq_seen           = 0.0
-        tracking_mode           = False
-        tracking_mode_hits      = 0
-        theory_slope            = 0.0
-        theory_intercept        = 0.0
-        theory_locked           = False
-        _prev_buf_median        = 0.0
-        _freeze_count           = 0
-        last_r2                 = 0.0
-        spike_blocked_count     = 0
-        mono_blocked_count      = 0
-        history_freq_snapshot   = []
-        init_air_len_cm         = 0.0
-        init_confirmed          = False
-        init_rise_count         = 0
-        last_diam_spread        = 999.0
-        reeval_deviate_count    = 0
-        reeval_last_time        = 0.0
-        reeval_total_count      = 0
+        history_time = []
+        history_freq = []
+        history_raw_freq = []
+        history_reg_freq = []
+        last_tracked_freq = 0.0
+        last_raw_freq = 0.0
+        last_reg_freq = 0.0
+        consecutive_loss_count = 0
+        consecutive_stop_hits = 0
+        initial_stable_freq = 0.0
+        current_diameter = 0.0
+        target_freq = 0.0
+        request_finish = False
+        last_stable_f = 0.0
+        last_current_air = 0.0
+        dynamic_min_limit = FREQ_MIN_LIMIT
+        noise_profile = []
+        max_freq_seen = 0.0
+        tracking_mode = False
+        tracking_mode_hits = 0
+        theory_slope = 0.0
+        theory_intercept = 0.0
+        theory_locked = False
+        _prev_buf_median = 0.0
+        _freeze_count = 0
+        last_r2 = 0.0
+        spike_blocked_count = 0
+        history_freq_snapshot = []
+        init_air_len_cm = 0.0
+        diameter_ready = False
+        _stag_start_time = 0.0
+        _stag_active = False
+        _explore_candidate = 0.0
+        _explore_confirm = 0
+
+    _reset_hp_filter_state()
     print('\n>>> [1단계] 배경 소음 측정 (1초)...')
 
 
 def stop_filling_local(save_result: bool) -> None:
     global is_filling, request_finish, history_freq_snapshot
+
     with lock:
         history_freq_snapshot = list(history_freq)
         is_filling = False
+
         if save_result:
             request_finish = True
+
     print('\n>>> 물 주입 종료.')
 
 
 # ════════════════════════════════════════════════════════════════════
-#  오디오 콜백 (v5.26)
+# 주파수 후처리
+# ════════════════════════════════════════════════════════════════════
+def _smooth_control_freq(raw_f, last_stable, in_final, is_tracking):
+    if raw_f <= 0:
+        return last_stable
+
+    if last_stable <= 0:
+        return raw_f
+
+    ratio = raw_f / (last_stable + 1e-12)
+
+    if is_tracking:
+        if ratio > SPIKE_RATIO_THRESHOLD:
+            alpha = 0.12
+        elif raw_f > last_stable:
+            alpha = 0.42 if in_final else 0.22
+        else:
+            alpha = 0.30
+    else:
+        alpha = EMA_ALPHA_FINAL if in_final else EMA_ALPHA_NORMAL
+
+    smoothed = last_stable * (1 - alpha) + raw_f * alpha
+
+    if smoothed > last_stable:
+        max_rise = RATE_LIMIT_FINAL_HZ if in_final else RATE_LIMIT_NORMAL_HZ
+        if smoothed - last_stable > max_rise:
+            smoothed = last_stable + max_rise
+
+    max_drop = MAX_DROP_HZ_AFTER_LOCK if is_tracking else MAX_ALLOWED_DROP_HZ
+    if last_stable - smoothed > max_drop:
+        smoothed = last_stable - max_drop
+
+    return float(smoothed)
+
+
+def _update_initial_frequency(filling_elapsed, reg_f):
+    global initial_stable_freq
+
+    if initial_stable_freq > 0 or reg_f <= INIT_STABLE_MIN_HZ:
+        return
+
+    init_candidate_buf.append(reg_f)
+
+    if len(init_candidate_buf) < INIT_CONFIRM_N:
+        return
+
+    vals = np.array(init_candidate_buf, dtype=float)
+    spread = float(np.max(vals) - np.min(vals))
+
+    if spread <= INIT_CONFIRM_SPREAD_HZ:
+        initial_stable_freq = float(np.median(vals))
+        print(f'\n[★ 초기 주파수 확정] init_f={initial_stable_freq:.0f}Hz | spread={spread:.1f}Hz | t={filling_elapsed:.1f}s')
+
+
+def _make_reg_freq(raw_f, last_reg, in_final):
+    if raw_f <= 0:
+        return last_reg
+
+    if last_reg <= 0:
+        return raw_f
+
+    ratio = raw_f / (last_reg + 1e-12)
+
+    if ratio > 1.0 + REG_MAX_JUMP_RATIO:
+        raw_f = last_reg * (1.0 + REG_MAX_JUMP_RATIO)
+    elif ratio < 1.0 - REG_MAX_JUMP_RATIO:
+        raw_f = last_reg * (1.0 - REG_MAX_JUMP_RATIO)
+
+    alpha = REG_EMA_ALPHA_FINAL if in_final else REG_EMA_ALPHA_NORMAL
+    return float(last_reg * (1 - alpha) + raw_f * alpha)
+
+
+def _current_search_range(filling_elapsed, ref_freq, stable_f, target_f, loss_count):
+    base_floor = FREQ_MIN_LIMIT
+    base_ceil = FREQ_MAX_LIMIT
+
+    if filling_elapsed < 3.5:
+        base_ceil = EARLY_CEIL_HZ
+
+    if ref_freq > 0:
+        if loss_count > 0 and loss_count % RECOVERY_FULLSCAN_EVERY == 0:
+            floor = FREQ_MIN_LIMIT
+            ceil = FREQ_MAX_LIMIT
+        elif tracking_mode:
+            floor = max(FREQ_MIN_LIMIT, ref_freq * TRACKING_FLOOR_RATIO)
+            ceil = min(FREQ_MAX_LIMIT, ref_freq + TRACKING_BAND_HZ)
+        else:
+            floor = max(FREQ_MIN_LIMIT, ref_freq * 0.55)
+            ceil = min(FREQ_MAX_LIMIT, ref_freq * 1.85 + 180.0)
+    else:
+        floor = base_floor
+        ceil = base_ceil
+
+    if stable_f > 0 and not tracking_mode:
+        floor = max(FREQ_MIN_LIMIT, min(floor, stable_f * 0.65))
+
+    if target_f > 0:
+        ceil = min(FREQ_MAX_LIMIT, max(ceil, target_f * 1.18))
+        floor = min(floor, target_f * 0.80)
+
+    floor = max(FREQ_MIN_LIMIT, floor)
+    ceil = min(FREQ_MAX_LIMIT, max(ceil, floor + 120.0))
+
+    return float(floor), float(ceil)
+
+
+# ════════════════════════════════════════════════════════════════════
+# 오디오 콜백
 # ════════════════════════════════════════════════════════════════════
 def audio_callback(indata, frames, time_info, status):
     global is_filling, filling_start_time, calibration_done
-    global target_freq, current_diameter, confirmed_diameter
-    global freq_buffer, raw_stop_buffer
-    global reg_time_buffer, reg_inv_freq_buffer
-    global diameter_candidates, history_time, history_freq
-    global last_tracked_freq, consecutive_loss_count, consecutive_stop_hits
+    global target_freq, current_diameter
+    global freq_buffer, reg_freq_buffer, reg_time_buffer, reg_inv_freq_buffer
+    global diameter_candidates, history_time, history_freq, history_raw_freq, history_reg_freq
+    global last_tracked_freq, last_raw_freq, last_reg_freq
+    global consecutive_loss_count, consecutive_stop_hits
     global request_finish, last_stable_f, last_current_air, initial_stable_freq
     global last_print_time, dynamic_min_limit, noise_profile
-    global STOP_TRIGGER_COUNT, CONTROL_START_TIME, FREQ_MAX_LIMIT, EARLY_CEIL_HZ
     global max_freq_seen, tracking_mode, tracking_mode_hits
     global theory_slope, theory_intercept, theory_locked
     global _prev_buf_median, _freeze_count
-    global last_r2, spike_blocked_count, mono_blocked_count
-    global history_freq_snapshot
-    global init_air_len_cm
-    global init_confirmed, init_rise_count, last_diam_spread
+    global last_r2, spike_blocked_count, history_freq_snapshot
+    global init_air_len_cm, diameter_ready
+    global _stag_start_time, _stag_active, _explore_candidate, _explore_confirm
 
     if not is_filling:
         return
 
     chunk = indata.flatten().astype(float)
+
     if np.max(np.abs(chunk)) < 0.01:
         return
 
     try:
         current_time = time.time()
+
         with lock:
             elapsed = current_time - filling_start_time
 
         # ── 1단계: 배경 소음 수집 ────────────────────────────────────
         if elapsed < NOISE_CALIBRATION_TIME:
             windowed = chunk * np.hamming(len(chunk))
-            fft_val  = np.abs(np.fft.rfft(windowed))
-            freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
-            mask     = (freqs >= 100) & (freqs <= 2000)
+            fft_val = np.abs(np.fft.rfft(windowed))
+            freqs = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
+            mask = (freqs >= 100) & (freqs <= 2200)
+
             if np.any(mask):
-                vf, vm   = freqs[mask], fft_val[mask]
-                peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.2)
+                vf = freqs[mask]
+                vm = fft_val[mask]
+                peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.25)
+
                 with lock:
                     for p in peaks:
                         f_n = float(vf[p])
                         if not any(abs(f_n - nf) < 20 for nf in noise_profile):
                             noise_profile.append(f_n)
+
             return
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
@@ -903,409 +1129,344 @@ def audio_callback(indata, frames, time_info, status):
         if filling_elapsed < SPLASH_GUARD_TIME:
             return
 
+        filtered = _hp_filter_continuous(chunk)
+
         with lock:
-            _last   = float(last_tracked_freq)
-            _init   = float(initial_stable_freq)
+            _last_raw = float(last_raw_freq)
+            _last_reg = float(last_reg_freq)
             _last_s = float(last_stable_f)
-            _init_confirmed = bool(init_confirmed)
-
-        # ── 3단계: 탐색 범위 결정 ────────────────────────────────────
-        if filling_elapsed < 3.5:
-            current_ceil  = EARLY_CEIL_HZ
-            current_floor = dynamic_min_limit
-        elif tracking_mode:
-            current_ceil  = min(FREQ_MAX_LIMIT, _last + TRACKING_BAND_HZ)
-            current_floor = max(dynamic_min_limit, max_freq_seen * TRACKING_FLOOR_RATIO)
-        else:
-            base = _last if _last > 0 else (_last_s if _last_s > 0 else _init)
-            current_ceil  = min(FREQ_MAX_LIMIT, base + 1500.0) if base > 0 else FREQ_MAX_LIMIT
-            current_floor = dynamic_min_limit
-
-        with lock:
-            if not tracking_mode and _last > 400:
-                new_floor = _last * 0.75
-                if new_floor > dynamic_min_limit:
-                    dynamic_min_limit = new_floor
-            if _init_confirmed and _init > 0 and not tracking_mode:
-                init_floor = _init * 0.95
-                if init_floor > dynamic_min_limit:
-                    dynamic_min_limit = init_floor
+            _init = float(initial_stable_freq)
             _tf = float(target_freq)
-            if _tf > 0 and dynamic_min_limit > _tf * 0.85:
-                dynamic_min_limit = _tf * 0.85
+            _cur_d = float(current_diameter)
+            _calib = bool(calibration_done)
+            _loss = int(consecutive_loss_count)
 
-        # ── 4단계: 주파수 검출 ───────────────────────────────────────
-        detected_f = get_frequency(chunk, _last, current_floor, current_ceil, allow_even=False)
+        ref_freq = _last_reg if _last_reg > 0 else (_last_raw if _last_raw > 0 else _last_s)
+        current_floor, current_ceil = _current_search_range(filling_elapsed, ref_freq, _last_s, _tf, _loss)
 
-        if detected_f < current_floor or detected_f == 0:
-            detected_f = 0.0
-        if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
-            detected_f = 0.0
+        allow_jump = _loss >= 2 or filling_elapsed < EARLY_NOISE_SEC
+        raw_f, dbg = select_frequency_candidate(filtered, ref_freq, current_floor, current_ceil, allow_jump=allow_jump)
 
-        if detected_f == 0.0:
-            consecutive_loss_count += 1
-            if not tracking_mode:
-                dynamic_min_limit = max(FREQ_MIN_LIMIT, dynamic_min_limit * 0.97)
-            if consecutive_loss_count > 10:
-                with lock:
-                    if last_stable_f > 0:
-                        last_tracked_freq = float(last_stable_f)
-                    elif initial_stable_freq > 0:
-                        last_tracked_freq = float(initial_stable_freq)
+        # ── 정체 감지 + 탐색 FFT ─────────────────────────────────────
+        explore_f = 0.0
+        if ENABLE_STAG_EXPLORE and _last_reg > 0 and filling_elapsed > STAG_MIN_ELAPSED:
+            with lock:
+                h_freq_snap = list(history_reg_freq)
+                h_time_snap = list(history_time)
+
+            recent = []
+            for i in range(len(h_time_snap) - 1, -1, -1):
+                if filling_elapsed - h_time_snap[i] > STAG_WINDOW_SEC:
+                    break
+                if i < len(h_freq_snap):
+                    recent.append(h_freq_snap[i])
+
+            if len(recent) >= 5:
+                f_range = max(recent) - min(recent)
+
+                if f_range < STAG_BAND_HZ:
+                    if not _stag_active:
+                        _stag_active = True
+                        _stag_start_time = filling_elapsed
+                        _explore_confirm = 0
+                        _explore_candidate = 0.0
+                        print(f'\n[정체 감지] reg_range={f_range:.1f}Hz < {STAG_BAND_HZ}Hz')
+
+                    explore_ceil = min(FREQ_MAX_LIMIT, _last_reg * EXPLORE_SEARCH_MULT)
+                    explore_f = fft_explore_rising(filtered, _last_reg, explore_ceil)
+
+                    if explore_f > _last_reg * EXPLORE_RISE_RATIO:
+                        lpc_check, _ = select_frequency_candidate(
+                            filtered,
+                            explore_f,
+                            max(FREQ_MIN_LIMIT, explore_f * 0.82),
+                            min(FREQ_MAX_LIMIT, explore_f * 1.18),
+                            allow_jump=True
+                        )
+
+                        lpc_fft_ok = abs(lpc_check - explore_f) / (explore_f + 1e-12) < 0.10 if lpc_check > 0 else False
+
+                        if lpc_fft_ok:
+                            if _explore_candidate > 0 and abs(explore_f - _explore_candidate) / (_explore_candidate + 1e-12) < 0.08:
+                                _explore_confirm += 1
+                            else:
+                                _explore_candidate = explore_f
+                                _explore_confirm = 1
+
+                            if _explore_confirm >= EXPLORE_CONFIRM_N:
+                                print(f'\n[정체 탈출] {_last_reg:.0f} → {explore_f:.0f}Hz | {EXPLORE_CONFIRM_N}회 확인')
+                                raw_f = explore_f
+                                _stag_active = False
+                                _explore_candidate = 0.0
+                                _explore_confirm = 0
+                                freq_buffer.clear()
+                                reg_freq_buffer.clear()
                     else:
-                        last_tracked_freq *= 0.9
+                        _explore_confirm = max(0, _explore_confirm - 1)
+                else:
+                    if _stag_active:
+                        print(f'\n[정체 해제] reg_range={f_range:.1f}Hz')
+                    _stag_active = False
+                    _explore_candidate = 0.0
+                    _explore_confirm = 0
+
+        # ── 검출 실패 처리 ───────────────────────────────────────────
+        if raw_f <= 0:
+            consecutive_loss_count += 1
             return
 
         consecutive_loss_count = 0
 
-        raw_f_for_reg = float(detected_f)
-
-        # ── 5단계: EMA 스무딩 (제어용) ───────────────────────────────
-        with lock:
-            _cur_d_live = float(current_diameter)
-            _cur_d_snap = float(confirmed_diameter)
-            _calib_snap = bool(calibration_done)
-
-        final_approach_mult  = _final_approach_mult()
-        alpha_final          = _ema_alpha_final()
-        final_tracking_alpha = _final_tracking_rise_alpha()
-        final_buf_n          = _final_buf_size()
-
-        if _calib_snap and _cur_d_snap > 0 and _last_s > 0:
-            L_now    = SOUND_SPEED / (4 * _last_s) - END_CORRECTION_K * _cur_d_snap
-            in_final = (L_now < TARGET_AIR_CM * final_approach_mult)
+        # ── 회귀용 주파수 생성: stable_f와 분리 ─────────────────────
+        if _calib and _cur_d > 0 and _last_s > 0:
+            L_now = SOUND_SPEED / (4 * _last_s) - END_CORRECTION_K * _cur_d
+            in_final = L_now < TARGET_AIR_CM * FINAL_APPROACH_MULT
         else:
             in_final = False
 
-        alpha_det = alpha_final if in_final else EMA_ALPHA_NORMAL
+        reg_f = _make_reg_freq(raw_f, _last_reg, in_final)
+        reg_freq_buffer.append(reg_f)
 
-        if _last > 0:
-            ratio = detected_f / _last
+        if len(reg_freq_buffer) >= 3:
+            reg_f = float(np.median(list(reg_freq_buffer)))
 
-            if tracking_mode:
-                if ratio < TRACKING_DROP_HARD_RATIO:
-                    detected_f = _last * 0.85 + detected_f * 0.15
-                elif ratio > 1.5:
-                    detected_f = _last * (1 - TRACKING_EMA_BIGRISE_ALPHA) \
-                               + detected_f * TRACKING_EMA_BIGRISE_ALPHA
-                elif ratio > 1.4:
-                    detected_f = _last * 0.95 + detected_f * 0.05
-                elif detected_f > _last:
-                    if in_final:
-                        alpha = final_tracking_alpha
-                    elif ratio > 1.3:
-                        alpha = TRACKING_EMA_SPIKE_ALPHA
-                    elif ratio > 1.15:
-                        alpha = TRACKING_EMA_RISE2_ALPHA
-                    else:
-                        alpha = TRACKING_EMA_RISE1_ALPHA
-                    detected_f = _last * (1 - alpha) + detected_f * alpha
-                else:
-                    detected_f = _last * (1 - TRACKING_EMA_FALL_ALPHA) \
-                               + detected_f * TRACKING_EMA_FALL_ALPHA
-            else:
-                if ratio > SPIKE_RATIO_THRESHOLD:
-                    detected_f = _last * 0.95 + detected_f * 0.05
-                else:
-                    detected_f = _last * (1 - alpha_det) + detected_f * alpha_det
+        # ── 제어/표시용 주파수 생성 ──────────────────────────────────
+        stable_candidate = _smooth_control_freq(reg_f, _last_s, in_final, tracking_mode)
+        freq_buffer.append(stable_candidate)
 
-        # ── 속도 제한 ─────────────────────────────────────────────
-        if _last > 0 and detected_f > _last:
-            if tracking_mode:
-                max_rise = TRACKING_RISE_LIMIT_HZ
-            else:
-                max_rise = RATE_LIMIT_FINAL_HZ if in_final else RATE_LIMIT_NORMAL_HZ
-            if detected_f - _last > max_rise:
-                detected_f = _last + max_rise
-
-        # ── [v5.26-RAWSTOP] theory guide 적용 전 주파수 저장 ─────────
-        pre_theory_f = float(detected_f)
-
-        # ── 이론 곡선 가이드 ────────────────────────────────────────
-        # [v5.26-NOTHFIN] in_final이면 alpha=0 → 가이드 비활성화
-        if theory_locked and detected_f > 0:
-            f_theory = theory_freq(filling_elapsed)
-            if f_theory > 0:
-                deviation = abs(detected_f - f_theory) / f_theory
-                if in_final:
-                    g_alpha  = THEORY_GUIDE_ALPHA_FINAL   # = 0.0
-                    g_margin = THEORY_GUIDE_MARGIN_FINAL
-                else:
-                    g_alpha  = THEORY_GUIDE_ALPHA
-                    g_margin = THEORY_GUIDE_MARGIN
-                if deviation <= g_margin and g_alpha > 0:
-                    blended = detected_f * (1 - g_alpha) + f_theory * g_alpha
-                    with lock:
-                        _tf_cap = float(target_freq)
-                    if _tf_cap > 0:
-                        blended = min(blended, _tf_cap * 1.01)
-                    detected_f = blended
-
-        with lock:
-            _tf_cap2   = float(target_freq)
-            _calib_cap = bool(calibration_done)
-        _cap_mult = 1.08 if _calib_cap else 1.15
-        if _tf_cap2 > 0 and detected_f > _tf_cap2 * _cap_mult:
-            detected_f = _last
-
-        last_tracked_freq = detected_f
-
-        # ── 6단계: freq_buffer → stable_f ────────────────────────────
         if in_final:
-            buf_size = final_buf_n
+            buf_size = BUF_SIZE_FINAL
         elif filling_elapsed < EARLY_NOISE_SEC:
             buf_size = EARLY_BUF_SIZE
         else:
             buf_size = 5
 
-        freq_buffer.append(detected_f)
         while len(freq_buffer) > buf_size:
             freq_buffer.popleft()
 
-        cur_median = float(np.median(list(freq_buffer)))
-        if cur_median == _prev_buf_median:
+        stable_f = float(np.median(list(freq_buffer))) if freq_buffer else stable_candidate
+
+        cur_median = stable_f
+        if abs(cur_median - _prev_buf_median) < 1e-6:
             _freeze_count += 1
         else:
             _freeze_count = 0
         _prev_buf_median = cur_median
+
         if _freeze_count >= FREEZE_RESET_N:
             freq_buffer.clear()
             _freeze_count = 0
 
-        if tracking_mode:
-            recent_n = TRACKING_STABLE_BUF if not in_final else final_buf_n
-            recent_vals = list(freq_buffer)[-recent_n:]
-            stable_f = float(np.median(recent_vals)) if recent_vals else detected_f
-        else:
-            stable_f = float(np.median(list(freq_buffer))) if freq_buffer else detected_f
+        # ── 이론 곡선 가이드는 표시/제어용 stable_f에만 약하게 적용 ─────
+        if theory_locked and stable_f > 0:
+            f_theory = theory_freq(filling_elapsed)
 
-        # ── [v5.26-RAWSTOP] 정지 판단용 별도 버퍼 ─────────────────────
-        raw_stop_buffer.append(pre_theory_f)
-        while len(raw_stop_buffer) > RAW_STOP_BUF_SIZE:
-            raw_stop_buffer.popleft()
-        raw_stable_f = float(np.median(list(raw_stop_buffer))) if raw_stop_buffer else pre_theory_f
+            if f_theory > 0:
+                deviation = abs(stable_f - f_theory) / f_theory
+                g_alpha = THEORY_GUIDE_ALPHA_FINAL if in_final else THEORY_GUIDE_ALPHA
+                g_margin = THEORY_GUIDE_MARGIN_FINAL if in_final else THEORY_GUIDE_MARGIN
 
-        # ── 단조증가 floor ───────────────────────────────────────────
-        if _init_confirmed and _init > 0 and stable_f < _init * 0.97:
-            stable_f = _init * 0.97
-        elif not _init_confirmed and filling_elapsed < EARLY_NOISE_SEC and _last_s > 0:
-            if stable_f < _last_s * 0.80:
-                stable_f = _last_s * 0.80
+                if deviation <= g_margin:
+                    stable_f = stable_f * (1 - g_alpha) + f_theory * g_alpha
 
+        # ── 상태 저장 ───────────────────────────────────────────────
         with lock:
-            history_time.append(filling_elapsed)
-            history_freq.append(stable_f)
+            last_raw_freq = float(raw_f)
+            last_reg_freq = float(reg_f)
+            last_stable_f = float(stable_f)
+            last_tracked_freq = float(stable_f)
 
-            if filling_elapsed > SPLASH_GUARD_TIME and stable_f > INIT_STABLE_MIN_HZ:
-                if initial_stable_freq == 0:
-                    initial_stable_freq = stable_f
-                    init_confirmed  = False
-                    init_rise_count = 0
-                    print(f'\n[init 설정] {stable_f:.0f}Hz (미확정, t={filling_elapsed:.1f}s)')
+            history_time.append(float(filling_elapsed))
+            history_raw_freq.append(float(raw_f))
+            history_reg_freq.append(float(reg_f))
+            history_freq.append(float(stable_f))
 
-                elif not init_confirmed:
-                    if stable_f < initial_stable_freq * INIT_REANCHOR_RATIO:
-                        old_init = initial_stable_freq
-                        initial_stable_freq = stable_f
-                        init_rise_count = 0
-                        if dynamic_min_limit > stable_f * 0.75:
-                            dynamic_min_limit = stable_f * 0.75
-                        print(f'\n[init 하향] {old_init:.0f}→{stable_f:.0f}Hz (t={filling_elapsed:.1f}s)')
-                    elif stable_f >= _last_s or abs(stable_f - _last_s) < 2.0:
-                        init_rise_count += 1
-                        if init_rise_count >= INIT_RISE_CONFIRM_N:
-                            init_confirmed = True
-                            print(f'\n[★ init 확정] {initial_stable_freq:.0f}Hz (t={filling_elapsed:.1f}s)')
-                    else:
-                        init_rise_count = max(0, init_rise_count - 1)
-
-            last_stable_f = stable_f
-
-        with lock:
-            if filling_elapsed > EARLY_NOISE_SEC and _init_confirmed and stable_f > max_freq_seen:
+            if stable_f > max_freq_seen:
                 max_freq_seen = stable_f
-            _max_f_seen = float(max_freq_seen)
 
+        _update_initial_frequency(filling_elapsed, reg_f)
+
+        # ── tracking 모드 진입 판정 ──────────────────────────────────
         with lock:
+            _init_now = float(initial_stable_freq)
             _tf_now = float(target_freq)
-        if not tracking_mode and _tf_now > 0 and _max_f_seen > _tf_now * 0.75:
-            hard_floor = min(_max_f_seen * 0.88, _tf_now * 0.98)
-            if stable_f < hard_floor:
-                stable_f = hard_floor
 
-        # ── 7단계: tracking 모드 진입 판정 ──────────────────────────
-        _tracking_thresh = max(TRACKING_ENTRY_HZ, _init * TRACKING_ENTRY_MULT) \
-                           if _init > 0 else TRACKING_ENTRY_HZ
+        _tracking_thresh = max(TRACKING_ENTRY_HZ, _init_now * TRACKING_ENTRY_MULT) if _init_now > 0 else TRACKING_ENTRY_HZ
 
         if stable_f > _tracking_thresh:
             tracking_mode_hits += 1
         else:
-            tracking_mode_hits = max(0, tracking_mode_hits - 1)
+            tracking_mode_hits = max(0, tracking_mode_hits - 2)
 
         if tracking_mode_hits >= TRACKING_MODE_THRESHOLD and not tracking_mode:
             with lock:
                 tracking_mode = True
             print(f'\n[★ 트래킹 모드] {stable_f:.0f}Hz (thresh={_tracking_thresh:.0f}Hz) 시작')
 
-        # ── 8단계: 회귀 버퍼 수집 → 워커 신호 ───────────────────────
+        # ── 회귀 버퍼 수집 → 워커 신호 ───────────────────────────────
         with lock:
-            _init_f      = float(initial_stable_freq)
-            _cur_d       = float(current_diameter)
-            _conf_d      = float(confirmed_diameter)
-            _cand_cnt    = len(diameter_candidates)
-            _init_conf   = bool(init_confirmed)
-            _diam_spread = float(last_diam_spread)
+            _init_f = float(initial_stable_freq)
+            _cur_d2 = float(current_diameter)
+            _cand_cnt = len(diameter_candidates)
+            _reg_buf_len = len(reg_time_buffer)
+            _spike_blocked = int(spike_blocked_count)
+            _d_ready_snap = bool(diameter_ready)
 
-        # [v5.25] calibration_done 후에도 계속 수집 (재평가용)
-        if filling_elapsed > CALC_START_TIME and _init_conf:
-
+        if filling_elapsed > CALC_START_TIME:
             if int(filling_elapsed) % 3 == 0 and abs(filling_elapsed - round(filling_elapsed)) < 0.15:
-                with lock:
-                    _reg_buf_len    = len(reg_time_buffer)
-                    _spike_blocked  = int(spike_blocked_count)
-                    _mono_blocked   = int(mono_blocked_count)
-                    _reeval_cnt     = int(reeval_total_count)
-                _entry_mult = _reg_entry_mult(filling_elapsed)
+                ready_str = '✓' if _d_ready_snap else '✗'
+                stag_str = '정체' if _stag_active else '정상'
                 print(
                     f'\n[D진단] t={filling_elapsed:.1f}s'
-                    f' | init_f={_init_f:.0f}Hz'
-                    f' | raw_f={raw_f_for_reg:.0f}Hz'
+                    f' | floor={current_floor:.0f}'
+                    f' | ceil={current_ceil:.0f}'
+                    f' | lpc={dbg["lpc"]:.0f}'
+                    f' | fft={dbg["fft"]:.0f}'
+                    f' | raw={raw_f:.0f}'
+                    f' | reg={reg_f:.0f}'
+                    f' | stable={stable_f:.0f}'
+                    f' | init={_init_f:.0f}'
+                    f' | D={_cur_d2:.2f}cm'
+                    f' | cand={_cand_cnt}/{DIAM_CAND_MAXLEN}'
                     f' | reg_buf={_reg_buf_len}'
                     f' | spikes={_spike_blocked}'
-                    f' | mono_blk={_mono_blocked}'
-                    f' | D_live={_cur_d:.2f}cm'
-                    f' | D_conf={_conf_d:.2f}cm'
-                    f' | reeval={_reeval_cnt}'
-                    f' | cand={_cand_cnt}/{DIAM_CAND_MAXLEN}'
+                    f' | src={dbg["src"]}'
+                    f' | ready={ready_str}'
+                    f' | {stag_str}'
                 )
 
-            _entry_mult_now = _reg_entry_mult(filling_elapsed)
-            if (_init_f > 0
-                    and raw_f_for_reg > _init_f * _entry_mult_now
-                    and raw_f_for_reg < _init_f * REG_HARMONIC_UPPER):
-                current_inv = 1.0 / raw_f_for_reg
+            accept_reg = False
+            reason = ''
 
+            if _init_f <= 0:
+                reason = 'initial_stable_freq 아직 0'
+            elif reg_f <= _init_f * 1.015:
+                reason = f'reg_f({reg_f:.0f}) ≤ init_f({_init_f:.0f})*1.015'
+            elif reg_f >= min(FREQ_MAX_LIMIT, _init_f * 2.40):
+                reason = f'reg_f({reg_f:.0f}) ≥ init_f({_init_f:.0f})*2.40 → 배음/오검출 의심'
+            else:
                 with lock:
-                    _buf_snapshot = list(reg_inv_freq_buffer)
+                    inv_snapshot = list(reg_inv_freq_buffer)
 
-                # 단조 필터
-                mono_ok = True
-                if len(_buf_snapshot) >= 1:
-                    last_inv = _buf_snapshot[-1]
-                    if current_inv > last_inv * (1.0 + REG_MONO_TOLERANCE):
-                        mono_ok = False
+                current_inv = 1.0 / reg_f
 
-                if not mono_ok:
-                    with lock:
-                        mono_blocked_count += 1
+                if len(inv_snapshot) >= 5:
+                    recent_median = float(np.median(inv_snapshot[-5:]))
+                    spike = abs(current_inv - recent_median) / (recent_median + 1e-12) > REG_SPIKE_GATE
                 else:
-                    if len(_buf_snapshot) >= 5:
-                        recent_median = float(np.median(_buf_snapshot[-5:]))
-                        spike = abs(current_inv - recent_median) / (recent_median + 1e-12) > REG_SPIKE_GATE
-                    else:
-                        spike = False
+                    spike = False
 
-                    if not spike:
-                        with lock:
-                            reg_time_buffer.append(filling_elapsed)
-                            reg_inv_freq_buffer.append(current_inv)
-                            _reg_len_now = len(reg_time_buffer)
-                        if _reg_len_now > REG_MIN_POINTS:
-                            _reg_event.set()
-                    else:
-                        with lock:
-                            spike_blocked_count += 1
+                if spike:
+                    reason = '1/f spike gate 차단'
+                    with lock:
+                        spike_blocked_count += 1
+                else:
+                    accept_reg = True
 
+            if accept_reg:
+                with lock:
+                    reg_time_buffer.append(filling_elapsed)
+                    reg_inv_freq_buffer.append(1.0 / reg_f)
+                    _reg_len_now = len(reg_time_buffer)
+
+                if _reg_len_now > REG_MIN_POINTS:
+                    _reg_event.set()
             else:
                 if int(filling_elapsed) % 3 == 0 and abs(filling_elapsed - round(filling_elapsed)) < 0.15:
-                    _entry_mult_diag = _reg_entry_mult(filling_elapsed)
-                    if _init_f == 0:
-                        print(f'\n[D진단] ❌ initial_stable_freq 아직 0')
-                    elif raw_f_for_reg <= _init_f * _entry_mult_diag:
-                        print(f'\n[D진단] ❌ raw_f({raw_f_for_reg:.0f}) ≤ init_f({_init_f:.0f})*{_entry_mult_diag:.4f}')
-                    elif raw_f_for_reg >= _init_f * REG_HARMONIC_UPPER:
-                        print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*{REG_HARMONIC_UPPER} → 배음 의심')
+                    print(f'\n[D진단] ❌ 회귀 제외: {reason}')
 
-        elif filling_elapsed > CALC_START_TIME and not _init_conf:
-            if int(filling_elapsed) % 3 == 0 and abs(filling_elapsed - round(filling_elapsed)) < 0.15:
-                print(
-                    f'\n[D진단] ⏳ init 미확정 (init={_init_f:.0f}Hz, rise={init_rise_count}/{INIT_RISE_CONFIRM_N})'
-                    f' | reg 보류 (t={filling_elapsed:.1f}s)'
-                )
-
-        # ── 9단계: 정지 판단 ──────────────────────────────────────────
-        # [v5.26-RAWSTOP] raw_stable_f 사용 (theory guide 미적용)
-        # [v5.26-COMP] D 비례 보상항 추가
+        # ── 정지 판단 ───────────────────────────────────────────────
         with lock:
-            _tf2      = float(target_freq)
-            _cd       = bool(calibration_done)
-            _cur_d2   = float(confirmed_diameter)
-            _live_d2  = float(current_diameter)
+            _tf2 = float(target_freq)
+            _d_ready = bool(diameter_ready)
+            _cur_d3 = float(current_diameter)
+            _theory_lock = bool(theory_locked)
+            _reg_buf_len2 = len(reg_time_buffer)
 
-        stop_need      = _stop_trigger_need()
-        stop_adv_cm    = _stop_advance_cm()
-        ctrl_start     = _control_start_time()
-        fast_margin    = _fast_stop_margin_cm()
-        fast_hit_bonus = _fast_stop_hit_bonus()
+        control_ready = (
+            _d_ready
+            and _tf2 > 0
+            and (_theory_lock or _reg_buf_len2 >= CONTROL_MIN_REG_POINTS)
+            and filling_elapsed > CONTROL_START_TIME
+        )
 
-        if filling_elapsed > ctrl_start and _cd and raw_stable_f > 0:
-            # [v5.26-RAWSTOP] raw_stable_f로 정지 판단
-            raw_air = SOUND_SPEED / (4 * raw_stable_f) - END_CORRECTION_K * _cur_d2
-            # [v5.26-COMP] D 비례 보상: 큰 비커일수록 조기 정지 보상
-            compensation = STOP_COMP_BASE + STOP_COMP_PER_CM * _cur_d2
-            current_air  = raw_air + compensation
+        if control_ready and stable_f > 0:
+            current_air = SOUND_SPEED / (4 * stable_f) - END_CORRECTION_K * _cur_d3
 
             with lock:
                 last_current_air = float(current_air)
 
+            stop_candidate = current_air <= TARGET_AIR_CM + STOP_ADVANCE_CM
+
+            # target cap은 검출값 변경이 아니라 정지 판단 보조로만 사용
+            if _tf2 > 0 and stable_f > _tf2 * TARGET_HARD_CAP_RATIO:
+                stop_candidate = True
+
             with lock:
-                if current_air <= TARGET_AIR_CM + stop_adv_cm - fast_margin:
-                    consecutive_stop_hits += fast_hit_bonus
-                elif current_air <= TARGET_AIR_CM + stop_adv_cm:
+                if stop_candidate:
                     consecutive_stop_hits += 1
                 elif consecutive_stop_hits > 0:
                     consecutive_stop_hits = max(0, consecutive_stop_hits - 1)
+
                 _hits = int(consecutive_stop_hits)
 
             if current_time - last_print_time >= PRINT_INTERVAL:
                 mode_str = '[T]' if tracking_mode else '   '
-                lock_str = '[R]' if theory_locked  else '   '
-                fin_str  = '[F]' if in_final        else '   '
-                init_str = '[I]' if _init_confirmed else '[?]'
-                bar_len  = min(_hits, stop_need)
-                bar      = '#' * bar_len + '-' * (stop_need - bar_len)
-                # 표시용에는 stable_f(theory 포함), 비교용에는 raw_stable_f
+                lock_str = '[R]' if _theory_lock else '   '
+                fin_str = '[F]' if in_final else '   '
+                bar_len = min(_hits, STOP_TRIGGER_COUNT)
+                bar = '#' * bar_len + '-' * (STOP_TRIGGER_COUNT - bar_len)
+
                 print(
-                    f'{mode_str}{lock_str}{fin_str}{init_str}[제어] D:{_cur_d2:.2f}cm '
-                    f'| L:{current_air:.2f}/{TARGET_AIR_CM:.1f}cm(+{compensation:.2f}) '
-                    f'| f:{stable_f:.0f}/{raw_stable_f:.0f}Hz [{bar}]',
+                    f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d3:.2f}cm '
+                    f'| L:{current_air:.2f}/{TARGET_AIR_CM:.1f}cm '
+                    f'| raw:{raw_f:.0f} reg:{reg_f:.0f} stable:{stable_f:.0f}Hz [{bar}]',
                     end='\r'
                 )
                 last_print_time = current_time
 
-            if _hits >= stop_need:
-                print(
-                    f'\n[완료] 목표 도달! D:{_cur_d2:.4f}cm | L_est:{current_air:.2f}cm'
-                    f' | comp:{compensation:.2f}cm | raw_f:{raw_stable_f:.0f}Hz'
-                )
+            if _hits >= STOP_TRIGGER_COUNT:
+                print(f'\n[완료] 목표 도달! D:{_cur_d3:.4f}cm | L_est:{current_air:.2f}cm | f={stable_f:.0f}Hz')
                 solenoid_off_async()
+
                 with lock:
                     history_freq_snapshot = list(history_freq)
-                    is_filling     = False
+                    is_filling = False
                     request_finish = True
+
                 return
 
-    except Exception:
+        elif not control_ready and filling_elapsed > CONTROL_START_TIME:
+            if int(filling_elapsed) % 3 == 0 and abs(filling_elapsed - round(filling_elapsed)) < 0.15:
+                reasons = []
+
+                if not _d_ready:
+                    reasons.append(f'D미준비(cand={_cand_cnt})')
+
+                if _tf2 <= 0:
+                    reasons.append('target_freq=0')
+
+                if not _theory_lock and _reg_buf_len2 < CONTROL_MIN_REG_POINTS:
+                    reasons.append(f'이론미잠금&reg={_reg_buf_len2}<{CONTROL_MIN_REG_POINTS}')
+
+                print(f'\n[제어대기] t={filling_elapsed:.1f}s | 미충족: {", ".join(reasons)}')
+
+    except Exception as e:
+        print(f'\n[오디오 콜백 오류] {e}')
         return
 
 
 # ════════════════════════════════════════════════════════════════════
-#  오디오 스트림 관리
+# 오디오 스트림 관리
 # ════════════════════════════════════════════════════════════════════
 def ensure_audio_stream():
     global audio_stream
+
     if audio_stream is not None:
         return
+
+    _reset_hp_filter_state()
+
     audio_stream = sd.InputStream(
         device=INPUT_DEVICE,
         callback=audio_callback,
@@ -1313,4 +1474,37 @@ def ensure_audio_stream():
         samplerate=SAMPLE_RATE,
         blocksize=CHUNK_SIZE,
     )
+
     audio_stream.start()
+
+
+def close_audio_stream():
+    global audio_stream
+
+    if audio_stream is None:
+        return
+
+    try:
+        audio_stream.stop()
+        audio_stream.close()
+    except Exception as e:
+        print(f'\n[오디오 스트림 종료 실패] {e}')
+
+    audio_stream = None
+
+
+# ════════════════════════════════════════════════════════════════════
+# 스위치 이벤트 연결
+# ════════════════════════════════════════════════════════════════════
+def _on_switch_pressed():
+    solenoid_on()
+    start_filling_local()
+
+
+def _off_switch_pressed():
+    solenoid_off()
+    stop_filling_local(save_result=False)
+
+
+sw_on.when_pressed = _on_switch_pressed
+sw_off.when_pressed = _off_switch_pressed
