@@ -1,4 +1,4 @@
-# smart_water_core.py  ── 개선판 v5.22-reg-agreement
+# smart_water_core.py  ── 개선판 v5.23-fft-primary
 #
 # 핵심 수정
 # 1. LPC 단독 우선 채택 제거: LPC/FFT 후보를 동시에 만들고 통합 점수로 선택
@@ -9,7 +9,7 @@
 # 6. 고역통과 필터 상태 zi 유지: chunk 경계 과도응답 감소
 # 7. 초기 주파수는 단일 샘플이 아니라 후보 누적 안정성으로 확정
 # 8. 지름 잠금은 후보 개수만 보지 않고 후보 안정도/R²/회귀시간/주파수 상승률까지 확인
-# 9. 지름 회귀 데이터는 LPC와 FFT가 직접 또는 배음 보정 기준으로 동의할 때만 사용
+# 9. FFT 직접 피크를 우선 사용: 배음 나눗셈/좁은 탐색범위로 실제 고주파 피크를 버리는 구조 제거
 
 import numpy as np
 import sounddevice as sd
@@ -59,7 +59,7 @@ CONTROL_MIN_REG_POINTS  = 30
 # 주파수 탐색 범위
 # ════════════════════════════════════════════════════════════════════
 FREQ_MAX_LIMIT           = 3000
-EARLY_CEIL_HZ            = 1200    # 기존 800은 실제 기본파/초기 상승을 막을 수 있어 완화
+EARLY_CEIL_HZ            = FREQ_MAX_LIMIT  # 초기 상한 제한 제거: 실제 고주파 피크를 초반부터 탐색
 FREQ_MIN_LIMIT           = 200     # 큰 컵/긴 공기층 초기 기본파를 놓치지 않도록 완화
 CALIBRATION_CUTOFF_RATIO = 0.9
 
@@ -102,28 +102,43 @@ LPC_MAX_PEAKS    = 6
 # ════════════════════════════════════════════════════════════════════
 # FFT 파라미터
 # ════════════════════════════════════════════════════════════════════
-FFT_PEAK_PROM    = 0.10
-FFT_MAX_PEAKS    = 8
+FFT_PEAK_PROM    = 0.06
+FFT_MAX_PEAKS    = 12
 FFT_MIN_PEAK_SEP = 8
 
 
 # ════════════════════════════════════════════════════════════════════
 # 후보 선택 파라미터
 # ════════════════════════════════════════════════════════════════════
-CONTINUITY_WEIGHT        = 0.28    # 이전값 근처 가산점. 기존처럼 강제 감점으로 쓰지 않음
-CONTINUITY_WIDTH_HZ      = 450.0
-RISE_BIAS_WEIGHT         = 0.04
-SOURCE_AGREE_BONUS       = 0.25
+CONTINUITY_WEIGHT        = 0.06    # 이전값 근처 가산점 최소화: 저주파 고착 방지
+CONTINUITY_WIDTH_HZ      = 900.0
+RISE_BIAS_WEIGHT         = 0.03
+SOURCE_AGREE_BONUS       = 0.05
 HARMONIC_PENALTY         = 0.12
 JUMP_STRONG_AMP_RATIO    = 0.75    # 강한 피크는 continuity보다 우선 허용
-REG_MAX_JUMP_RATIO       = 0.22
+REG_MAX_JUMP_RATIO       = 1.50
 REG_MEDIAN_GATE_RATIO    = 0.18
 
 # 지름 회귀용 주파수 품질 검사
 # LPC와 FFT가 서로 비슷하거나, 한쪽이 다른 쪽의 2/3/4/5배 배음 관계로 설명될 때만 reg buffer에 넣는다.
-REG_REQUIRE_LPC_FFT_AGREE = True
+REG_REQUIRE_LPC_FFT_AGREE = False  # FFT primary에서는 LPC 불일치만으로 회귀 제외하지 않음
 REG_LPC_FFT_AGREE_RATIO   = 0.12
 REG_HARMONIC_AGREE_RATIO  = 0.10
+
+FFT_PRIMARY_MODE          = False   # v5.24: FFT 단독 우선 금지, LPC+FFT 후보 융합 사용
+ENABLE_HARMONIC_VARIANTS  = False   # f/2, f/3 후보 생성 금지: 실제 고주파가 저주파로 접히는 문제 차단
+FORCE_FULL_BAND_SEARCH    = True    # 매 chunk 200~3000 Hz 전체 탐색
+USE_NOISE_PROFILE_REJECT  = False   # 초기 noise_profile이 실제 공명 피크를 지우는 문제 차단
+USE_LPC_FFT_FUSION        = True    # LPC와 FFT를 같이 써서 후보 점수화
+FUSION_FFT_WEIGHT         = 0.56
+FUSION_LPC_WEIGHT         = 0.44
+FUSION_BOTH_BONUS         = 0.28
+FUSION_SINGLE_PENALTY     = 0.12
+FUSION_MERGE_HZ           = 28.0
+FUSION_MIN_SOURCE_AMP     = 0.08
+FFT_UPPER_RESCUE          = True    # 저주파 고착 중 위쪽 강한 피크가 보이면 위쪽 후보 선택 허용
+FFT_UPPER_RESCUE_RATIO    = 1.18
+FFT_UPPER_RESCUE_MIN_AMP  = 0.22
 
 RAW_LOSS_HOLD_N          = 8
 RECOVERY_FULLSCAN_EVERY  = 6
@@ -163,23 +178,23 @@ MAX_DROP_HZ_AFTER_LOCK   = 35.0
 # ════════════════════════════════════════════════════════════════════
 # EMA alpha
 # ════════════════════════════════════════════════════════════════════
-EMA_ALPHA_NORMAL    = 0.28
-EMA_ALPHA_FINAL     = 0.58
+EMA_ALPHA_NORMAL    = 0.45
+EMA_ALPHA_FINAL     = 0.72
 FINAL_APPROACH_MULT = 1.5
 
 
 # ════════════════════════════════════════════════════════════════════
 # 회귀용 EMA
 # ════════════════════════════════════════════════════════════════════
-REG_EMA_ALPHA_NORMAL = 0.45
-REG_EMA_ALPHA_FINAL  = 0.65
+REG_EMA_ALPHA_NORMAL = 0.82
+REG_EMA_ALPHA_FINAL  = 0.88
 
 
 # ════════════════════════════════════════════════════════════════════
 # Hz/청크 속도 제한
 # ════════════════════════════════════════════════════════════════════
-RATE_LIMIT_NORMAL_HZ  = 90.0
-RATE_LIMIT_FINAL_HZ   = 260.0
+RATE_LIMIT_NORMAL_HZ  = 350.0
+RATE_LIMIT_FINAL_HZ   = 500.0
 SPIKE_RATIO_THRESHOLD = 1.35
 
 
@@ -435,6 +450,8 @@ def _hp_filter_continuous(chunk):
 
 
 def _is_noise_freq(f):
+    if not USE_NOISE_PROFILE_REJECT:
+        return False
     return any(abs(f - nf) < 25.0 for nf in noise_profile)
 
 
@@ -691,63 +708,155 @@ def reg_source_agreement_ok(raw_f, dbg):
 
     return False, f'LPC/FFT 불일치(lpc={lpc_f:.0f}, fft={fft_f:.0f}, raw={raw_f:.0f}, diff={direct_diff*100:.1f}%)'
 
+def _source_amp_near(source_cands, f, merge_hz=FUSION_MERGE_HZ):
+    """해당 주파수 근처에서 source 후보가 얼마나 강한지 반환."""
+    best_amp = 0.0
+    best_f = 0.0
+
+    for c in source_cands:
+        cf = float(c.get('f', 0.0))
+        if abs(cf - f) <= max(merge_hz, f * 0.025):
+            amp = float(c.get('amp', 0.0))
+            if amp > best_amp:
+                best_amp = amp
+                best_f = cf
+
+    return best_amp, best_f
+
+
+def _build_fusion_candidates(lpc_cands, fft_cands):
+    """LPC와 FFT 피크를 같은 후보군으로 합친다.
+
+    중요: f/2, f/3로 접지 않는다. 실제 위쪽 피크를 배음이라고 낮춰버리는 오류를 막기 위해
+    직접 검출된 주파수 후보만 사용한다.
+    """
+    seed_freqs = []
+
+    for c in fft_cands:
+        seed_freqs.append(float(c['f']))
+    for c in lpc_cands:
+        seed_freqs.append(float(c['f']))
+
+    seed_freqs = sorted([f for f in seed_freqs if f > 0])
+    groups = []
+
+    for f in seed_freqs:
+        placed = False
+        for g in groups:
+            center = g['center']
+            if abs(f - center) <= max(FUSION_MERGE_HZ, center * 0.025):
+                g['freqs'].append(f)
+                g['center'] = float(np.median(g['freqs']))
+                placed = True
+                break
+        if not placed:
+            groups.append({'center': f, 'freqs': [f]})
+
+    fusion = []
+    for g in groups:
+        f = float(g['center'])
+        fft_amp, fft_f = _source_amp_near(fft_cands, f)
+        lpc_amp, lpc_f = _source_amp_near(lpc_cands, f)
+
+        if fft_amp < FUSION_MIN_SOURCE_AMP and lpc_amp < FUSION_MIN_SOURCE_AMP:
+            continue
+
+        src_parts = []
+        if lpc_amp > 0:
+            src_parts.append('LPC')
+        if fft_amp > 0:
+            src_parts.append('FFT')
+
+        fusion.append({
+            'f': f,
+            'fft_amp': float(fft_amp),
+            'lpc_amp': float(lpc_amp),
+            'fft_f': float(fft_f),
+            'lpc_f': float(lpc_f),
+            'src': '+'.join(src_parts) if src_parts else 'NONE',
+        })
+
+    return fusion
+
+
 def select_frequency_candidate(filtered_chunk, ref_freq, f_min, f_max, allow_jump=True):
+    """LPC+FFT 융합 주파수 선택.
+
+    v5.23처럼 FFT만 쓰지 않는다. 다만 예전 코드처럼 LPC가 값을 냈다고 바로 채택하지도 않는다.
+    LPC는 공명 포락선 후보, FFT는 실제 스펙트럼 피크 후보로 보고 둘을 같은 후보표에서 점수화한다.
+    """
     lpc_cands = lpc_frequency_candidates(filtered_chunk, f_min, f_max)
     fft_cands = fft_frequency_candidates(filtered_chunk, f_min, f_max)
 
-    all_cands = []
-    all_cands.extend(lpc_cands)
-    all_cands.extend(fft_cands)
-    all_cands = _add_harmonic_variants(all_cands, f_min, f_max)
-    all_cands = _agreement_bonus(all_cands)
+    best_lpc = lpc_cands[0]['f'] if lpc_cands else 0.0
+    best_fft = fft_cands[0]['f'] if fft_cands else 0.0
 
-    if not all_cands:
+    if not lpc_cands and not fft_cands:
         return 0.0, {'lpc': 0.0, 'fft': 0.0, 'src': 'NONE', 'candidates': []}
 
-    max_amp = max(c['amp'] for c in all_cands) + 1e-12
+    all_cands = _build_fusion_candidates(lpc_cands, fft_cands)
+
+    if not all_cands:
+        fallback = fft_cands if fft_cands else lpc_cands
+        best = dict(fallback[0])
+        return float(best['f']), {
+            'lpc': float(best_lpc),
+            'fft': float(best_fft),
+            'src': best.get('src', 'FALLBACK'),
+            'candidates': [(round(c['f'], 1), round(c.get('score', c.get('amp', 0)), 3), c.get('src', '')) for c in fallback[:8]],
+        }
 
     for c in all_cands:
-        f = c['f']
-        amp_n = c['amp'] / max_amp
-        score = 0.72 * c['score'] + 0.28 * amp_n
+        f = float(c['f'])
+        fft_amp = float(c['fft_amp'])
+        lpc_amp = float(c['lpc_amp'])
+
+        has_fft = fft_amp > 0
+        has_lpc = lpc_amp > 0
+
+        score = FUSION_FFT_WEIGHT * fft_amp + FUSION_LPC_WEIGHT * lpc_amp
+
+        if has_fft and has_lpc:
+            score += FUSION_BOTH_BONUS
+        else:
+            score -= FUSION_SINGLE_PENALTY
 
         if ref_freq > 0:
             dist = abs(f - ref_freq)
-            cont = np.exp(-dist / CONTINUITY_WIDTH_HZ)
-            score += CONTINUITY_WEIGHT * cont
+            score += CONTINUITY_WEIGHT * np.exp(-dist / CONTINUITY_WIDTH_HZ)
 
             if f > ref_freq:
                 score += RISE_BIAS_WEIGHT
 
-            ratio = f / ref_freq
-            strong_peak = amp_n >= JUMP_STRONG_AMP_RATIO
+            if FFT_UPPER_RESCUE and f > ref_freq * FFT_UPPER_RESCUE_RATIO:
+                if fft_amp >= FFT_UPPER_RESCUE_MIN_AMP or (has_fft and has_lpc):
+                    score += 0.22
 
-            if not allow_jump and (ratio > 1.8 or ratio < 0.55) and not strong_peak:
-                score -= 0.65
+            ratio = f / (ref_freq + 1e-12)
+            strong_supported = (fft_amp >= 0.55) or (has_fft and has_lpc)
+            if not allow_jump and (ratio > 1.9 or ratio < 0.55) and not strong_supported:
+                score -= 0.35
 
-            if ratio > 2.8 and c.get('harm', 1) == 1 and not strong_peak:
-                score -= 0.40
-
-        if c.get('harm', 1) > 1:
-            score -= HARMONIC_PENALTY * (c['harm'] - 1)
+            if f < ref_freq * 0.90:
+                score -= 0.06
 
         c['final_score'] = float(score)
 
     all_cands = sorted(all_cands, key=lambda c: c['final_score'], reverse=True)
     chosen = all_cands[0]
 
-    best_lpc = lpc_cands[0]['f'] if lpc_cands else 0.0
-    best_fft = fft_cands[0]['f'] if fft_cands else 0.0
-
     debug = {
         'lpc': float(best_lpc),
         'fft': float(best_fft),
-        'src': chosen['src'],
-        'candidates': [(round(c['f'], 1), round(c['final_score'], 3), c['src']) for c in all_cands[:6]],
+        'src': 'LPC_FFT_FUSION:' + chosen['src'],
+        'candidates': [
+            (round(c['f'], 1), round(c['final_score'], 3), c['src'],
+             round(c['lpc_amp'], 2), round(c['fft_amp'], 2))
+            for c in all_cands[:8]
+        ],
     }
 
     return float(chosen['f']), debug
-
 
 def fft_explore_rising(filtered_chunk, current_f, f_max):
     if current_f <= 0:
@@ -1179,18 +1288,23 @@ def _make_reg_freq(raw_f, last_reg, in_final):
     if last_reg <= 0:
         return raw_f
 
+    # FFT primary에서는 복구 점프를 막으면 실제 고주파 피크로 올라가지 못한다.
+    # 따라서 점프 제한을 매우 약하게 두고, EMA도 빠르게 따라가게 한다.
     ratio = raw_f / (last_reg + 1e-12)
 
     if ratio > 1.0 + REG_MAX_JUMP_RATIO:
         raw_f = last_reg * (1.0 + REG_MAX_JUMP_RATIO)
     elif ratio < 1.0 - REG_MAX_JUMP_RATIO:
-        raw_f = last_reg * (1.0 - REG_MAX_JUMP_RATIO)
+        raw_f = max(FREQ_MIN_LIMIT, last_reg * (1.0 - REG_MAX_JUMP_RATIO))
 
     alpha = REG_EMA_ALPHA_FINAL if in_final else REG_EMA_ALPHA_NORMAL
     return float(last_reg * (1 - alpha) + raw_f * alpha)
 
 
 def _current_search_range(filling_elapsed, ref_freq, stable_f, target_f, loss_count):
+    if FORCE_FULL_BAND_SEARCH:
+        return float(FREQ_MIN_LIMIT), float(FREQ_MAX_LIMIT)
+
     base_floor = FREQ_MIN_LIMIT
     base_ceil = FREQ_MAX_LIMIT
 
@@ -1222,6 +1336,7 @@ def _current_search_range(filling_elapsed, ref_freq, stable_f, target_f, loss_co
     ceil = min(FREQ_MAX_LIMIT, max(ceil, floor + 120.0))
 
     return float(floor), float(ceil)
+
 
 
 # ════════════════════════════════════════════════════════════════════
