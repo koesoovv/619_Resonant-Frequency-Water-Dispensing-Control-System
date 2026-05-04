@@ -1,4 +1,4 @@
-# smart_water_core.py  ── 개선판 v5.21-diameter-lock-fix
+# smart_water_core.py  ── 개선판 v5.22-reg-agreement
 #
 # 핵심 수정
 # 1. LPC 단독 우선 채택 제거: LPC/FFT 후보를 동시에 만들고 통합 점수로 선택
@@ -9,6 +9,7 @@
 # 6. 고역통과 필터 상태 zi 유지: chunk 경계 과도응답 감소
 # 7. 초기 주파수는 단일 샘플이 아니라 후보 누적 안정성으로 확정
 # 8. 지름 잠금은 후보 개수만 보지 않고 후보 안정도/R²/회귀시간/주파수 상승률까지 확인
+# 9. 지름 회귀 데이터는 LPC와 FFT가 직접 또는 배음 보정 기준으로 동의할 때만 사용
 
 import numpy as np
 import sounddevice as sd
@@ -117,6 +118,13 @@ HARMONIC_PENALTY         = 0.12
 JUMP_STRONG_AMP_RATIO    = 0.75    # 강한 피크는 continuity보다 우선 허용
 REG_MAX_JUMP_RATIO       = 0.22
 REG_MEDIAN_GATE_RATIO    = 0.18
+
+# 지름 회귀용 주파수 품질 검사
+# LPC와 FFT가 서로 비슷하거나, 한쪽이 다른 쪽의 2/3/4/5배 배음 관계로 설명될 때만 reg buffer에 넣는다.
+REG_REQUIRE_LPC_FFT_AGREE = True
+REG_LPC_FFT_AGREE_RATIO   = 0.12
+REG_HARMONIC_AGREE_RATIO  = 0.10
+
 RAW_LOSS_HOLD_N          = 8
 RECOVERY_FULLSCAN_EVERY  = 6
 
@@ -624,6 +632,64 @@ def _agreement_bonus(cands):
 
     return cands
 
+
+
+
+def _freq_rel_diff(a, b):
+    if a <= 0 or b <= 0:
+        return 1e9
+    return abs(a - b) / max(a, b)
+
+
+def _supported_by_source_peak(selected_f, source_f):
+    """selected_f가 source_f의 직접 피크 또는 배음 보정값으로 설명되는지 검사."""
+    if selected_f <= 0 or source_f <= 0:
+        return False
+
+    # 직접 일치
+    if _freq_rel_diff(selected_f, source_f) <= REG_LPC_FFT_AGREE_RATIO:
+        return True
+
+    # source_f가 selected_f의 2~5배 배음으로 잡힌 경우 허용
+    ratio = source_f / (selected_f + 1e-12)
+    for h in (2, 3, 4, 5):
+        if abs(ratio - h) / h <= REG_HARMONIC_AGREE_RATIO:
+            return True
+
+    # selected_f가 source_f의 2~5배인 경우는 기본적으로 배음 오검출 가능성이 커서 회귀용으로는 불허
+    return False
+
+
+def reg_source_agreement_ok(raw_f, dbg):
+    """지름 회귀용 raw_f가 LPC/FFT 양쪽에서 지지되는지 확인."""
+    if not REG_REQUIRE_LPC_FFT_AGREE:
+        return True, 'agreement 비활성'
+
+    lpc_f = float(dbg.get('lpc', 0.0))
+    fft_f = float(dbg.get('fft', 0.0))
+    src = str(dbg.get('src', ''))
+
+    if raw_f <= 0:
+        return False, 'raw_f=0'
+
+    if lpc_f <= 0 or fft_f <= 0:
+        return False, f'LPC/FFT 부족(lpc={lpc_f:.0f}, fft={fft_f:.0f})'
+
+    # 후보 병합 단계에서 이미 LPC+FFT가 같은 후보로 합쳐진 경우
+    if 'LPC' in src and 'FFT' in src:
+        return True, 'LPC+FFT merged'
+
+    direct_diff = _freq_rel_diff(lpc_f, fft_f)
+    if direct_diff <= REG_LPC_FFT_AGREE_RATIO:
+        return True, f'LPC≈FFT({direct_diff*100:.1f}%)'
+
+    lpc_support = _supported_by_source_peak(raw_f, lpc_f)
+    fft_support = _supported_by_source_peak(raw_f, fft_f)
+
+    if lpc_support and fft_support:
+        return True, 'LPC/FFT harmonic support'
+
+    return False, f'LPC/FFT 불일치(lpc={lpc_f:.0f}, fft={fft_f:.0f}, raw={raw_f:.0f}, diff={direct_diff*100:.1f}%)'
 
 def select_frequency_candidate(filtered_chunk, ref_freq, f_min, f_max, allow_jump=True):
     lpc_cands = lpc_frequency_candidates(filtered_chunk, f_min, f_max)
@@ -1304,6 +1370,10 @@ def audio_callback(indata, frames, time_info, status):
 
         consecutive_loss_count = 0
 
+        # ── 회귀용 후보 품질 검사: LPC/FFT 동의 여부 ─────────────────
+        # 이 값은 제어용 stable_f에는 직접 적용하지 않고, 지름 회귀 버퍼 투입 여부에만 사용한다.
+        reg_src_ok, reg_src_reason = reg_source_agreement_ok(raw_f, dbg)
+
         # ── 회귀용 주파수 생성: stable_f와 분리 ─────────────────────
         if _calib and _cur_d > 0 and _last_s > 0:
             L_now = SOUND_SPEED / (4 * _last_s) - END_CORRECTION_K * _cur_d
@@ -1418,6 +1488,7 @@ def audio_callback(indata, frames, time_info, status):
                     f' | reg_buf={_reg_buf_len}'
                     f' | spikes={_spike_blocked}'
                     f' | src={dbg["src"]}'
+                    f' | src_ok={"✓" if reg_src_ok else "✗"}'
                     f' | ready={ready_str}'
                     f' | {stag_str}'
                 )
@@ -1427,6 +1498,8 @@ def audio_callback(indata, frames, time_info, status):
 
             if _init_f <= 0:
                 reason = 'initial_stable_freq 아직 0'
+            elif not reg_src_ok:
+                reason = reg_src_reason
             elif reg_f <= _init_f * 1.015:
                 reason = f'reg_f({reg_f:.0f}) ≤ init_f({_init_f:.0f})*1.015'
             elif reg_f >= min(FREQ_MAX_LIMIT, _init_f * 2.40):
