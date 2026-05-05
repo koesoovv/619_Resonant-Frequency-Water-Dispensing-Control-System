@@ -39,6 +39,8 @@ def run_kiosk_gui():                                                # GUI 실행
         status_var.set(s)                                           # 상태 문구 갱신
         print(f'\n[GUI] {s}')                                       # 콘솔에도 출력
 
+    _pending_save = [None]                                         # 제어 완료 후 대기 중인 저장 데이터
+
     def gui_on():                                                   # ON 버튼 동작
         with core.lock:
             if core.is_filling:                                     # 이미 급수 중이면
@@ -57,6 +59,13 @@ def run_kiosk_gui():                                                # GUI 실행
         init_air_var.set('초기 공기층(용기 높이) : - cm')            # 화면 값 초기화
         hit_var.set(f'확신(Hits) : 0/{core.STOP_TRIGGER_COUNT}')    # 히트 수 초기화
         progress.set(0.0)                                           # 진행바 초기화
+
+        _pending_save[0] = None                                     # 미입력 저장 데이터 폐기
+        try:
+            actual_air_frame.pack_forget()                          # 공기층 입력 칸 숨김
+            actual_air_entry.delete(0, 'end')                       # 입력창 초기화
+        except Exception:
+            pass                                                    # 위젯 미생성 시 무시
 
         core.ensure_audio_stream()                                  # 오디오 스트림 준비
         core.start_filling_local()                                  # 실험 상태 초기화
@@ -78,6 +87,7 @@ def run_kiosk_gui():                                                # GUI 실행
         set_status('GUI OFF → 주입 종료')                           # 상태 표시
 
     def on_close():                                                 # 창 닫기 동작
+        _pending_save[0] = None                                     # 미입력 저장 데이터 폐기
         core.solenoid_off()                                         # 솔레노이드 OFF
         try:
             if core.audio_stream:                                   # 오디오 스트림이 있으면
@@ -341,8 +351,54 @@ def run_kiosk_gui():                                                # GUI 실행
     plot_frame = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)  # 그래프 영역
     plot_frame.pack(fill='both', expand=True)                       # 배치
 
-    ctk.CTkLabel(plot_frame, text='실시간 주파수 추적 그래프', text_color=C_TEXT,
-                 font=('Malgun Gothic', 16, 'bold')).pack(anchor='w', pady=(0, 6))  # 제목 표시
+    graph_header = ctk.CTkFrame(plot_frame, fg_color=C_CARD)        # 그래프 헤더 행
+    graph_header.pack(fill='x', pady=(0, 6))                        # 배치
+
+    ctk.CTkLabel(graph_header, text='실시간 주파수 추적 그래프',
+                 text_color=C_TEXT,
+                 font=('Malgun Gothic', 16, 'bold')
+                 ).pack(side='left')                                 # 제목 (왼쪽 고정)
+
+    actual_air_frame = ctk.CTkFrame(graph_header, fg_color=C_CARD)  # 입력 영역 (평소 숨김)
+    # 초기에는 pack 안 함 → 제어 완료 시에만 오른쪽에 표시
+
+    ctk.CTkLabel(actual_air_frame, text='실제 공기층(cm):',
+                 text_color=C_NAVY,
+                 font=('Malgun Gothic', 12, 'bold')
+                 ).pack(side='left', padx=(14, 4))                   # 라벨
+
+    actual_air_entry = ctk.CTkEntry(actual_air_frame, width=72,
+                                    placeholder_text='예) 3.20',
+                                    font=('Malgun Gothic', 12))      # 숫자 입력창
+    actual_air_entry.pack(side='left', padx=(0, 6))                  # 배치
+
+    def on_confirm_save():                                           # 저장 버튼 동작
+        data = _pending_save[0]
+        if data is None:
+            return
+        raw = actual_air_entry.get().strip()                         # 입력값 읽기
+        try:
+            actual_air = float(raw)                                  # 숫자 변환 시도
+        except ValueError:
+            actual_air = None                                        # 미입력 시 공란으로 저장
+        save_to_csv(
+            data['d'], data['init_f'], data['tf'], data['sf'],
+            r2_final=data['r2'],
+            total_samples=data['total_samples'],
+            theory_intercept=data['theory_intercept'],
+            stand_type='filled_box',
+            stand_height_cm=3.0,
+            actual_air_cm=actual_air,
+        )
+        _pending_save[0] = None                                      # 대기 데이터 초기화
+        actual_air_frame.pack_forget()                               # 입력 칸 숨김
+        actual_air_entry.delete(0, 'end')                            # 입력창 초기화
+        set_status('저장 완료')                                       # 상태 표시
+
+    ctk.CTkButton(actual_air_frame, text='저장', width=60, height=28,
+                  fg_color=C_NAVY, hover_color=C_NAVY_HOVER,
+                  font=('Malgun Gothic', 12, 'bold'), corner_radius=8,
+                  command=on_confirm_save).pack(side='left')         # 저장 버튼
 
     fig = Figure(figsize=(6.2, 3.0), dpi=100)                      # Figure 생성
     ax  = fig.add_subplot(111)                                     # 축 생성
@@ -415,7 +471,7 @@ def run_kiosk_gui():                                                # GUI 실행
             canvas.draw_idle()                                     # 화면에 반영
 
             if finish:                                             # 저장 요청이 있으면
-                set_status('종료 → 결과 저장')                      # 상태 표시
+                set_status('측정 완료 → 실제 공기층 입력 후 저장')   # 상태 표시
 
                 with core.lock:
                     init_f_save   = float(core.initial_stable_freq)    # 저장용 초기 주파수
@@ -427,14 +483,18 @@ def run_kiosk_gui():                                                # GUI 실행
 
                 print(f'\n[DEBUG] 샘플수={total_samples} | R2={r2}')  # 디버그 출력
 
-                save_to_csv(
-                    d, init_f_save, tf, sf,                          # 기본 저장값
-                    r2_final=r2,                                     # R² 저장
-                    total_samples=total_samples,                     # 총 샘플 수 저장
-                    theory_intercept=t_intercept_s,                  # 절편 저장
-                    stand_type="filled_box",                         # 받침대 종류
-                    stand_height_cm=3.0,                             # 받침대 높이
-                )
+                # 즉시 저장하지 않고 실제 공기층 입력 대기
+                _pending_save[0] = {
+                    'd':                d,
+                    'init_f':           init_f_save,
+                    'tf':               tf,
+                    'sf':               sf,
+                    'r2':               r2,
+                    'total_samples':    total_samples,
+                    'theory_intercept': t_intercept_s,
+                }
+                actual_air_entry.delete(0, 'end')                    # 입력창 초기화
+                actual_air_frame.pack(side='right')                  # 제목 오른쪽에 입력 칸 표시
 
                 _init_air_fixed[0] = None                            # 다음 실험 위해 초기화
                 init_air_var.set('초기 공기층(용기 높이) : - cm')     # 표시 초기화
@@ -458,3 +518,5 @@ def run_kiosk_gui():                                                # GUI 실행
     set_status('GPIO 제어 모드 준비 완료')                           # 초기 상태 표시
     periodic_update()                                               # 업데이트 루프 시작
     app.mainloop()                                                  # GUI 메인 루프 시작
+
+
