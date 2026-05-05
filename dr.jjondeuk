@@ -45,21 +45,21 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 21.5
+FLOW_RATE        = 20
 END_CORRECTION_K = 0.4
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
 TARGET_AIR_CM           = 3.0
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
-CALC_START_TIME         = 3.0
-DIAM_CALC_END_TIME      = 15.0
+CALC_START_TIME         = 5.0
+DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 4.0
 STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
 # 솔레노이드 지연 + EMA 지연 보상: 목표보다 이 값만큼 먼저 정지 트리거
 # 실험 후 물이 많이 남으면 줄이고, 넘치면 늘리세요 (단위: cm)
-STOP_ADVANCE_CM         = 0.5
+STOP_ADVANCE_CM         = 0
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
@@ -95,7 +95,7 @@ LPC_CONTINUITY_W = 600.0
 LPC_RISE_BIAS    = 0.05
 
 # ── LOESS 파라미터 ────────────────────────────────────────────────────
-LOESS_FRAC   = 0.35
+LOESS_FRAC   = 0.25
 LOESS_DEGREE = 1
 
 # ── tracking 파라미터 ────────────────────────────────────────────────
@@ -134,14 +134,14 @@ THEORY_GUIDE_ALPHA_FINAL  = 0.50
 THEORY_GUIDE_MARGIN_FINAL = 0.375
 
 # ── D 안정화 ─────────────────────────────────────────────────────────
-DIAM_CAND_MAXLEN   = 15
-DIAM_CAND_MIN      = 7
+DIAM_CAND_MAXLEN   = 20
+DIAM_CAND_MIN      = 15
 DIAM_EMA_KEEP      = 0.92
 DIAM_EMA_NEW       = 0.08
 DIAM_OUTLIER_RATIO = 0.30
 
 # ── LSM / 데이터 충분성 ───────────────────────────────────────────────
-LSM_R2_MIN     = 0.88
+LSM_R2_MIN     = 0.95
 REG_MIN_POINTS = 20
 THEORY_LOCK_R2 = 0.92
 
@@ -205,6 +205,8 @@ last_r2               = 0.0
 spike_blocked_count   = 0
 history_freq_snapshot = []
 init_air_len_cm       = 0.0
+
+peak_lock_floor = 0.0
 
 # [v5.18-THREAD] 회귀 워커 스레드 신호 이벤트
 _reg_event = threading.Event()
@@ -399,7 +401,7 @@ def robust_slope_loess_lsm(times, inv_freqs):
         if mask.sum() < 8:
             return None, 0.0, 0.0
         slope, intercept = np.polyfit(x[mask], y_smooth[mask], 1)
-        if abs(slope) < MIN_SLOPE_CUTOFF:
+        if slope >= 0 or abs(slope) < MIN_SLOPE_CUTOFF:
             return None, 0.0, 0.0
         y_pred  = slope * x[mask] + intercept
         ss_res  = np.sum((y_smooth[mask] - y_pred)**2)
@@ -469,14 +471,42 @@ def _regression_worker():
                 theory_locked    = True
                 print(f'\n[★ 이론 곡선 잠금] slope={s_a:.6f} r²={r_sq:.3f}')
 
-        if s_a is None or abs(s_a) <= 1e-9 or r_sq <= LSM_R2_MIN:
-            with lock:
-                if s_a is not None:
-                    last_r2 = r_sq
+        if s_a is None or abs(s_a) <= 1e-9:
             continue
 
-        temp_D = np.sqrt(16 * FLOW_RATE / (np.pi * SOUND_SPEED * abs(s_a)))
-        temp_D *= DIAMETER_SCALE
+        # 기울기 크기에 따라 r² 기준 자동 완화 (큰 컵일수록 slope 작음)
+        if abs(s_a) < 0.000035:
+            r2_threshold = 0.88
+        elif abs(s_a) < 0.000055:
+            r2_threshold = 0.92
+        else:
+            r2_threshold = 0.95
+
+        if r_sq <= r2_threshold:
+            with lock:
+                last_r2 = r_sq
+            continue
+        
+        if _cur_d > 0 and s_a is not None:
+            q_implied = abs(s_a) * np.pi * SOUND_SPEED * _cur_d**2 / 16
+            if 10.0 < q_implied < 30.0:
+                effective_Q = q_implied
+            else:
+                effective_Q = FLOW_RATE
+        else:
+            effective_Q = FLOW_RATE
+
+        temp_D = np.sqrt(16 * effective_Q / (np.pi * SOUND_SPEED * abs(s_a)))
+
+        # slope 작을수록(큰 컵) D 과대추정 → 자동 보정
+        if abs(s_a) < 0.000030:
+            auto_scale = 0.9
+        elif abs(s_a) < 0.000045:
+            auto_scale = 0.95
+        else:
+            auto_scale = 1.0
+
+        temp_D *= DIAMETER_SCALE * auto_scale
 
         if not (2.0 < temp_D < 15.0):
             continue
@@ -554,6 +584,7 @@ def start_filling_local() -> None:
     global _prev_buf_median, _freeze_count
     global last_r2, spike_blocked_count, history_freq_snapshot
     global init_air_len_cm
+    global peak_lock_floor
 
     with lock:
         is_filling              = True
@@ -588,6 +619,7 @@ def start_filling_local() -> None:
         spike_blocked_count     = 0
         history_freq_snapshot   = []
         init_air_len_cm         = 0.0
+        peak_lock_floor 		= 0.0
     print('\n>>> [1단계] 배경 소음 측정 (1초)...')
 
 
@@ -618,6 +650,7 @@ def audio_callback(indata, frames, time_info, status):
     global _prev_buf_median, _freeze_count
     global last_r2, spike_blocked_count, history_freq_snapshot
     global init_air_len_cm
+    global peak_lock_floor
 
     if not is_filling:
         return
@@ -773,7 +806,7 @@ def audio_callback(indata, frames, time_info, status):
                     blended = detected_f * (1 - g_alpha) + f_theory * g_alpha
                     with lock:
                         _tf_cap = float(target_freq)
-                    if _tf_cap > 0:
+                    if _tf_cap > 0 and not in_final:
                         blended = min(blended, _tf_cap * 1.01)
                     detected_f = blended
 
@@ -781,7 +814,7 @@ def audio_callback(indata, frames, time_info, status):
             _tf_cap2 = float(target_freq)
             _calib_cap = bool(calibration_done)
         # calibration 확정 후엔 천장을 1.08로 좁혀 스파이크 누적 차단
-        _cap_mult = 1.08 if _calib_cap else 1.15
+        _cap_mult = 1.20 if not _calib_cap else (1.35 if in_final else 1.12)
         if _tf_cap2 > 0 and detected_f > _tf_cap2 * _cap_mult:
             detected_f = _last
 
@@ -835,7 +868,7 @@ def audio_callback(indata, frames, time_info, status):
         # [v5.19] max_freq_seen: 초기 노이즈 구간(6s) 이후만 업데이트
         # 초기 스파이크가 max에 등록되면 이후 floor 계산이 왜곡됨
         with lock:
-            if filling_elapsed > EARLY_NOISE_SEC and stable_f > max_freq_seen:
+            if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
                 max_freq_seen = stable_f
             _max_f_seen = float(max_freq_seen)
 
@@ -845,6 +878,11 @@ def audio_callback(indata, frames, time_info, status):
             hard_floor = min(_max_f_seen * 0.88, _tf_now * 0.98)
             if stable_f < hard_floor:
                 stable_f = hard_floor
+                
+        if stable_f > peak_lock_floor:
+            peak_lock_floor = stable_f
+        if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
+            stable_f = peak_lock_floor * 0.90
 
         # ── 7단계: tracking 모드 진입 판정 ──────────────────────────
         _tracking_thresh = max(TRACKING_ENTRY_HZ, _init * TRACKING_ENTRY_MULT) if _init > 0 else TRACKING_ENTRY_HZ
@@ -885,7 +923,7 @@ def audio_callback(indata, frames, time_info, status):
                     f' | cand={_cand_cnt}/{DIAM_CAND_MAXLEN}'
                 )
 
-            if _init_f > 0 and raw_f_for_reg > _init_f * 1.02 and raw_f_for_reg < _init_f * 2.0:
+            if _init_f > 0 and raw_f_for_reg > _init_f * 1.005 and raw_f_for_reg < _init_f * 4.0:
                 current_inv = 1.0 / raw_f_for_reg
 
                 with lock:
@@ -914,7 +952,7 @@ def audio_callback(indata, frames, time_info, status):
                         print(f'\n[D진단] ❌ initial_stable_freq 아직 0')
                     elif raw_f_for_reg <= _init_f * 1.02:
                         print(f'\n[D진단] ❌ raw_f({raw_f_for_reg:.0f}) ≤ init_f({_init_f:.0f})*1.02')
-                    elif raw_f_for_reg >= _init_f * 2.0:
+                    elif raw_f_for_reg >= _init_f * 4.0:
                         print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*2.0 → 배음 의심, 제외')
 
         # ── 9단계: 정지 판단 ──────────────────────────────────────────
