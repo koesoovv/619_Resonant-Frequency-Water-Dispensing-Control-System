@@ -45,7 +45,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 21.5
+FLOW_RATE        = 20
 END_CORRECTION_K = 0.4
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ DIAMETER_SCALE          = 1.0
 CALC_START_TIME         = 5.0
 DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 4.0
-STOP_TRIGGER_COUNT      = 3
+STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
 # 솔레노이드 지연 + EMA 지연 보상: 목표보다 이 값만큼 먼저 정지 트리거
 # 실험 후 물이 많이 남으면 줄이고, 넘치면 늘리세요 (단위: cm)
@@ -95,7 +95,7 @@ LPC_CONTINUITY_W = 600.0
 LPC_RISE_BIAS    = 0.05
 
 # ── LOESS 파라미터 ────────────────────────────────────────────────────
-LOESS_FRAC   = 0.35
+LOESS_FRAC   = 0.25
 LOESS_DEGREE = 1
 
 # ── tracking 파라미터 ────────────────────────────────────────────────
@@ -135,13 +135,13 @@ THEORY_GUIDE_MARGIN_FINAL = 0.375
 
 # ── D 안정화 ─────────────────────────────────────────────────────────
 DIAM_CAND_MAXLEN   = 15
-DIAM_CAND_MIN      = 7
+DIAM_CAND_MIN      = 15
 DIAM_EMA_KEEP      = 0.92
 DIAM_EMA_NEW       = 0.08
 DIAM_OUTLIER_RATIO = 0.30
 
 # ── LSM / 데이터 충분성 ───────────────────────────────────────────────
-LSM_R2_MIN     = 0.88
+LSM_R2_MIN     = 0.95
 REG_MIN_POINTS = 20
 THEORY_LOCK_R2 = 0.92
 
@@ -778,7 +778,7 @@ def audio_callback(indata, frames, time_info, status):
                     blended = detected_f * (1 - g_alpha) + f_theory * g_alpha
                     with lock:
                         _tf_cap = float(target_freq)
-                    if _tf_cap > 0:
+                    if _tf_cap > 0 and not in_final:
                         blended = min(blended, _tf_cap * 1.01)
                     detected_f = blended
 
@@ -786,7 +786,7 @@ def audio_callback(indata, frames, time_info, status):
             _tf_cap2 = float(target_freq)
             _calib_cap = bool(calibration_done)
         # calibration 확정 후엔 천장을 1.08로 좁혀 스파이크 누적 차단
-        _cap_mult = 1.08 if _calib_cap else 1.15
+        _cap_mult = 1.20 if not _calib_cap else (1.35 if in_final else 1.12)
         if _tf_cap2 > 0 and detected_f > _tf_cap2 * _cap_mult:
             detected_f = _last
 
@@ -895,7 +895,7 @@ def audio_callback(indata, frames, time_info, status):
                     f' | cand={_cand_cnt}/{DIAM_CAND_MAXLEN}'
                 )
 
-            if _init_f > 0 and raw_f_for_reg > _init_f * 1.005 and raw_f_for_reg < _init_f * 2.0:
+            if _init_f > 0 and raw_f_for_reg > _init_f * 1.005 and raw_f_for_reg < _init_f * 4.0:
                 current_inv = 1.0 / raw_f_for_reg
 
                 with lock:
