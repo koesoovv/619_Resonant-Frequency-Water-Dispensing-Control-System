@@ -1,0 +1,465 @@
+# user_kiosk_gui.py ── 사용자 전용 키오스크 GUI (customtkinter)
+#
+#  python user_kiosk_gui.py
+#  ESC → 전체화면 해제 (개발 중 편의용)
+
+import time
+import datetime
+import threading
+import tkinter as tk
+import customtkinter as ctk
+import smart_water_core as core
+from csv_logger import save_to_csv
+
+# ── 색상 ─────────────────────────────────────────────
+BG        = '#070c18'
+SURFACE   = '#0d1526'
+BORDER    = '#1e3a5f'
+CYAN      = '#67e8f9'
+BLUE      = '#3b82f6'
+AMBER     = '#fbbf24'
+GREEN_CLR = '#22c55e'
+MUTED     = '#4b6280'
+
+# ── 컵 캔버스 크기 ───────────────────────────────────
+CUP_CW, CUP_CH = 240, 310
+
+# 사다리꼴 꼭짓점:  위쪽이 넓고, 아래쪽이 좁아야 컵처럼 보임
+#   위: 190px   아래: 100px  → 확실한 테이퍼
+CUP_TL = (25,  18)   # 상단 좌  (위 너비 190px)
+CUP_TR = (215, 18)   # 상단 우
+CUP_BR = (170, 280)  # 하단 우  (아래 너비 100px)
+CUP_BL = (70,  280)  # 하단 좌
+CUP_INNER_H = CUP_BL[1] - CUP_TL[1]   # 262
+
+
+class CupCanvas(tk.Canvas):
+    def __init__(self, master, **kw):
+        super().__init__(master, width=CUP_CW, height=CUP_CH,
+                         bg=BG, highlightthickness=0, **kw)
+        self._pct = 0.0
+        self._redraw()
+
+    def _pts_at(self, pct):
+        """수위 pct(0~100) → 물 표면의 x_left, x_right, y_top"""
+        h     = CUP_INNER_H * (pct / 100.0)
+        y_top = CUP_BL[1] - h
+        r     = h / CUP_INNER_H           # 0=비어있음, 1=가득
+        xl    = CUP_BL[0] + (CUP_TL[0] - CUP_BL[0]) * r
+        xr    = CUP_BR[0] + (CUP_TR[0] - CUP_BR[0]) * r
+        return xl, xr, y_top
+
+    def _redraw(self):
+        self.delete('all')
+        pct = self._pct
+
+        # ① 물 채움
+        if pct > 0.2:
+            xl, xr, yt = self._pts_at(pct)
+            self.create_polygon(
+                xl, yt, xr, yt,
+                CUP_BR[0], CUP_BR[1],
+                CUP_BL[0], CUP_BL[1],
+                fill='#1d4ed8', outline='',
+            )
+            # 물 표면 하이라이트
+            self.create_line(xl, yt, xr, yt, fill='#93c5fd', width=2)
+
+        # ② 컵 외곽 (글로우: 두꺼운 어두운 선 → 얇은 밝은 선)
+        pts = [CUP_TL, CUP_TR, CUP_BR, CUP_BL]
+        flat = [c for p in pts for c in p]
+        self.create_polygon(flat, fill='', outline='#1e3a8a', width=8)
+        self.create_polygon(flat, fill='', outline='#3b82f6', width=2)
+
+        # ③ 상단 림 (청록 강조)
+        lx0, lx1 = CUP_TL[0] - 4, CUP_TR[0] + 4
+        ly = CUP_TL[1]
+        self.create_line(lx0, ly,     lx1, ly,     fill='#67e8f9', width=5)
+        self.create_line(lx0, ly + 6, lx1, ly + 6, fill='#1e40af', width=2)
+
+        # ④ 수위 % 텍스트
+        self.create_text(
+            CUP_CW // 2, CUP_CH // 2,
+            text=f'{round(pct)}%',
+            font=('Courier New', 36, 'bold'),
+            fill='white',
+        )
+
+    def set_fill(self, pct: float):
+        pct = max(0.0, min(100.0, pct))
+        if abs(pct - self._pct) < 0.15:
+            return
+        self._pct = pct
+        self._redraw()
+
+
+# ════════════════════════════════════════════════════
+def run_kiosk_gui():
+    ctk.set_appearance_mode('dark')
+    ctk.set_default_color_theme('blue')
+
+    app = ctk.CTk()
+    app.title('기주공명 음성인식 스마트 정수기')
+    app.configure(fg_color=BG)
+
+    # ── 전체화면 ──────────────────────────────────────
+    app.attributes('-fullscreen', True)
+    # ESC 로 전체화면 토글 (개발 편의용; 실제 배포 시 제거 가능)
+    app.bind('<Escape>',
+             lambda e: app.attributes('-fullscreen',
+                                      not app.attributes('-fullscreen')))
+
+    _last_saved_t  = [0.0]
+    target_pct_var = tk.IntVar(value=70)
+    hit_dots: list[tk.Label] = []
+
+    # ── 레이아웃 3행 ─────────────────────────────────
+    app.grid_rowconfigure(0, weight=0)
+    app.grid_rowconfigure(1, weight=1)
+    app.grid_rowconfigure(2, weight=0)
+    app.grid_columnconfigure(0, weight=1)
+
+    # ────────────────────────────────────────────────
+    #  헤더
+    # ────────────────────────────────────────────────
+    hdr = tk.Frame(app, bg='#0d1526', height=50)
+    hdr.grid(row=0, column=0, sticky='ew')
+    hdr.grid_propagate(False)
+    hdr.grid_columnconfigure(1, weight=1)
+
+    tk.Label(hdr, text='기주공명·음성인식 스마트 정수기',
+             bg='#0d1526', fg=CYAN,
+             font=('Malgun Gothic', 14, 'bold')
+             ).grid(row=0, column=0, padx=20, pady=13, sticky='w')
+
+    hdr_right = tk.Frame(hdr, bg='#0d1526')
+    hdr_right.grid(row=0, column=1, sticky='e', padx=20)
+    for t in ['동의대 전자공학과 11조', '  |  ', '동물원', '  |  ']:
+        tk.Label(hdr_right, text=t, bg='#0d1526', fg=MUTED,
+                 font=('Malgun Gothic', 10)).pack(side='left')
+    clock_lbl = tk.Label(hdr_right, text='', bg='#0d1526',
+                         fg=CYAN, font=('Courier New', 14, 'bold'))
+    clock_lbl.pack(side='left')
+
+    tk.Frame(app, bg=BORDER, height=1).grid(row=0, column=0, sticky='sew')
+
+    # ────────────────────────────────────────────────
+    #  메인 (컵 + 상태)
+    # ────────────────────────────────────────────────
+    main_f = tk.Frame(app, bg=BG)
+    main_f.grid(row=1, column=0, sticky='nsew')
+    main_f.grid_columnconfigure(0, weight=1)
+    main_f.grid_rowconfigure(0, weight=1)
+    main_f.grid_rowconfigure(1, weight=0)
+
+    cup_wrap = tk.Frame(main_f, bg=BG)
+    cup_wrap.grid(row=0, column=0)
+
+    cup_canvas = CupCanvas(cup_wrap)
+    cup_canvas.pack(pady=(10, 4))
+
+    stat_f = tk.Frame(main_f, bg=BG)
+    stat_f.grid(row=1, column=0, pady=(0, 8))
+
+    tk.Label(stat_f, text='현 재  수 위', bg=BG,
+             fg=MUTED, font=('Malgun Gothic', 10)).pack()
+    status_lbl = tk.Label(stat_f, text='대 기  중', bg=BG,
+                          fg=CYAN, font=('Malgun Gothic', 16, 'bold'))
+    status_lbl.pack(pady=(3, 0))
+
+    # ────────────────────────────────────────────────
+    #  하단 패널
+    # ────────────────────────────────────────────────
+    tk.Frame(app, bg=BORDER, height=1).grid(row=2, column=0, sticky='new')
+
+    bot = tk.Frame(app, bg='#0a1224', height=148)
+    bot.grid(row=2, column=0, sticky='ew')
+    bot.grid_propagate(False)
+    bot.grid_columnconfigure(1, weight=1)
+
+    # ── 주파수 카드 (CTkFrame → 둥근 모서리) ────────
+    fcard = ctk.CTkFrame(bot, fg_color=SURFACE,
+                         border_color=BORDER, border_width=1,
+                         corner_radius=14)
+    fcard.grid(row=0, column=0, padx=(14, 8), pady=14, sticky='ns')
+
+    tk.Label(fcard, text='기주공명 주파수 추적',
+             bg=SURFACE, fg=MUTED,
+             font=('Malgun Gothic', 9)
+             ).pack(anchor='w', padx=12, pady=(10, 3))
+
+    frow = tk.Frame(fcard, bg=SURFACE)
+    frow.pack(padx=12, pady=(0, 10))
+
+    cur_col = tk.Frame(frow, bg=SURFACE)
+    cur_col.pack(side='left')
+    tk.Label(cur_col, text='현재', bg=SURFACE, fg=MUTED,
+             font=('Malgun Gothic', 8)).pack(anchor='w')
+    freq_cur_lbl = tk.Label(cur_col, text='--- Hz', bg=SURFACE,
+                            fg=AMBER, font=('Courier New', 16, 'bold'), width=8)
+    freq_cur_lbl.pack(anchor='w')
+
+    mid_col = tk.Frame(frow, bg=SURFACE, width=96)
+    mid_col.pack(side='left', padx=10)
+    mid_col.pack_propagate(False)
+
+    bar_cv = tk.Canvas(mid_col, width=96, height=7,
+                       bg=SURFACE, highlightthickness=0)
+    bar_cv.pack(pady=(8, 5))
+    bar_cv.create_rectangle(0, 0, 96, 7, fill='#1e3a5f', outline='')
+    bar_fill = bar_cv.create_rectangle(0, 0, 0, 7, fill=BLUE, outline='')
+
+    dot_f = tk.Frame(mid_col, bg=SURFACE)
+    dot_f.pack()
+
+    def rebuild_dots(n):
+        for w in hit_dots:
+            w.destroy()
+        hit_dots.clear()
+        for _ in range(n):
+            dw = tk.Label(dot_f, text='●', bg=SURFACE,
+                          fg=BORDER, font=('Arial', 7))
+            dw.pack(side='left', padx=1)
+            hit_dots.append(dw)
+
+    rebuild_dots(core.STOP_TRIGGER_COUNT)
+
+    tgt_col = tk.Frame(frow, bg=SURFACE)
+    tgt_col.pack(side='left')
+    tk.Label(tgt_col, text='목표', bg=SURFACE, fg=MUTED,
+             font=('Malgun Gothic', 8)).pack(anchor='e')
+    freq_tgt_lbl = tk.Label(tgt_col, text='--- Hz', bg=SURFACE,
+                            fg=BLUE, font=('Courier New', 16, 'bold'),
+                            width=8, anchor='e')
+    freq_tgt_lbl.pack(anchor='e')
+
+    # ── 목표 수위 카드 (CTkFrame) ─────────────────────
+    tcard = ctk.CTkFrame(bot, fg_color=SURFACE,
+                         border_color=BORDER, border_width=1,
+                         corner_radius=14)
+    tcard.grid(row=0, column=1, padx=8, pady=14, sticky='nsew')
+
+    thdr = tk.Frame(tcard, bg=SURFACE)
+    thdr.pack(anchor='w', padx=14, pady=(10, 1))
+    tk.Label(thdr, text='목표 수위 —', bg=SURFACE,
+             fg=MUTED, font=('Malgun Gothic', 10)).pack(side='left')
+    pct_lbl = tk.Label(thdr, text='70', bg=SURFACE,
+                       fg=BLUE, font=('Courier New', 18, 'bold'))
+    pct_lbl.pack(side='left', padx=(5, 2))
+    tk.Label(thdr, text='%', bg=SURFACE,
+             fg=MUTED, font=('Malgun Gothic', 10)).pack(side='left')
+    tk.Label(thdr, text='50 ~ 90', bg=SURFACE,
+             fg=MUTED, font=('Courier New', 8)).pack(side='right', padx=4)
+
+    tick_f = tk.Frame(tcard, bg=SURFACE)
+    tick_f.pack(fill='x', padx=16)
+    tick_map: dict[int, tk.Label] = {}
+    for v in range(50, 91, 5):
+        lbl = tk.Label(tick_f, text=str(v), bg=SURFACE,
+                       fg=MUTED, font=('Courier New', 8))
+        lbl.pack(side='left', expand=True)
+        tick_map[v] = lbl
+
+    def update_ticks(val: int):
+        for v, lbl in tick_map.items():
+            lbl.configure(
+                fg=BLUE if v == val else MUTED,
+                font=('Courier New', 8, 'bold') if v == val
+                     else ('Courier New', 8),
+            )
+
+    update_ticks(70)
+
+    slider = ctk.CTkSlider(
+        tcard, from_=50, to=90, number_of_steps=8,
+        variable=target_pct_var,
+        button_color=BLUE, button_hover_color='#60a5fa',
+        progress_color=BLUE, fg_color='#1e3a5f', height=18,
+    )
+    slider.pack(fill='x', padx=16, pady=(2, 12))
+
+    def on_slider(val):
+        v = round(float(val) / 5) * 5
+        target_pct_var.set(v)
+        pct_lbl.configure(text=str(v))
+        update_ticks(v)
+        with core.lock:
+            filling  = bool(core.is_filling)
+            calib    = bool(core.calibration_done)
+            d        = float(core.current_diameter)
+            init_air = float(core.init_air_len_cm)
+        if filling and calib and d > 0:
+            ref = init_air if init_air > 0.5 else 15.0
+            core.TARGET_AIR_CM = max(0.5, ref * (1.0 - v / 100.0))
+
+    slider.configure(command=on_slider)
+
+    # ── 버튼 ──────────────────────────────────────────
+    btn_f = tk.Frame(bot, bg='#0a1224')
+    btn_f.grid(row=0, column=2, padx=(8, 16), pady=14)
+
+    def gui_on():
+        with core.lock:
+            if core.is_filling:
+                return
+        pct = target_pct_var.get()
+        with core.lock:
+            init_air = float(core.init_air_len_cm)
+        ref = init_air if init_air > 0.5 else 15.0
+        core.TARGET_AIR_CM = max(0.5, ref * (1.0 - pct / 100.0))
+        core.ensure_audio_stream()
+        core.start_filling_local()
+
+        def _pump():
+            time.sleep(core.NOISE_CALIBRATION_TIME + 0.1)
+            with core.lock:
+                if core.is_filling:
+                    core.solenoid_on()
+                    print('\n>>> 펌프 가동!')
+
+        threading.Thread(target=_pump, daemon=True).start()
+
+    def gui_off():
+        core.solenoid_off()
+        core.stop_filling_local(save_result=True)
+
+    btn_start = ctk.CTkButton(
+        btn_f, text='▶  급수 시작',
+        width=118, height=58,
+        fg_color='#166534', hover_color='#15803d',
+        text_color='#dcfce7',
+        font=('Malgun Gothic', 13, 'bold'),
+        corner_radius=14,
+        command=gui_on,
+    )
+    btn_start.pack(pady=(0, 8))
+
+    btn_stop = ctk.CTkButton(
+        btn_f, text='■  정   지',
+        width=118, height=58,
+        fg_color='#7f1d1d', hover_color='#991b1b',
+        text_color='#fecaca',
+        font=('Malgun Gothic', 13, 'bold'),
+        corner_radius=14,
+        command=gui_off,
+    )
+    btn_stop.pack()
+
+    # ── 종료 ─────────────────────────────────────────
+    def on_close():
+        core.solenoid_off()
+        for obj in (core.audio_stream, ):
+            if obj:
+                try:
+                    obj.stop(); obj.close()
+                except Exception:
+                    pass
+        for obj in (core.sw_on, core.sw_off, core.solenoid):
+            try:
+                obj.close()
+            except Exception:
+                pass
+        app.destroy()
+
+    app.protocol('WM_DELETE_WINDOW', on_close)
+    core.sw_on.when_pressed  = gui_on
+    core.sw_off.when_pressed = gui_off
+
+    # ── 100ms 주기 갱신 ──────────────────────────────
+    def periodic_update():
+        try:
+            DAYS = ['월', '화', '수', '목', '금', '토', '일']
+            n = datetime.datetime.now()
+            clock_lbl.configure(
+                text=(f'{n.year}.{n.month:02d}.{n.day:02d}'
+                      f' ({DAYS[n.weekday()]}) | {n.hour:02d}:{n.minute:02d}')
+            )
+
+            with core.lock:
+                d        = float(core.current_diameter)
+                sf       = float(core.last_stable_f)
+                tf       = float(core.target_freq)
+                air      = float(core.last_current_air)
+                hits     = int(core.consecutive_stop_hits)
+                max_hits = int(core.STOP_TRIGGER_COUNT)
+                filling  = bool(core.is_filling)
+                init_air = float(core.init_air_len_cm)
+                t_mode   = bool(core.tracking_mode)
+                finish   = bool(core.request_finish)
+                init_f   = float(core.initial_stable_freq)
+                r2       = float(core.last_r2)
+                t_inter  = float(core.theory_intercept)
+                snap     = list(core.history_freq_snapshot)
+                if finish:
+                    core.request_finish = False
+
+            # CSV 저장
+            now = time.time()
+            if finish and (now - _last_saved_t[0]) > 2.0:
+                _last_saved_t[0] = now
+                threading.Thread(
+                    target=save_to_csv,
+                    args=(d, init_f, tf, sf),
+                    kwargs=dict(
+                        r2_final=r2, total_samples=len(snap),
+                        theory_intercept=t_inter,
+                        stand_type='filled_box', stand_height_cm=3.0,
+                    ),
+                    daemon=True,
+                ).start()
+
+            # 수위 %
+            fill_pct = 0.0
+            if init_air > 0.5 and air >= 0:
+                fill_pct = max(0.0, min(100.0,
+                               (1.0 - air / init_air) * 100.0))
+
+            cup_canvas.set_fill(fill_pct)
+
+            # 상태 텍스트
+            if not filling:
+                status_lbl.configure(text='대 기  중', fg=CYAN)
+            elif d == 0:
+                status_lbl.configure(text='소음 측정 중 ...', fg=AMBER)
+            elif fill_pct < 3:
+                status_lbl.configure(text='급수 시작 중 ...', fg=GREEN_CLR)
+            else:
+                status_lbl.configure(
+                    text=f'{fill_pct:.1f}%  채워지는 중', fg=GREEN_CLR)
+
+            # 주파수
+            freq_cur_lbl.configure(
+                text=f'{sf:.0f} Hz' if sf > 0 else '--- Hz',
+                fg=GREEN_CLR if t_mode else AMBER,
+            )
+            freq_tgt_lbl.configure(
+                text=f'{tf:.0f} Hz' if tf > 0 else '--- Hz',
+            )
+
+            if sf > 0 and tf > 0:
+                bar_cv.coords(bar_fill, 0, 0, 96 * min(1.0, sf / tf), 7)
+            else:
+                bar_cv.coords(bar_fill, 0, 0, 0, 7)
+
+            if len(hit_dots) != max_hits:
+                rebuild_dots(max_hits)
+            for i, dw in enumerate(hit_dots):
+                dw.configure(fg=BLUE if i < hits else BORDER)
+
+            btn_start.configure(
+                fg_color='#14532d' if filling else '#166534',
+                text_color='#86efac' if filling else '#dcfce7',
+            )
+
+        except Exception as e:
+            print(f'\n[periodic_update 오류] {e}')
+        finally:
+            app.after(100, periodic_update)
+
+    core.solenoid_off()
+    periodic_update()
+    app.mainloop()
+
+
+if __name__ == '__main__':
+    run_kiosk_gui()
