@@ -45,6 +45,7 @@ DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 4.0
 STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
+INIT_AIR_OFFSET_CM = 3.0
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
@@ -108,7 +109,7 @@ TRACKING_EMA_FALL_ALPHA   = 0.35
 FINAL_TRACKING_RISE_ALPHA = 0.45
 
 # ── Hz/청크 속도 제한 ────────────────────────────────────────────────
-RATE_LIMIT_NORMAL_HZ  = 50.0
+RATE_LIMIT_NORMAL_HZ  = 100.0
 RATE_LIMIT_FINAL_HZ   = 300.0
 SPIKE_RATIO_THRESHOLD = 1.15
 
@@ -190,6 +191,7 @@ spike_blocked_count   = 0
 history_freq_snapshot = []
 init_air_len_cm       = 0.0
 _eff_target_air_cm    = 3.0    # TARGET_FILL_PCT → cm 변환값 (내부용)
+init_stable_buffer    = deque(maxlen=10)
 
 peak_lock_floor = 0.0
 
@@ -523,6 +525,7 @@ def _regression_worker():
             # [PCT] init_air 확정 시 _eff_target_air_cm 자동 계산
             if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
                 est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
+                est += INIT_AIR_OFFSET_CM
                 if est > 0.5:
                     init_air_len_cm    = est
                     _eff_target_air_cm = max(0.5, est * (1.0 - TARGET_FILL_PCT / 100.0))
@@ -565,6 +568,7 @@ def start_filling_local() -> None:
     global last_r2, spike_blocked_count, history_freq_snapshot
     global init_air_len_cm, _eff_target_air_cm
     global peak_lock_floor
+    global init_stable_buffer
 
     with lock:
         is_filling              = True
@@ -602,6 +606,7 @@ def start_filling_local() -> None:
         init_air_len_cm         = 0.0
         _eff_target_air_cm      = 3.0   # fallback (init_air 확정 전)
         peak_lock_floor         = 0.0
+        init_stable_buffer      = deque(maxlen=10)   # ← 추가
     print('\n>>> [1단계] 배경 소음 측정 (1초)...')
 
 
@@ -634,6 +639,7 @@ def audio_callback(indata, frames, time_info, status):
     global last_r2, spike_blocked_count, history_freq_snapshot
     global init_air_len_cm, _eff_target_air_cm
     global peak_lock_floor
+    global init_stable_buffer
 
     if not is_filling:
         return
@@ -691,7 +697,7 @@ def audio_callback(indata, frames, time_info, status):
                 dynamic_min_limit = new_floor
 
         if _init > 0 and not tracking_mode:
-            init_floor = _init * 0.95
+            init_floor = _init * 0.85
             if init_floor > dynamic_min_limit:
                 dynamic_min_limit = init_floor
 
@@ -838,7 +844,9 @@ def audio_callback(indata, frames, time_info, status):
             if (filling_elapsed > SPLASH_GUARD_TIME
                     and initial_stable_freq == 0
                     and stable_f > INIT_STABLE_MIN_HZ):
-                initial_stable_freq = stable_f
+                init_stable_buffer.append(stable_f)
+                if len(init_stable_buffer) >= 10:
+                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 75))
 
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
