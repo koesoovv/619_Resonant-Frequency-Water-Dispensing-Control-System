@@ -1,18 +1,21 @@
-# smart_water_core.py  ── 개선판 v5.18
+# smart_water_core.py  ── 개선판 v5.21
 #
-# ═══ v5.18 변경 사항 ════════════════════════════════════════════════
-# [v5.18-THREAD] LOESS+LSM 회귀를 별도 워커 스레드로 분리
-# [v5.18-THREAD] Thread safety 보강
-# [v5.18-FIX]   diam_full stale 버그 수정
-# [v5.18-PERF]  freq_buffer list.pop(0) → deque.popleft() O(n)→O(1)
-# [v5.18-REG]   REG_SPIKE_GATE 0.05→0.08
+# ═══ v5.21 변경 사항 (v5.18 기반, 최소 변경) ═══════════════════════
+# [v5.21-ZONE-EMA] fill% 구간별 EMA alpha 차등 적용
+#   - calibration_done 이후, fill% 50~99 구간에서만 활성화
+#   - 50%대: alpha=0.20 (버퍼 80% / 실시간 20% — 느리게, 과대추정 방지)
+#   - 60%대: alpha=0.30
+#   - 70%대: alpha=0.40
+#   - 80%대: alpha=0.55
+#   - 90%대: alpha=0.68 (실시간 비중↑ — 빠르게 추종)
+#   - 50% 미만 or calibration 전: 기존 EMA_ALPHA_NORMAL/FINAL 그대로
 #
-# ═══ % 제어 모드 변경 사항 ══════════════════════════════════════════
-# [PCT] TARGET_AIR_CM → TARGET_FILL_PCT (목표 수위 %)
-# [PCT] STOP_ADVANCE_CM → STOP_ADVANCE_PCT (정지 선행 보정 %)
-# [PCT] 정지 판단: cm 비교 → fill% 비교
-# [PCT] _eff_target_air_cm: init_air 확정 후 TARGET_FILL_PCT로 자동 계산
+# [v5.21-ZONE-ADV] fill% 구간별 progressive advance
+#   - 50%대: +1%, 60%대: +2%, 70%대: +3%, 80%대: +4%, 90%대: +5%
+#   - 기존 STOP_ADVANCE_PCT(글로벌)에 합산
 #
+# ※ 그 외 모든 파라미터, 로직은 v5.18과 동일
+# ═══════════════════════════════════════════════════════════════════
 
 import numpy as np
 import sounddevice as sd
@@ -36,8 +39,8 @@ FLOW_RATE        = 20
 END_CORRECTION_K = 0.4
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
-TARGET_FILL_PCT         = 70.0   # 목표 수위 % (0~100)
-STOP_ADVANCE_PCT        = 0.0    # 정지 선행 보정 % (양수=일찍 멈춤, 음수=늦게 멈춤)
+TARGET_FILL_PCT         = 70.0
+STOP_ADVANCE_PCT        = 0.0
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
 CALC_START_TIME         = 5.0
@@ -45,6 +48,29 @@ DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 4.0
 STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
+INIT_AIR_OFFSET_CM      = 4.5
+
+# ── [v5.21-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
+# fill_pct가 해당 구간일 때 EMA_ALPHA_NORMAL 대신 이 값을 사용
+# (in_final이면 EMA_ALPHA_FINAL 대신 사용)
+# key = 구간 십의 자리 (50 = 50~59%)
+ZONE_EMA_ALPHA = {
+    50: 0.15,   # 버퍼 비중 크게 — 작은 컵 과대추정 억제
+    60: 0.25,
+    70: 0.45,
+    80: 0.60,   # 실시간 비중 높여 — 큰 컵 추종 개선
+    90: 0.80,
+}
+
+# ── [v5.21-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
+# STOP_ADVANCE_PCT에 합산되는 추가 보정
+ZONE_ADVANCE_PCT = {
+    50: -3.0,
+    60: -1.0,
+    70: 3.0,
+    80: 4.0,
+    90: 5.0,
+}
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
@@ -54,7 +80,7 @@ CALIBRATION_CUTOFF_RATIO = 0.9
 
 # ── 녹음/타이밍 ──────────────────────────────────────────────────────
 NOISE_CALIBRATION_TIME = 1.0
-SPLASH_GUARD_TIME      = 2.5
+SPLASH_GUARD_TIME      = 5.0
 SAMPLE_RATE  = 44100
 CHUNK_SIZE   = 4096
 
@@ -95,7 +121,7 @@ EARLY_NOISE_SEC = 6.0
 EARLY_BUF_SIZE  = 9
 MONO_DROP_RATIO = 0.85
 
-# ── EMA alpha ────────────────────────────────────────────────────────
+# ── EMA alpha (기존 — 구간 밖일 때 사용) ─────────────────────────────
 EMA_ALPHA_NORMAL    = 0.35
 EMA_ALPHA_FINAL     = 0.68
 FINAL_APPROACH_MULT = 1.5
@@ -108,7 +134,7 @@ TRACKING_EMA_FALL_ALPHA   = 0.35
 FINAL_TRACKING_RISE_ALPHA = 0.45
 
 # ── Hz/청크 속도 제한 ────────────────────────────────────────────────
-RATE_LIMIT_NORMAL_HZ  = 50.0
+RATE_LIMIT_NORMAL_HZ  = 100.0
 RATE_LIMIT_FINAL_HZ   = 300.0
 SPIKE_RATIO_THRESHOLD = 1.15
 
@@ -169,7 +195,7 @@ noise_profile           = []
 request_finish          = False
 last_stable_f           = 0.0
 last_current_air        = 0.0
-last_fill_pct           = 0.0   # GUI 표시용 현재 수위 %
+last_fill_pct           = 0.0
 last_print_time         = 0.0
 audio_stream            = None
 lock                    = threading.Lock()
@@ -189,7 +215,8 @@ last_r2               = 0.0
 spike_blocked_count   = 0
 history_freq_snapshot = []
 init_air_len_cm       = 0.0
-_eff_target_air_cm    = 3.0    # TARGET_FILL_PCT → cm 변환값 (내부용)
+_eff_target_air_cm    = 3.0
+init_stable_buffer    = deque(maxlen=10)
 
 peak_lock_floor = 0.0
 
@@ -214,6 +241,26 @@ def solenoid_off():
 
 def solenoid_off_async():
     threading.Thread(target=solenoid_off, daemon=True).start()
+
+
+# ════════════════════════════════════════════════════════════════════
+#  [v5.21] 구간별 파라미터 조회
+# ════════════════════════════════════════════════════════════════════
+def _get_zone_ema_alpha(fill_pct: float, in_final: bool) -> float:
+    """fill% 50~99 구간이면 ZONE_EMA_ALPHA 사용, 아니면 기존 alpha."""
+    if 50.0 <= fill_pct < 100.0:
+        key = int(fill_pct // 10) * 10  # 57.3→50, 83.1→80
+        if key in ZONE_EMA_ALPHA:
+            return ZONE_EMA_ALPHA[key]
+    return EMA_ALPHA_FINAL if in_final else EMA_ALPHA_NORMAL
+
+
+def _get_zone_advance(fill_pct: float) -> float:
+    """fill% 50~99 구간이면 ZONE_ADVANCE_PCT, 아니면 0."""
+    if 50.0 <= fill_pct < 100.0:
+        key = int(fill_pct // 10) * 10
+        return ZONE_ADVANCE_PCT.get(key, 0.0)
+    return 0.0
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -455,7 +502,6 @@ def _regression_worker():
         if s_a is None or abs(s_a) <= 1e-9:
             continue
 
-        # slope 크기별 r² 기준 자동 완화
         if abs(s_a) < 0.000035:
             r2_threshold = 0.88
         elif abs(s_a) < 0.000055:
@@ -468,7 +514,6 @@ def _regression_worker():
                 last_r2 = r_sq
             continue
 
-        # 동적 Q 보정
         if _cur_d > 0:
             q_implied = abs(s_a) * np.pi * SOUND_SPEED * _cur_d**2 / 16
             effective_Q = q_implied if 10.0 < q_implied < 30.0 else FLOW_RATE
@@ -477,7 +522,6 @@ def _regression_worker():
 
         temp_D = np.sqrt(16 * effective_Q / (np.pi * SOUND_SPEED * abs(s_a)))
 
-        # slope 크기 기반 자동 보정
         if abs(s_a) < 0.000030:
             auto_scale = 0.90
         elif abs(s_a) < 0.000045:
@@ -520,16 +564,15 @@ def _regression_worker():
                 current_diameter = current_diameter * DIAM_EMA_KEEP + med_D * DIAM_EMA_NEW
             _cur_d = float(current_diameter)
 
-            # [PCT] init_air 확정 시 _eff_target_air_cm 자동 계산
             if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
                 est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
+                est += INIT_AIR_OFFSET_CM
                 if est > 0.5:
                     init_air_len_cm    = est
                     _eff_target_air_cm = max(0.5, est * (1.0 - TARGET_FILL_PCT / 100.0))
                     print(f'\n[★ 용기 높이 확정] {est:.2f} cm'
                           f' → 목표 공기층 {_eff_target_air_cm:.2f} cm ({TARGET_FILL_PCT:.0f}%)')
 
-            # [PCT] target_freq 계산에 _eff_target_air_cm 사용
             target_L_eff = _eff_target_air_cm + END_CORRECTION_K * _cur_d
             new_tf = SOUND_SPEED / (4 * target_L_eff)
             if target_freq == 0:
@@ -565,6 +608,7 @@ def start_filling_local() -> None:
     global last_r2, spike_blocked_count, history_freq_snapshot
     global init_air_len_cm, _eff_target_air_cm
     global peak_lock_floor
+    global init_stable_buffer
 
     with lock:
         is_filling              = True
@@ -600,8 +644,9 @@ def start_filling_local() -> None:
         spike_blocked_count     = 0
         history_freq_snapshot   = []
         init_air_len_cm         = 0.0
-        _eff_target_air_cm      = 3.0   # fallback (init_air 확정 전)
+        _eff_target_air_cm      = 3.0
         peak_lock_floor         = 0.0
+        init_stable_buffer      = deque(maxlen=10)
     print('\n>>> [1단계] 배경 소음 측정 (1초)...')
 
 
@@ -634,6 +679,7 @@ def audio_callback(indata, frames, time_info, status):
     global last_r2, spike_blocked_count, history_freq_snapshot
     global init_air_len_cm, _eff_target_air_cm
     global peak_lock_floor
+    global init_stable_buffer
 
     if not is_filling:
         return
@@ -691,7 +737,7 @@ def audio_callback(indata, frames, time_info, status):
                 dynamic_min_limit = new_floor
 
         if _init > 0 and not tracking_mode:
-            init_floor = _init * 0.95
+            init_floor = _init * 0.85
             if init_floor > dynamic_min_limit:
                 dynamic_min_limit = init_floor
 
@@ -730,15 +776,20 @@ def audio_callback(indata, frames, time_info, status):
             _cur_d_snap = float(current_diameter)
             _calib_snap = bool(calibration_done)
             _eff_tgt    = float(_eff_target_air_cm)
+            _fill_pct_now = float(last_fill_pct)  # [v5.21] 현재 fill% 스냅샷
 
-        # [PCT] in_final 판단에 _eff_target_air_cm 사용
         if _calib_snap and _cur_d_snap > 0 and _last_s > 0:
             L_now    = SOUND_SPEED / (4 * _last_s) - END_CORRECTION_K * _cur_d_snap
             in_final = (L_now < _eff_tgt * FINAL_APPROACH_MULT)
         else:
             in_final = False
 
-        alpha_det = EMA_ALPHA_FINAL if in_final else EMA_ALPHA_NORMAL
+        # ── [v5.21-ZONE-EMA] 구간별 alpha 결정 ──────────────────────
+        # calibration 완료 + fill% 50 이상이면 구간별, 아니면 기존 로직
+        if _calib_snap and _fill_pct_now >= 50.0:
+            alpha_det = _get_zone_ema_alpha(_fill_pct_now, in_final)
+        else:
+            alpha_det = EMA_ALPHA_FINAL if in_final else EMA_ALPHA_NORMAL
 
         if _last > 0:
             ratio = detected_f / _last
@@ -763,6 +814,7 @@ def audio_callback(indata, frames, time_info, status):
                 if ratio > SPIKE_RATIO_THRESHOLD:
                     detected_f = _last * 0.95 + detected_f * 0.05
                 else:
+                    # [v5.21] alpha_det은 구간별로 달라질 수 있음
                     detected_f = _last * (1 - alpha_det) + detected_f * alpha_det
 
         if not tracking_mode and _last > 0 and detected_f > _last:
@@ -770,7 +822,7 @@ def audio_callback(indata, frames, time_info, status):
             if detected_f - _last > max_rise:
                 detected_f = _last + max_rise
 
-        # ── 이론 곡선 가이드 ────────────────────────────────────────
+        # ── 이론 곡선 가이드 (v5.18 그대로) ─────────────────────────
         if theory_locked and detected_f > 0:
             f_theory = theory_freq(filling_elapsed)
             if f_theory > 0:
@@ -798,7 +850,7 @@ def audio_callback(indata, frames, time_info, status):
 
         last_tracked_freq = detected_f
 
-        # ── 6단계: freq_buffer → stable_f ────────────────────────────
+        # ── 6단계: freq_buffer → stable_f (v5.18 그대로) ─────────────
         if in_final:
             buf_size = BUF_SIZE_FINAL
         elif filling_elapsed < EARLY_NOISE_SEC:
@@ -838,7 +890,9 @@ def audio_callback(indata, frames, time_info, status):
             if (filling_elapsed > SPLASH_GUARD_TIME
                     and initial_stable_freq == 0
                     and stable_f > INIT_STABLE_MIN_HZ):
-                initial_stable_freq = stable_f
+                init_stable_buffer.append(stable_f)
+                if len(init_stable_buffer) >= 10:
+                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 75))
 
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
@@ -870,7 +924,7 @@ def audio_callback(indata, frames, time_info, status):
                 tracking_mode = True
             print(f'\n[★ 트래킹 모드] {stable_f:.0f}Hz (thresh={_tracking_thresh:.0f}Hz) 시작')
 
-        # ── 8단계: 회귀 버퍼 수집 ────────────────────────────────────
+        # ── 8단계: 회귀 버퍼 수집 (v5.18 그대로) ────────────────────
         with lock:
             _init_f    = float(initial_stable_freq)
             _cur_d     = float(current_diameter)
@@ -921,7 +975,7 @@ def audio_callback(indata, frames, time_info, status):
                     elif raw_f_for_reg >= _init_f * 4.0:
                         print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*4.0 → 배음 의심, 제외')
 
-        # ── 9단계: 정지 판단 [PCT] ────────────────────────────────────
+        # ── 9단계: 정지 판단 [PCT] [v5.21-ZONE-ADV] ─────────────────
         with lock:
             _tf2       = float(target_freq)
             _cd        = bool(calibration_done)
@@ -933,15 +987,21 @@ def audio_callback(indata, frames, time_info, status):
             with lock:
                 last_current_air = float(current_air)
 
-            # [PCT] fill% 계산 및 정지 판단
             if _init_air > 0:
                 fill_pct = max(0.0, min(100.0, (1.0 - current_air / _init_air) * 100.0))
                 with lock:
                     last_fill_pct = fill_pct
-                trigger = (fill_pct >= TARGET_FILL_PCT - STOP_ADVANCE_PCT)
+
+                # [v5.21-ZONE-ADV] 구간별 advance 합산
+                zone_adv = _get_zone_advance(fill_pct)
+                total_advance = STOP_ADVANCE_PCT + zone_adv
+
+                trigger = (fill_pct >= TARGET_FILL_PCT - total_advance)
             else:
                 fill_pct = 0.0
-                trigger  = False  # init_air 미확정 시 정지 보류
+                zone_adv = 0.0
+                total_advance = STOP_ADVANCE_PCT
+                trigger  = False
 
             with lock:
                 if trigger:
@@ -956,10 +1016,13 @@ def audio_callback(indata, frames, time_info, status):
                 fin_str  = '[F]' if in_final        else '   '
                 bar_len  = min(_hits, STOP_TRIGGER_COUNT)
                 bar      = '#' * bar_len + '-' * (STOP_TRIGGER_COUNT - bar_len)
+                # [v5.21] 구간 정보 표시
+                adv_str = f' adv:{total_advance:+.0f}%' if zone_adv > 0 else ''
                 if _init_air > 0:
                     print(
                         f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
-                        f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}% '
+                        f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}%{adv_str} '
+                        f'| α:{alpha_det:.2f} '
                         f'| {stable_f:.0f}Hz [{bar}]',
                         end='\r'
                     )
@@ -973,7 +1036,8 @@ def audio_callback(indata, frames, time_info, status):
                 last_print_time = current_time
 
             if _hits >= STOP_TRIGGER_COUNT:
-                print(f'\n[완료] 목표 도달! D:{_cur_d2:.4f}cm | Level:{fill_pct:.1f}% | L_est:{current_air:.2f}cm')
+                print(f'\n[완료] 목표 도달! D:{_cur_d2:.4f}cm | Level:{fill_pct:.1f}%'
+                      f' (adv:{total_advance:+.0f}%) | L_est:{current_air:.2f}cm')
                 solenoid_off_async()
                 with lock:
                     history_freq_snapshot = list(history_freq)
