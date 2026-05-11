@@ -79,7 +79,7 @@ FREQ_MIN_LIMIT           = 300
 CALIBRATION_CUTOFF_RATIO = 0.9
 
 # ── 녹음/타이밍 ──────────────────────────────────────────────────────
-NOISE_CALIBRATION_TIME = 1.0
+NOISE_CALIBRATION_TIME = 2.5
 SPLASH_GUARD_TIME      = 5.0
 SAMPLE_RATE  = 44100
 CHUNK_SIZE   = 4096
@@ -892,7 +892,7 @@ def audio_callback(indata, frames, time_info, status):
                     and stable_f > INIT_STABLE_MIN_HZ):
                 init_stable_buffer.append(stable_f)
                 if len(init_stable_buffer) >= 10:
-                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 75))
+                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
 
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
