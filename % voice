@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""
+voice_module.py  ─ 음성인식 모듈
+=================================
+silero-VAD + Google STT + 상태머신
+
+담당:
+  - 마이크 입력 / VAD / STT
+  - 상태머신 (SLEEP → 위치 → 급수)
+  - TTS 출력
+  - ESP32 컵 위치 HTTP 통신
+  - 초음파 도착 감지
+  - 정수기 위치 안내 시 0001.mp3 반복 재생 (도착 시 즉시 정지)
+  - 목표 수위 설정 시 smart_water_core.TARGET_FILL_PCT + GUI 반영
+"""
+
+import re
+import time
+import os
+import signal
+import asyncio
+import subprocess
+import shutil
+import collections
+import threading
+
+import sounddevice as sd
+import numpy as np
+import torch
+import edge_tts
+import speech_recognition as sr
+import noisereduce as nr
+import requests
+
+# ════════════════════════════════════════════════════════════════════
+#  설정
+# ════════════════════════════════════════════════════════════════════
+
+VOICE_MIC_DEVICE  = None
+VOICE_SAMPLE_RATE = 16000
+VOICE_CHANNELS    = 1
+VAD_CHUNK_MS      = 32
+VAD_CHUNK_SIZE    = int(VOICE_SAMPLE_RATE * VAD_CHUNK_MS / 1000)
+
+VAD_THRESHOLD  = 0.60
+PRE_ROLL_MS    = 500
+SPEECH_PAD_MS  = 800
+MIN_SPEECH_MS  = 300
+MAX_WAKE_SEC   = 3.0
+MAX_CMD_SEC    = 6.0
+
+MIN_RMS_FOR_STT = 0.004
+NOISE_REDUCE    = True
+TARGET_RMS      = 0.08
+MAX_GAIN        = 10.0
+
+LOCATION_TIMEOUT   = 12.0
+CUP_FOUND_TIMEOUT  = 40.0
+CUP_POLL_INTERVAL  = 0.5
+ARRIVAL_TIMEOUT    = 40.0
+LEVEL_TIMEOUT      = 20.0
+READY_TIMEOUT      = 20.0
+POUR_LISTEN_SEC    = 2.0
+
+ULTRASONIC_TRIG_GPIO = 20
+ULTRASONIC_ECHO_GPIO = 21
+ARRIVED_DISTANCE_CM  = 30.0
+ARRIVED_CONFIRM_CNT  = 2
+ULTRASONIC_TIMEOUT   = 0.02
+
+CUP_LOCATOR_URL = 'http://192.168.0.51'
+
+USE_TTS      = True
+TTS_VOICE    = 'ko-KR-SunHiNeural'
+TTS_RATE     = '+10%'
+TTS_VOLUME   = '+10%'
+TTS_PITCH    = '+0Hz'
+TTS_FILE     = '/tmp/tts_output.mp3'
+TTS_COOLDOWN = 1.0
+
+DISPENSER_SOUND_PATH = '/home/kimcapybara/venv/HI/0001.mp3'
+
+DEBUG = True
+
+# ── 정수기 안내 음원 제어 ─────────────────────────────────────────────
+_dispenser_sound_stop = threading.Event()
+_dispenser_proc       = None
+_shutdown = threading.Event()
+
+# ════════════════════════════════════════════════════════════════════
+#  상태 정의
+# ════════════════════════════════════════════════════════════════════
+
+MODE_SLEEP                  = 'SLEEP'
+MODE_LOCATION_COMMAND       = 'LOCATION_COMMAND'
+MODE_WAIT_CUP_FOUND         = 'WAIT_CUP_FOUND'
+MODE_WAIT_DISPENSER_ARRIVAL = 'WAIT_DISPENSER_ARRIVAL'
+MODE_SELECT_LEVEL           = 'SELECT_LEVEL'
+MODE_READY_TO_POUR          = 'READY_TO_POUR'
+MODE_POURING                = 'POURING'
+
+# ════════════════════════════════════════════════════════════════════
+#  키워드
+# ════════════════════════════════════════════════════════════════════
+
+WAKE_WORDS = [
+    '지니야', '진이야', '지니아', '진희야', '제니야',
+    '지니', '지니어', '지니 야', '도비야', '우석아','가희야'
+]
+KW_DISPENSER = ['정수기', '정숙이', '경숙이', '정수경', '저기', '전국이', '정국이']
+KW_CUP       = ['컵', '겁', '껍', 'cup']
+KW_LOCATION  = [
+    '어디', '위치', '찾아', '안내', '알려', '어딨',
+    '어디야', '어디있', '어디에', '어딘', '어디서',
+    '찾아줘', '알려줘', '안내해', '있어',
+]
+KW_START = [
+    '시작', '틀어', '받아', '나와', '줘',
+    '시작해', '틀어줘', '받아줘', '나와라',
+    '해줘', '해 줘', '부어', '부어줘', '따라', '따라줘',
+    '채워', '채워줘', '내놔',
+]
+KW_STOP    = ['멈춰', '정지', '그만', '꺼', '중지', '스톱', 'stop',
+              '멈춰줘', '꺼줘', '그만해', '중지해']
+KW_WATER   = ['물', '급수']
+KW_ARRIVAL = ['도착', '왔어', '도착했어', '정수기 왔어',
+               '정수기 도착', '앞이야', '앞에 왔어', '도착 완료']
+KW_CANCEL  = ['취소', '종료', '그만할래', '처음으로', '나가기', '안먹을래', '시발','미친 새끼야',]
+LEVEL_WORD_MAP = {
+    '반만': 50, '반절': 50, '절반': 50,
+    '가득': 90, '꽉': 90, '풀': 90,
+}
+
+# ════════════════════════════════════════════════════════════════════
+#  로그
+# ════════════════════════════════════════════════════════════════════
+
+def ts():
+    return time.strftime('%H:%M:%S')
+
+def log_info(msg):  print(f'  [{ts()}] {msg}',       flush=True)
+def log_dbg(msg):   print(f'  [{ts()}] [DBG] {msg}', flush=True)
+
+def log_result(label, detail=''):
+    extra = f' -> {detail}' if detail else ''
+    print(f'  [RESULT] [{ts()}] {label}{extra}', flush=True)
+
+def log_header(title):
+    print(flush=True)
+    print('-' * 60, flush=True)
+    print(f'  {title}', flush=True)
+    print('-' * 60, flush=True)
+
+# ════════════════════════════════════════════════════════════════════
+#  초음파 센서
+# ════════════════════════════════════════════════════════════════════
+
+_GPIO_READY = False
+_trig_pin   = None
+_echo_pin   = None
+
+
+def _init_ultrasonic():
+    global _GPIO_READY, _trig_pin, _echo_pin
+    if _GPIO_READY:
+        return
+    try:
+        from gpiozero import OutputDevice as _OD, InputDevice as _ID
+        _trig_pin   = _OD(ULTRASONIC_TRIG_GPIO, initial_value=False)
+        _echo_pin   = _ID(ULTRASONIC_ECHO_GPIO, pull_up=False)
+        _GPIO_READY = True
+        log_info(f'초음파 GPIO 초기화 완료 (TRIG={ULTRASONIC_TRIG_GPIO}, ECHO={ULTRASONIC_ECHO_GPIO})')
+    except Exception as e:
+        log_info(f'[WARN] 초음파 GPIO 초기화 실패: {e}')
+
+
+def _measure_distance_cm() -> float:
+    if not _GPIO_READY or _trig_pin is None or _echo_pin is None:
+        return 9999.0
+    try:
+        _trig_pin.off()
+        time.sleep(0.000002)
+        _trig_pin.on()
+        time.sleep(0.00001)
+        _trig_pin.off()
+
+        t0 = time.time()
+        while not _echo_pin.value:
+            if time.time() - t0 > ULTRASONIC_TIMEOUT:
+                return 9999.0
+        echo_start = time.time()
+
+        while _echo_pin.value:
+            if time.time() - echo_start > ULTRASONIC_TIMEOUT:
+                return 9999.0
+        echo_end = time.time()
+
+        return round((echo_end - echo_start) * 34300.0 / 2.0, 1)
+    except Exception as e:
+        log_dbg(f'초음파 측정 오류: {e}')
+        return 9999.0
+
+
+def is_dispenser_arrived() -> bool:
+    hit = 0
+    for _ in range(ARRIVED_CONFIRM_CNT):
+        dist = _measure_distance_cm()
+        if DEBUG:
+            log_dbg(f'초음파 거리: {dist:.1f} cm')
+        if dist <= ARRIVED_DISTANCE_CM:
+            hit += 1
+        time.sleep(0.05)
+    arrived = hit >= ARRIVED_CONFIRM_CNT
+    if arrived:
+        log_result('정수기 도착 감지', f'초음파 {hit}/{ARRIVED_CONFIRM_CNT}회 확인')
+    return arrived
+
+# ════════════════════════════════════════════════════════════════════
+#  GUI 제어 브릿지
+# ════════════════════════════════════════════════════════════════════
+
+_gui_on_cb    = None
+_gui_off_cb   = None
+_gui_level_cb = None   # 수위 설정 시 GUI 슬라이더 갱신용 콜백
+
+
+def register_gui_callbacks(on_cb, off_cb):
+    global _gui_on_cb, _gui_off_cb
+    _gui_on_cb  = on_cb
+    _gui_off_cb = off_cb
+
+
+def register_gui_level_callback(cb):
+    """GUI 슬라이더 갱신 콜백 등록. gui_app.py 에서 호출."""
+    global _gui_level_cb
+    _gui_level_cb = cb
+
+
+def voice_start_water():
+    import smart_water_core as core
+    with core.lock:
+        if core.is_filling:
+            log_info('[급수] 이미 급수 중 — 시작 무시')
+            return
+    if _gui_on_cb:
+        _gui_on_cb()
+    else:
+        core.ensure_audio_stream()
+        core.start_filling_local()
+        def _delayed():
+            time.sleep(core.NOISE_CALIBRATION_TIME + 0.1)
+            with core.lock:
+                still = bool(core.is_filling)
+            if still:
+                core.solenoid_on()
+        threading.Thread(target=_delayed, daemon=True).start()
+    log_info('[급수] 시작 요청')
+
+
+def voice_stop_water():
+    import smart_water_core as core
+    if _gui_off_cb:
+        _gui_off_cb()
+    else:
+        core.solenoid_off()
+        core.stop_filling_local(save_result=True)
+    log_info('[급수] 정지 요청')
+
+
+def is_water_target_reached() -> bool:
+    import smart_water_core as core
+    with core.lock:
+        return bool(core.request_finish)
+
+# ════════════════════════════════════════════════════════════════════
+#  ESP32 컵 위치 알림
+# ════════════════════════════════════════════════════════════════════
+
+def cup_locator_start():
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/start', timeout=2)
+        log_info(f'컵 위치 알림 시작 요청: {r.status_code}')
+        return r.status_code == 200
+    except Exception as e:
+        log_info(f'컵 위치 알림 시작 실패: {e}')
+        return False
+
+def cup_locator_stop():
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/stop', timeout=2)
+        log_info(f'컵 위치 알림 정지 요청: {r.status_code}')
+        return r.status_code == 200
+    except Exception as e:
+        log_info(f'컵 위치 알림 정지 실패: {e}')
+        return False
+
+def cup_locator_reset():
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/reset', timeout=2)
+        return r.status_code == 200
+    except Exception as e:
+        log_info(f'컵 위치 상태 초기화 실패: {e}')
+        return False
+
+def is_cup_found() -> bool:
+    try:
+        r = requests.get(CUP_LOCATOR_URL + '/api/status', timeout=2)
+        if r.status_code != 200:
+            return False
+        status = r.json()
+        if DEBUG:
+            log_dbg(f'컵 위치 알림 상태: {status}')
+        return bool(status.get('cup_found', False))
+    except Exception as e:
+        log_info(f'컵 위치 상태 확인 실패: {e}')
+        return False
+
+# ════════════════════════════════════════════════════════════════════
+#  TTS + 음원 재생
+# ════════════════════════════════════════════════════════════════════
+
+async def _make_tts(text: str):
+    comm = edge_tts.Communicate(
+        text=text, voice=TTS_VOICE,
+        rate=TTS_RATE, volume=TTS_VOLUME, pitch=TTS_PITCH,
+    )
+    await comm.save(TTS_FILE)
+
+
+def speak(text: str):
+    log_info(f'[TTS] "{text}"')
+    if not USE_TTS:
+        return
+    try:
+        asyncio.run(_make_tts(text))
+        subprocess.run(
+            ['ffmpeg', '-y', '-i', TTS_FILE, '-f', 'alsa', 'plughw:4,0'],
+            timeout=15,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(TTS_FILE):
+            os.remove(TTS_FILE)
+    except Exception as e:
+        log_info(f'TTS 오류: {e}')
+
+
+def _play_sound_once(path: str):
+    global _dispenser_proc
+    try:
+        _dispenser_proc = subprocess.Popen(
+            ['ffmpeg', '-y', '-i', path, '-f', 'alsa', 'plughw:4,0'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+        _dispenser_proc.wait()
+    except Exception as e:
+        log_info(f'[WARN] 음원 재생 실패: {e}')
+    finally:
+        _dispenser_proc = None
+
+
+def action_dispenser_location():
+    """0001.mp3 를 도착할 때까지 반복 재생 (별도 스레드)."""
+    log_result('정수기 위치 안내 실행')
+    _dispenser_sound_stop.clear()
+
+    def _loop():
+        while not _dispenser_sound_stop.is_set():
+            if not os.path.exists(DISPENSER_SOUND_PATH):
+                log_info(f'[WARN] 음원 파일 없음: {DISPENSER_SOUND_PATH}')
+                break
+            _play_sound_once(DISPENSER_SOUND_PATH)
+            if not _dispenser_sound_stop.is_set():
+                time.sleep(0.2)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def stop_dispenser_sound():
+    """ffmpeg 프로세스를 프로세스 그룹 단위로 즉시 강제 종료."""
+    global _dispenser_proc
+    _dispenser_sound_stop.set()
+
+    proc = _dispenser_proc
+    if proc and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception as e:
+            log_dbg(f'음원 강제 종료 오류: {e}')
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+    _dispenser_proc = None
+    time.sleep(0.3)
+    log_info('[SOUND] 정수기 안내 음원 즉시 정지')
+
+
+def action_cup_location():
+    log_result('컵 위치 안내 실행')
+    cup_locator_reset()
+    cup_locator_start()
+
+
+def set_water_level(percent: int):
+    """
+    목표 수위를 설정한다.
+    1) smart_water_core.TARGET_FILL_PCT 반영
+    2) GUI 슬라이더/표시 갱신 콜백 호출
+    """
+    import smart_water_core as core
+    core.TARGET_FILL_PCT = float(percent)
+    log_info(f'[CORE] TARGET_FILL_PCT → {percent}%')
+
+    # GUI 슬라이더 동기화 (메인 스레드 안전하게 호출)
+    if _gui_level_cb:
+        try:
+            _gui_level_cb(float(percent))
+        except Exception as e:
+            log_dbg(f'GUI 레벨 콜백 오류: {e}')
+
+# ════════════════════════════════════════════════════════════════════
+#  오디오 처리 (음성인식용)
+# ════════════════════════════════════════════════════════════════════
+
+def rms(audio):
+    if audio is None or audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(audio ** 2)))
+
+
+def clean_audio(audio):
+    cleaned = audio.copy()
+    if NOISE_REDUCE:
+        try:
+            cleaned = nr.reduce_noise(
+                y=cleaned, sr=VOICE_SAMPLE_RATE,
+                stationary=False, prop_decrease=0.35,
+                n_fft=512, hop_length=128,
+            )
+        except Exception as e:
+            log_dbg(f'noisereduce 오류: {e}')
+    r = rms(cleaned)
+    if r > 0.0001:
+        cleaned = np.clip(cleaned * min(TARGET_RMS / r, MAX_GAIN), -1.0, 1.0)
+    return cleaned.astype(np.float32)
+
+
+def collect_speech(stream, vad_model, max_seconds):
+    if max_seconds <= 0:
+        return None
+    pre_roll_n = max(1, int(PRE_ROLL_MS   / VAD_CHUNK_MS))
+    pad_n      = max(1, int(SPEECH_PAD_MS / VAD_CHUNK_MS))
+    min_n      = max(1, int(MIN_SPEECH_MS / VAD_CHUNK_MS))
+    max_chunks = int(max_seconds * 1000 / VAD_CHUNK_MS)
+
+    pre_roll      = collections.deque(maxlen=pre_roll_n)
+    speech_frames = []
+    speaking      = False
+    silence_cnt   = 0
+
+    vad_model.reset_states()
+    for _ in range(max_chunks):
+        try:
+            data, _ = stream.read(VAD_CHUNK_SIZE)
+        except Exception:
+            break
+        chunk = (data[:, 0] if data.ndim > 1 else data.flatten()).astype(np.float32)
+        prob  = vad_model(torch.from_numpy(chunk), VOICE_SAMPLE_RATE).item()
+
+        if not speaking:
+            pre_roll.append(chunk.copy())
+            if prob >= VAD_THRESHOLD:
+                speaking    = True
+                silence_cnt = 0
+                speech_frames.extend(list(pre_roll))
+                log_dbg(f'음성 감지 ({prob:.0%})')
+        else:
+            speech_frames.append(chunk.copy())
+            if prob >= VAD_THRESHOLD:
+                silence_cnt = 0
+            else:
+                silence_cnt += 1
+                if silence_cnt >= pad_n:
+                    break
+
+    vad_model.reset_states()
+    if not speech_frames or len(speech_frames) < min_n:
+        return None
+    audio = np.concatenate(speech_frames)
+    if rms(audio) < MIN_RMS_FOR_STT:
+        return None
+    return audio
+
+
+_recognizer = sr.Recognizer()
+
+
+def transcribe_google(audio_np):
+    if audio_np is None or audio_np.size == 0:
+        return ''
+    cleaned = clean_audio(audio_np)
+    try:
+        audio_data = sr.AudioData(
+            (cleaned * 32767).astype(np.int16).tobytes(),
+            VOICE_SAMPLE_RATE, 2,
+        )
+        text = _recognizer.recognize_google(audio_data, language='ko-KR')
+        log_dbg(f'Google STT: "{text}"')
+        return text.strip()
+    except sr.UnknownValueError:
+        return ''
+    except sr.RequestError as e:
+        log_info(f'[WARN] STT 네트워크 오류: {e}')
+        return ''
+    except Exception as e:
+        log_info(f'[ERROR] STT 오류: {e}')
+        return ''
+
+
+def listen_text(stream, vad_model, max_seconds):
+    audio = collect_speech(stream, vad_model, max_seconds)
+    if audio is None:
+        return ''
+    text = transcribe_google(audio)
+    if text:
+        log_info(f'[STT] 인식됨: "{text}"')
+    return text
+
+# ════════════════════════════════════════════════════════════════════
+#  ReSpeaker 자동 감지
+# ════════════════════════════════════════════════════════════════════
+
+def find_respeaker_device():
+    keywords = ['respeaker', 'seeed', 'xmos', 'xu316']
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev['max_input_channels'] > 0:
+            for kw in keywords:
+                if kw in dev['name'].lower():
+                    return idx, dev['name']
+    return None, None
+
+# ════════════════════════════════════════════════════════════════════
+#  명령 판정
+# ════════════════════════════════════════════════════════════════════
+
+def _contains_any(text, keywords):
+    return any(kw in text for kw in keywords)
+
+def _norm(text):
+    return text.lower().replace(' ', '')
+
+def check_wake_word(text):
+    n     = _norm(text)
+    clean = re.sub(r'[^\w]', '', text)
+    if len(clean) < 2:
+        return False
+    return any(_norm(w) in n for w in WAKE_WORDS)
+
+def detect_stop_command(text):
+    return _contains_any(_norm(text), [_norm(k) for k in KW_STOP])
+
+def detect_cancel_command(text):
+    return _contains_any(_norm(text), [_norm(k) for k in KW_CANCEL])
+
+def detect_location_command(text):
+    t             = _norm(text)
+    has_dispenser = _contains_any(t, [_norm(k) for k in KW_DISPENSER])
+    has_cup       = _contains_any(t, [_norm(k) for k in KW_CUP])
+    has_location  = _contains_any(t, [_norm(k) for k in KW_LOCATION])
+    if has_cup and not has_dispenser:
+        return 'CUP_LOCATION',       text, 1.0 if has_location else 0.8
+    if has_dispenser and has_location:
+        return 'DISPENSER_LOCATION', text, 1.0
+    if has_dispenser:
+        return 'DISPENSER_LOCATION', text, 0.8
+    return 'UNKNOWN', text, 0.0
+
+def detect_arrival_command(text):
+    return _contains_any(_norm(text), [_norm(k) for k in KW_ARRIVAL])
+
+def detect_level_command(text):
+    t = _norm(text)
+    m = re.search(r'(\d+)\s*(%|퍼센트|프로)', text)
+    if m:
+        lvl = int(m.group(1))
+        if 0 < lvl <= 100:
+            return True, lvl
+    m = re.search(r'\b(\d{1,3})\b', text)
+    if m:
+        lvl = int(m.group(1))
+        if 0 < lvl <= 100:
+            return True, lvl
+    for word, lvl in LEVEL_WORD_MAP.items():
+        if _norm(word) in t:
+            return True, lvl
+    return False, None
+
+def detect_pour_start_command(text):
+    t       = _norm(text)
+    directs = ['물줘','물따라줘','물받아줘','물틀어줘',
+               '급수시작','급수해줘','따라줘','받아줘']
+    if _contains_any(t, [_norm(k) for k in directs]):
+        return True
+    return (_contains_any(t, [_norm(k) for k in KW_WATER]) and
+            _contains_any(t, [_norm(k) for k in KW_START]))
+
+# ════════════════════════════════════════════════════════════════════
+#  음성인식 메인 루프
+# ════════════════════════════════════════════════════════════════════
+
+def voice_loop():
+    log_info('silero-VAD 로드 중...')
+    vad_model, _ = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad',
+        model='silero_vad',
+        force_reload=False,
+        trust_repo=True,
+    )
+    log_info('silero-VAD 로드 완료')
+
+    mic_idx, mic_name = find_respeaker_device()
+    if VOICE_MIC_DEVICE is not None:
+        mic_idx  = VOICE_MIC_DEVICE
+        mic_name = '수동 설정'
+    log_info(f'마이크: [{mic_idx}] {mic_name}' if mic_idx is not None else '마이크: 기본 장치')
+
+    stream = sd.InputStream(
+        samplerate=VOICE_SAMPLE_RATE,
+        channels=VOICE_CHANNELS,
+        dtype='float32',
+        device=mic_idx,
+        blocksize=VAD_CHUNK_SIZE,
+    )
+    stream.start()
+    log_info('음성인식 오디오 스트림 시작')
+
+    _init_ultrasonic()
+
+    mode             = MODE_SLEEP
+    selected_level   = None
+    state_start_time = time.time()
+    last_tts_time    = 0.0
+    header_printed   = False
+    stt_fail_count   = 0
+
+    def change_mode(new_mode):
+        nonlocal mode, state_start_time, header_printed, stt_fail_count
+        mode             = new_mode
+        state_start_time = time.time()
+        header_printed   = False
+        stt_fail_count   = 0
+
+    def tts(text):
+        nonlocal last_tts_time
+        speak(text)
+        last_tts_time = time.time()
+
+    try:
+        while True:
+            if _shutdown.is_set():         # 
+                log_info('음성인식 루프 종료')  #
+                break                       #
+            if time.time() - last_tts_time < TTS_COOLDOWN:
+                time.sleep(0.05)
+                continue
+
+            now           = time.time()
+            elapsed_state = now - state_start_time
+
+            # ── SLEEP ─────────────────────────────────────────────────
+            if mode == MODE_SLEEP:
+                if not header_printed:
+                    log_header('절전모드 - "지니야"라고 말하면 시작합니다')
+                    header_printed = True
+                text = listen_text(stream, vad_model, MAX_WAKE_SEC)
+                if not text:
+                    continue
+                if check_wake_word(text):
+                    log_result('호출어 인식 성공', f'"{text}"')
+                    tts('무엇을 찾을까요? 정수기 위치 또는 컵 위치를 말해주세요')
+                    change_mode(MODE_LOCATION_COMMAND)
+                else:
+                    log_info(f'호출어 아님: "{text}"')
+
+            # ── LOCATION_COMMAND ───────────────────────────────────────
+            elif mode == MODE_LOCATION_COMMAND:
+                if not header_printed:
+                    log_header('위치 선택 대기 - 정수기 위치 또는 컵 위치를 말하세요')
+                    header_printed = True
+                if elapsed_state > LOCATION_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                cmd, _, _ = detect_location_command(text)
+                if cmd == 'CUP_LOCATION':
+                    log_result('명령 인식: 컵 위치', f'"{text}"')
+                    tts('컵 위치를 안내합니다. 컵을 찾으면 자동으로 정수기 위치 안내를 시작합니다')
+                    action_cup_location()
+                    change_mode(MODE_WAIT_CUP_FOUND)
+                elif cmd == 'DISPENSER_LOCATION':
+                    log_result('명령 인식: 정수기 위치', f'"{text}"')
+                    tts('정수기 위치를 안내합니다')
+                    action_dispenser_location()
+                    change_mode(MODE_WAIT_DISPENSER_ARRIVAL)
+                else:
+                    stt_fail_count += 1
+                    log_info(f'위치 명령 아님: "{text}"')
+                    if stt_fail_count >= 2:
+                        tts('정수기 위치 또는 컵 위치 중 하나를 말해주세요')
+                        stt_fail_count = 0
+
+            # ── WAIT_CUP_FOUND ─────────────────────────────────────────
+            elif mode == MODE_WAIT_CUP_FOUND:
+                if not header_printed:
+                    log_header('컵 찾기 대기 - ESP32 컵 위치 알림 동작 중')
+                    header_printed = True
+                if elapsed_state > CUP_FOUND_TIMEOUT:
+                    cup_locator_stop()
+                    tts('컵 찾기 시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                if is_cup_found():
+                    log_result('컵 찾음 확인', 'ESP32 초음파 감지 완료')
+                    cup_locator_reset()
+                    tts('컵을 찾았습니다. 정수기 위치를 안내합니다')
+                    action_dispenser_location()
+                    change_mode(MODE_WAIT_DISPENSER_ARRIVAL)
+                    continue
+                time.sleep(CUP_POLL_INTERVAL)
+
+            # ── WAIT_DISPENSER_ARRIVAL ─────────────────────────────────
+            elif mode == MODE_WAIT_DISPENSER_ARRIVAL:
+                if not header_printed:
+                    log_header('정수기 도착 대기 - 초음파 자동 감지 중')
+                    header_printed = True
+                if elapsed_state > ARRIVAL_TIMEOUT:
+                    stop_dispenser_sound()
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                if is_dispenser_arrived():
+                    stop_dispenser_sound()
+                    tts('정수기 앞에 도착하셨군요. 급수량을 선택해 주세요')
+                    change_mode(MODE_SELECT_LEVEL)
+                    continue
+                time.sleep(0.05)
+
+            # ── SELECT_LEVEL ───────────────────────────────────────────
+            elif mode == MODE_SELECT_LEVEL:
+                if not header_printed:
+                    log_header('급수량 선택 - 70%, 80%, 반만, 가득 등을 말하세요')
+                    header_printed = True
+                if elapsed_state > LEVEL_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                level_ok, level = detect_level_command(text)
+                if level_ok:
+                    selected_level = level
+                    set_water_level(selected_level)   # 코어 + GUI 반영
+                    tts(f'수위를 {selected_level}퍼센트로 설정합니다. 물이 필요하면 물 줘라고 말해주세요')
+                    change_mode(MODE_READY_TO_POUR)
+                elif detect_pour_start_command(text):
+                    tts('먼저 급수량을 선택해 주세요')
+                else:
+                    stt_fail_count += 1
+                    log_info(f'급수량 인식 실패: "{text}"')
+                    if stt_fail_count >= 2:
+                        tts('70퍼센트, 80퍼센트, 반만, 가득 중에서 말해주세요')
+                        stt_fail_count = 0
+
+            # ── READY_TO_POUR ──────────────────────────────────────────
+            elif mode == MODE_READY_TO_POUR:
+                if not header_printed:
+                    log_header('급수 시작 대기 - 물 줘, 물 따라줘, 급수 시작 등을 말하세요')
+                    header_printed = True
+                if elapsed_state > READY_TIMEOUT:
+                    tts('시간이 초과되었습니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                text = listen_text(stream, vad_model, MAX_CMD_SEC)
+                if not text:
+                    continue
+                if detect_cancel_command(text):
+                    tts('취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                if detect_stop_command(text):
+                    tts('급수를 취소합니다')
+                    change_mode(MODE_SLEEP)
+                    continue
+                level_ok, level = detect_level_command(text)
+                if level_ok:
+                    selected_level = level
+                    set_water_level(selected_level)   # 코어 + GUI 반영
+                    tts(f'수위를 {selected_level}퍼센트로 다시 설정합니다. 물 줘라고 말해주세요')
+                    continue
+                if detect_pour_start_command(text):
+                    if selected_level is None:
+                        tts('먼저 급수량을 선택해 주세요')
+                        change_mode(MODE_SELECT_LEVEL)
+                    else:
+                        log_result('급수 시작 명령 인식', f'"{text}"')
+                        voice_start_water()
+                        tts('급수를 시작합니다')
+                        change_mode(MODE_POURING)
+                else:
+                    log_info(f'급수 시작 명령 아님: "{text}"')
+
+            # ── POURING ────────────────────────────────────────────────
+            elif mode == MODE_POURING:
+                if not header_printed:
+                    log_header('급수 중 - 멈춰, 정지, 그만이라고 말하면 즉시 멈춥니다')
+                    header_printed = True
+
+                # 급수가 외부(GUI 버튼, 목표 도달)에서 종료됐는지 체크
+                import smart_water_core as _core
+                with _core.lock:
+                    still_filling = bool(_core.is_filling)
+
+                if not still_filling:
+                    log_result('급수 종료 감지 (외부 정지 또는 목표 도달)')
+                    tts('급수가 완료되었습니다')
+                    selected_level = None
+                    change_mode(MODE_SLEEP)
+                    continue
+
+                text = listen_text(stream, vad_model, POUR_LISTEN_SEC)
+                if not text:
+                    continue
+
+                if detect_stop_command(text):
+                    log_result('급수 정지 명령 인식', f'"{text}"')
+                    voice_stop_water()
+                    tts('급수를 멈춥니다')
+                    selected_level = None
+                    change_mode(MODE_SLEEP)
+                else:
+                    log_info(f'급수 중 입력 무시: "{text}"')
+
+    except Exception as e:
+        log_info(f'[ERROR] voice_loop 예외: {e}')
+    finally:
+        stream.stop()
+        stream.close()
+        log_info('음성인식 오디오 스트림 종료')
+
