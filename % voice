@@ -49,7 +49,7 @@ MIN_SPEECH_MS  = 300
 MAX_WAKE_SEC   = 3.0
 MAX_CMD_SEC    = 6.0
 
-MIN_RMS_FOR_STT = 0.004
+MIN_RMS_FOR_STT = 0.003
 NOISE_REDUCE    = True
 TARGET_RMS      = 0.08
 MAX_GAIN        = 10.0
@@ -105,7 +105,8 @@ MODE_POURING                = 'POURING'
 
 WAKE_WORDS = [
     '지니야', '진이야', '지니아', '진희야', '제니야',
-    '지니', '지니어', '지니 야', '도비야', '우석아','가희야'
+    '지니', '지니어', '지니 야', '도비야', '우석아', '가희야'
+    '먹고싶다','마시고싶다','세미야','아쿠야','새미야','샘이야','쌤이야'
 ]
 KW_DISPENSER = ['정수기', '정숙이', '경숙이', '정수경', '저기', '전국이', '정국이']
 KW_CUP       = ['컵', '겁', '껍', 'cup']
