@@ -16,6 +16,7 @@ def run_kiosk_gui():
     C_NAVY_HOVER = '#123A73'
     C_TEXT       = '#0F172A'
     C_MUTED      = '#64748B'
+    C_GREEN      = '#0B7A3E'                                        # 음성 수위 표시색
 
     app = ctk.CTk()
     app.title('주파수 기반 급수 제어 시스템')
@@ -27,13 +28,14 @@ def run_kiosk_gui():
     app.geometry('1280x650+0+0')
     app.minsize(720, 360)
 
-    status_var   = ctk.StringVar(value='GPIO 제어 모드 준비됨')
-    d_var        = ctk.StringVar(value='지름(D) : - cm')
-    f_var        = ctk.StringVar(value='주파수(F) : - Hz')
-    tf_var       = ctk.StringVar(value='목표(Target) : - %')
-    air_var      = ctk.StringVar(value='수위(Level) : - %')
-    init_air_var = ctk.StringVar(value='초기 공기층(용기 높이) : - cm')
-    hit_var      = ctk.StringVar(value=f'확신(Hits) : 0/{core.STOP_TRIGGER_COUNT}')
+    status_var      = ctk.StringVar(value='GPIO 제어 모드 준비됨')
+    d_var           = ctk.StringVar(value='지름(D) : - cm')
+    f_var           = ctk.StringVar(value='주파수(F) : - Hz')
+    tf_var          = ctk.StringVar(value='목표(Target) : - %')
+    air_var         = ctk.StringVar(value='수위(Level) : - %')
+    init_air_var    = ctk.StringVar(value='초기 공기층(용기 높이) : - cm')
+    hit_var         = ctk.StringVar(value=f'확신(Hits) : 0/{core.STOP_TRIGGER_COUNT}')
+    voice_level_var = ctk.StringVar(value='🎤 음성 목표 수위 : - %')  # 음성 설정 수위 표시
 
     def set_status(s: str):
         status_var.set(s)
@@ -89,6 +91,12 @@ def run_kiosk_gui():
     def on_close():
         _pending_save[0] = None
         core.solenoid_off()
+        try:
+            import voice_module as vm
+            vm._shutdown.set()          # 음성인식 루프 종료 신호
+            stop_dispenser_sound()      # 재생 중인 음원도 정지
+        except Exception:
+            pass
         try:
             if core.audio_stream:
                 core.audio_stream.stop()
@@ -250,6 +258,7 @@ def run_kiosk_gui():
         fmax_sl.set(DEFAULT_FMAX)
         early_ceil_sl.set(DEFAULT_ECEIL)
         hit_var.set(f'확신(Hits) : 0/{core.STOP_TRIGGER_COUNT}')
+        voice_level_var.set('🎤 음성 목표 수위 : - %')              # 음성 수위도 초기화
         set_status('튜닝 값 초기화')
 
     lock_row = ctk.CTkFrame(tune, fg_color=C_CARD, corner_radius=12)
@@ -347,11 +356,19 @@ def run_kiosk_gui():
     stats = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
     stats.pack(fill='x', pady=(0, 12))
 
+    # 기존 수치 표시 항목
     for v in [d_var, f_var, tf_var, air_var, init_air_var, hit_var]:
         r = ctk.CTkFrame(stats, fg_color=C_CARD, corner_radius=12)
         r.pack(fill='x', pady=4)
         ctk.CTkLabel(r, textvariable=v, text_color=C_TEXT,
                      font=('Malgun Gothic', 16, 'bold')).pack(anchor='w', padx=6)
+
+    # 음성 목표 수위 표시 (초록색 강조)
+    voice_level_row = ctk.CTkFrame(stats, fg_color='#F0FFF4', corner_radius=12)
+    voice_level_row.pack(fill='x', pady=4)
+    ctk.CTkLabel(voice_level_row, textvariable=voice_level_var,
+                 text_color=C_GREEN,
+                 font=('Malgun Gothic', 16, 'bold')).pack(anchor='w', padx=6)
 
     plot_frame = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=16)
     plot_frame.pack(fill='both', expand=True)
@@ -366,13 +383,13 @@ def run_kiosk_gui():
 
     actual_air_frame = ctk.CTkFrame(graph_header, fg_color=C_CARD)
 
-    ctk.CTkLabel(actual_air_frame, text='실제 공기층(cm):',
+    ctk.CTkLabel(actual_air_frame, text='실제 채움률(%):',
                  text_color=C_NAVY,
                  font=('Malgun Gothic', 12, 'bold')
                  ).pack(side='left', padx=(14, 4))
 
     actual_air_entry = ctk.CTkEntry(actual_air_frame, width=72,
-                                    placeholder_text='예) 3.20',
+                                    placeholder_text='예) 75.0',
                                     font=('Malgun Gothic', 12))
     actual_air_entry.pack(side='left', padx=(0, 6))
 
@@ -382,8 +399,15 @@ def run_kiosk_gui():
             return
         raw = actual_air_entry.get().strip()
         try:
-            actual_air = float(raw)
+            fill_pct_input = float(raw)
+            fill_pct_input = max(0.0, min(100.0, fill_pct_input))
+            init_air       = data.get('init_air', 0.0)
+            if init_air > 0:
+                actual_air = (1.0 - fill_pct_input / 100.0) * init_air  # % → cm 역변환
+            else:
+                actual_air = None
         except ValueError:
+            fill_pct_input = None
             actual_air = None
         save_to_csv(
             data['d'], data['init_f'], data['tf'], data['sf'],
@@ -393,6 +417,8 @@ def run_kiosk_gui():
             stand_type='filled_box',
             stand_height_cm=3.0,
             actual_air_cm=actual_air,
+            init_air_len_cm=data.get('init_air', 0.0),
+            actual_fill_pct=fill_pct_input,
         )
         _pending_save[0] = None
         actual_air_frame.pack_forget()
@@ -442,7 +468,7 @@ def run_kiosk_gui():
             # [PCT] 목표 수위: core.TARGET_FILL_PCT 직접 사용
             tf_var.set(f'목표(Target) : {core.TARGET_FILL_PCT:.1f} %' if tf > 0 else '목표(Target) : - %')
 
-            # [PCT] 현재 수위: core에서 계산된 last_fill_pct 사용
+            # [PCT] 현재 수위
             if init_air_c > 0 and fill_pct > 0:
                 air_var.set(f'수위(Level) : {fill_pct:.1f} %')
             else:
@@ -482,13 +508,14 @@ def run_kiosk_gui():
             canvas.draw_idle()
 
             if finish:
-                set_status('측정 완료 → 실제 공기층 입력 후 저장')
+                set_status('측정 완료 → 실제 채움률(%) 입력 후 저장')
 
                 with core.lock:
                     init_f_save   = float(core.initial_stable_freq)
                     r2            = float(core.last_r2)
                     freq_snapshot = list(core.history_freq_snapshot)
                     t_intercept_s = float(core.theory_intercept)
+                    init_air_save = float(core.init_air_len_cm)
 
                 total_samples = len(freq_snapshot)
                 print(f'\n[DEBUG] 샘플수={total_samples} | R2={r2}')
@@ -501,6 +528,7 @@ def run_kiosk_gui():
                     'r2':               r2,
                     'total_samples':    total_samples,
                     'theory_intercept': t_intercept_s,
+                    'init_air':         init_air_save,
                 }
                 actual_air_entry.delete(0, 'end')
                 actual_air_frame.pack(side='right')
@@ -524,6 +552,42 @@ def run_kiosk_gui():
     core.sw_off.when_pressed = gui_off
     app.protocol('WM_DELETE_WINDOW', on_close)
     core.solenoid_off()
+
+    # ── 음성인식 콜백 등록 ──────────────────────────────────────────
+    try:
+        import main as _main_mod
+
+        # ON/OFF 콜백
+        _main_mod.register_gui_callbacks(gui_on, gui_off)
+
+        # 수위 설정 콜백: 음성으로 수위 설정 시 슬라이더 + 표시 즉시 갱신
+        def _on_voice_level(pct: float):
+            try:
+                target_air_var.set(round(pct, 1))                   # 슬라이더 값 갱신
+                target_air_sl.set(pct)                              # 슬라이더 위치 갱신
+                voice_level_var.set(f'🎤 음성 목표 수위 : {pct:.0f} %')  # 표시 갱신
+
+                # apply_tuning()과 동일하게 core._eff_target_air_cm 재계산
+                core.TARGET_FILL_PCT = pct
+                with core.lock:
+                    init_air = float(core.init_air_len_cm)
+                    if init_air > 0:
+                        core._eff_target_air_cm = max(0.5, init_air * (1.0 - pct / 100.0))
+                    if core.calibration_done and core.current_diameter > 0 and core._eff_target_air_cm > 0:
+                        core.target_freq = float(
+                            core.SOUND_SPEED / (4 * (core._eff_target_air_cm + core.END_CORRECTION_K * core.current_diameter))
+                        )
+
+                print(f'\n[GUI] 음성 목표 수위 갱신: {pct:.0f}%')
+            except Exception as e:
+                print(f'\n[GUI] 음성 수위 콜백 오류: {e}')
+
+        _main_mod.register_gui_level_callback(_on_voice_level)
+
+    except Exception as e:
+        print(f'\n[GUI] 콜백 등록 오류 (단독 실행 시 무시): {e}')
+
     set_status('GPIO 제어 모드 준비 완료')
     periodic_update()
     app.mainloop()
+
