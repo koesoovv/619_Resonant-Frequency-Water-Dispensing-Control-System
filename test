@@ -1,20 +1,21 @@
-# smart_water_core.py  ── 개선판 v5.21
+# smart_water_core.py  ── 개선판 v5.23
 #
-# ═══ v5.21 변경 사항 (v5.18 기반, 최소 변경) ═══════════════════════
-# [v5.21-ZONE-EMA] fill% 구간별 EMA alpha 차등 적용
-#   - calibration_done 이후, fill% 50~99 구간에서만 활성화
-#   - 50%대: alpha=0.20 (버퍼 80% / 실시간 20% — 느리게, 과대추정 방지)
-#   - 60%대: alpha=0.30
-#   - 70%대: alpha=0.40
-#   - 80%대: alpha=0.55
-#   - 90%대: alpha=0.68 (실시간 비중↑ — 빠르게 추종)
-#   - 50% 미만 or calibration 전: 기존 EMA_ALPHA_NORMAL/FINAL 그대로
+# ═══ v5.23 변경 사항 (v5.22 기반, 최소 변경) ═══════════════════════
+# [v5.23-ZONE-ADV] ZONE_ADVANCE_PCT 실측 기반 재보정
+#   - 60%: -1 → -10  (알고리즘 11% 과대평가 보정)
+#   - 70%: +3 → -5   (알고리즘 8% 과대평가 보정)
+#   - 80%: +4 → +2   (약간 초과 줄임)
+#   - 90%: +5 → +12  (추적 lag 10%+ 보정)
 #
-# [v5.21-ZONE-ADV] fill% 구간별 progressive advance
-#   - 50%대: +1%, 60%대: +2%, 70%대: +3%, 80%대: +4%, 90%대: +5%
-#   - 기존 STOP_ADVANCE_PCT(글로벌)에 합산
+# [v5.23-ZONE-EMA] 90% 구간 EMA alpha 강화
+#   - 90%: 0.80 → 0.92  (고주파 구간 빠른 추종)
 #
-# ※ 그 외 모든 파라미터, 로직은 v5.18과 동일
+# [v5.23-PUMP-NOISE] SPLASH_GUARD_TIME 중 펌프 소음 보완 수집
+#   - SPLASH 구간(급수 후 5초)에서 700Hz 미만 피크만 noise_profile 추가
+#   - 실제 공명(>700Hz)에 영향 없음
+#   - v5.22의 FFT 초기 탐지와 시너지: 500Hz대 펌프 소음 이중 차단
+#
+# ※ 그 외 모든 파라미터, 로직은 v5.22와 동일
 # ═══════════════════════════════════════════════════════════════════
 
 import numpy as np
@@ -27,7 +28,7 @@ from gpiozero import OutputDevice, Button
 
 # ── 파일/GPIO 설정 ──────────────────────────────────────────────────
 CSV_FILENAME      = 'experiment_results.csv'
-INPUT_DEVICE      = 0
+INPUT_DEVICE      = 1
 SOLENOID_GPIO     = 7
 SW_ON_GPIO        = 3
 SW_OFF_GPIO       = 5
@@ -50,26 +51,28 @@ STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
 INIT_AIR_OFFSET_CM      = 4.5
 
-# ── [v5.21-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
-# fill_pct가 해당 구간일 때 EMA_ALPHA_NORMAL 대신 이 값을 사용
-# (in_final이면 EMA_ALPHA_FINAL 대신 사용)
-# key = 구간 십의 자리 (50 = 50~59%)
+# ── [v5.23-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
-    50: 0.15,   # 버퍼 비중 크게 — 작은 컵 과대추정 억제
+    50: 0.15,
     60: 0.25,
     70: 0.45,
-    80: 0.60,   # 실시간 비중 높여 — 큰 컵 추종 개선
-    90: 0.80,
+    80: 0.60,
+    90: 0.92,   # [v5.23] 0.80 → 0.92: 고주파 구간 빠른 추종
 }
 
-# ── [v5.21-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
-# STOP_ADVANCE_PCT에 합산되는 추가 보정
+# ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
+# 실측 결과 기반 재보정:
+#   50%: 정확 → 유지
+#   60%: 알고리즘 11% 과대평가 → -10%로 늦게 트리거
+#   70%: 알고리즘 8% 과대평가  → -5%로 늦게 트리거
+#   80%: 약간 초과(+2%)        → +2%로 조정
+#   90%: lag 10%+              → +12%로 일찍 트리거
 ZONE_ADVANCE_PCT = {
     50: -3.0,
-    60: -1.0,
-    70: 3.0,
-    80: 4.0,
-    90: 5.0,
+    60: -5.0,
+    70: -5.0,
+    80:  2.0,
+    90: 12.0,
 }
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
@@ -244,19 +247,17 @@ def solenoid_off_async():
 
 
 # ════════════════════════════════════════════════════════════════════
-#  [v5.21] 구간별 파라미터 조회
+#  구간별 파라미터 조회
 # ════════════════════════════════════════════════════════════════════
 def _get_zone_ema_alpha(fill_pct: float, in_final: bool) -> float:
-    """fill% 50~99 구간이면 ZONE_EMA_ALPHA 사용, 아니면 기존 alpha."""
     if 50.0 <= fill_pct < 100.0:
-        key = int(fill_pct // 10) * 10  # 57.3→50, 83.1→80
+        key = int(fill_pct // 10) * 10
         if key in ZONE_EMA_ALPHA:
             return ZONE_EMA_ALPHA[key]
     return EMA_ALPHA_FINAL if in_final else EMA_ALPHA_NORMAL
 
 
 def _get_zone_advance(fill_pct: float) -> float:
-    """fill% 50~99 구간이면 ZONE_ADVANCE_PCT, 아니면 0."""
     if 50.0 <= fill_pct < 100.0:
         key = int(fill_pct // 10) * 10
         return ZONE_ADVANCE_PCT.get(key, 0.0)
@@ -711,7 +712,21 @@ def audio_callback(indata, frames, time_info, status):
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
+        # ── 2단계: [v5.23-PUMP-NOISE] SPLASH 구간 펌프 소음 보완 수집 ─
+        # 700Hz 미만 피크만 추가 → 실제 공명(>700Hz)에 영향 없음
         if filling_elapsed < SPLASH_GUARD_TIME:
+            windowed = chunk * np.hamming(len(chunk))
+            fft_val  = np.abs(np.fft.rfft(windowed))
+            freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
+            mask     = (freqs >= 100) & (freqs < 700)
+            if np.any(mask):
+                vf, vm   = freqs[mask], fft_val[mask]
+                peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.3)
+                with lock:
+                    for p in peaks:
+                        f_n = float(vf[p])
+                        if not any(abs(f_n - nf) < 30 for nf in noise_profile):
+                            noise_profile.append(f_n)
             return
 
         with lock:
@@ -747,16 +762,13 @@ def audio_callback(indata, frames, time_info, status):
             dynamic_min_limit = _tf * 0.85
 
         # ── 4단계: 주파수 검출 ───────────────────────────────────────
-        # initial_stable_freq 확정 전에는 LPC를 쓰지 않고 FFT만 강제 사용
-        # 확정 이후에는 기존 get_frequency() = LPC 우선 + FFT 백업 방식 사용
-        if _init <= 0:
-            filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
-            detected_f = fft_backup_frequency(
-                filtered,
-                _last,
-                current_floor,
-                current_ceil
-            )
+        # [v5.22-INIT-FFT] initial_stable_freq 미확정 구간은 FFT 강제 사용
+        with lock:
+            _init_confirmed = (initial_stable_freq > 0)
+
+        if not _init_confirmed:
+            filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
+            detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
             detected_f = _harmonic_correct(detected_f, _last)
         else:
             detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
@@ -785,10 +797,10 @@ def audio_callback(indata, frames, time_info, status):
 
         # ── 5단계: EMA 스무딩 ────────────────────────────────────────
         with lock:
-            _cur_d_snap = float(current_diameter)
-            _calib_snap = bool(calibration_done)
-            _eff_tgt    = float(_eff_target_air_cm)
-            _fill_pct_now = float(last_fill_pct)  # [v5.21] 현재 fill% 스냅샷
+            _cur_d_snap   = float(current_diameter)
+            _calib_snap   = bool(calibration_done)
+            _eff_tgt      = float(_eff_target_air_cm)
+            _fill_pct_now = float(last_fill_pct)
 
         if _calib_snap and _cur_d_snap > 0 and _last_s > 0:
             L_now    = SOUND_SPEED / (4 * _last_s) - END_CORRECTION_K * _cur_d_snap
@@ -796,8 +808,7 @@ def audio_callback(indata, frames, time_info, status):
         else:
             in_final = False
 
-        # ── [v5.21-ZONE-EMA] 구간별 alpha 결정 ──────────────────────
-        # calibration 완료 + fill% 50 이상이면 구간별, 아니면 기존 로직
+        # 구간별 alpha 결정
         if _calib_snap and _fill_pct_now >= 50.0:
             alpha_det = _get_zone_ema_alpha(_fill_pct_now, in_final)
         else:
@@ -826,7 +837,6 @@ def audio_callback(indata, frames, time_info, status):
                 if ratio > SPIKE_RATIO_THRESHOLD:
                     detected_f = _last * 0.95 + detected_f * 0.05
                 else:
-                    # [v5.21] alpha_det은 구간별로 달라질 수 있음
                     detected_f = _last * (1 - alpha_det) + detected_f * alpha_det
 
         if not tracking_mode and _last > 0 and detected_f > _last:
@@ -834,7 +844,7 @@ def audio_callback(indata, frames, time_info, status):
             if detected_f - _last > max_rise:
                 detected_f = _last + max_rise
 
-        # ── 이론 곡선 가이드 (v5.18 그대로) ─────────────────────────
+        # ── 이론 곡선 가이드 ─────────────────────────────────────────
         if theory_locked and detected_f > 0:
             f_theory = theory_freq(filling_elapsed)
             if f_theory > 0:
@@ -862,7 +872,7 @@ def audio_callback(indata, frames, time_info, status):
 
         last_tracked_freq = detected_f
 
-        # ── 6단계: freq_buffer → stable_f (v5.18 그대로) ─────────────
+        # ── 6단계: freq_buffer → stable_f ────────────────────────────
         if in_final:
             buf_size = BUF_SIZE_FINAL
         elif filling_elapsed < EARLY_NOISE_SEC:
@@ -905,6 +915,7 @@ def audio_callback(indata, frames, time_info, status):
                 init_stable_buffer.append(stable_f)
                 if len(init_stable_buffer) >= 10:
                     initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
+                    print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz (FFT 기반)')
 
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
@@ -936,7 +947,7 @@ def audio_callback(indata, frames, time_info, status):
                 tracking_mode = True
             print(f'\n[★ 트래킹 모드] {stable_f:.0f}Hz (thresh={_tracking_thresh:.0f}Hz) 시작')
 
-        # ── 8단계: 회귀 버퍼 수집 (v5.18 그대로) ────────────────────
+        # ── 8단계: 회귀 버퍼 수집 ────────────────────────────────────
         with lock:
             _init_f    = float(initial_stable_freq)
             _cur_d     = float(current_diameter)
@@ -987,7 +998,7 @@ def audio_callback(indata, frames, time_info, status):
                     elif raw_f_for_reg >= _init_f * 4.0:
                         print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*4.0 → 배음 의심, 제외')
 
-        # ── 9단계: 정지 판단 [PCT] [v5.21-ZONE-ADV] ─────────────────
+        # ── 9단계: 정지 판단 [PCT] ───────────────────────────────────
         with lock:
             _tf2       = float(target_freq)
             _cd        = bool(calibration_done)
@@ -1004,16 +1015,14 @@ def audio_callback(indata, frames, time_info, status):
                 with lock:
                     last_fill_pct = fill_pct
 
-                # [v5.21-ZONE-ADV] 구간별 advance 합산
-                zone_adv = _get_zone_advance(fill_pct)
+                zone_adv      = _get_zone_advance(fill_pct)
                 total_advance = STOP_ADVANCE_PCT + zone_adv
-
-                trigger = (fill_pct >= TARGET_FILL_PCT - total_advance)
+                trigger       = (fill_pct >= TARGET_FILL_PCT - total_advance)
             else:
-                fill_pct = 0.0
-                zone_adv = 0.0
+                fill_pct      = 0.0
+                zone_adv      = 0.0
                 total_advance = STOP_ADVANCE_PCT
-                trigger  = False
+                trigger       = False
 
             with lock:
                 if trigger:
@@ -1028,8 +1037,7 @@ def audio_callback(indata, frames, time_info, status):
                 fin_str  = '[F]' if in_final        else '   '
                 bar_len  = min(_hits, STOP_TRIGGER_COUNT)
                 bar      = '#' * bar_len + '-' * (STOP_TRIGGER_COUNT - bar_len)
-                # [v5.21] 구간 정보 표시
-                adv_str = f' adv:{total_advance:+.0f}%' if zone_adv > 0 else ''
+                adv_str  = f' adv:{total_advance:+.0f}%' if zone_adv != 0 else ''
                 if _init_air > 0:
                     print(
                         f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
