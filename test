@@ -77,27 +77,27 @@ RELAY_ACTIVE_HIGH = True
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
 FLOW_RATE        = 18.0        # ml/s 실측값 (v5.27, 기존 20→18)
-END_CORRECTION_K = 0.4
+END_CORRECTION_K = 0.3
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
-TARGET_FILL_PCT         = 70.0
+TARGET_FILL_PCT         = 50.0
 STOP_ADVANCE_PCT        = 0.0
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
 CALC_START_TIME         = 5.0
 DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 4.0
-STOP_TRIGGER_COUNT      = 10
+STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
-# INIT_AIR_OFFSET_CM      = 4.5
+INIT_AIR_OFFSET_CM      = 3.5
 
 # ── [v5.25-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
-    50: 0.15,
-    60: 0.35,
-    70: 0.45,
-    80: 0.60,
-    90: 0.86,
+    50: 0.20,
+    60: 0.45,
+    70: 0.65,
+    80: 0.80,
+    90: 0.90,
 }
 
 # ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
@@ -282,18 +282,10 @@ history_freq_snapshot = []
 init_air_len_cm       = 0.0
 _eff_target_air_cm    = 3.0
 init_stable_buffer    = deque(maxlen=10)
-init_stable_time      = 0.0
 
 peak_lock_floor = 0.0
 
 dynamic_Q = FLOW_RATE    # [v5.25-DYN-Q]
-
-# ── 음성 GUI 표시용 상태값 ────────────────────────────────────────────
-# voice_module.py 에서 갱신하고 user_kiosk_gui.py 에서 읽는다.
-voice_active = False            # 사용자가 말하는 중이면 True
-mic_volume = 0.0                # 아우라 크기 제어용 마이크 볼륨(0.0~1.0)
-last_recognized_text = ''       # 마지막 STT 인식 문장
-last_recognized_time = 0.0      # 마지막 STT 인식 시각
 
 _reg_event = threading.Event()
 
@@ -490,11 +482,11 @@ def _harmonic_correct(f: float, ref: float) -> float:
     if ref <= 0 or f <= 0:
         return f
     ratio = f / ref
-    if 2.6 <= ratio <= 3.4:
+    if 2.7 <= ratio <= 3.3:
         return f / 3.0
-    elif 1.7 <= ratio <= 2.3:      # 1.8→1.7, 2.2→2.3 확대
+    elif 1.8 <= ratio <= 2.2:
         return f / 2.0
-    elif 4.5 <= ratio <= 5.5:
+    elif 4.7 <= ratio <= 5.3:
         return f / 5.0
     elif ratio > 2.5:
         return 0.0
@@ -556,7 +548,6 @@ def _regression_worker():
     global theory_slope, theory_intercept, theory_locked
     global init_air_len_cm, last_r2, diameter_candidates
     global _eff_target_air_cm, dynamic_Q
-    global init_stable_time
 
     while True:
         _reg_event.wait(timeout=1.0)
@@ -569,7 +560,6 @@ def _regression_worker():
             times     = list(reg_time_buffer)
             inv_freqs = list(reg_inv_freq_buffer)
             _init_f   = float(initial_stable_freq)
-            _init_stable_t = float(init_stable_time)    # [NEW]
             _cur_d    = float(current_diameter)
             _cand_cnt = len(diameter_candidates)
             _dyn_q    = float(dynamic_Q)
@@ -630,15 +620,15 @@ def _regression_worker():
         temp_D = np.sqrt(16 * effective_Q / (np.pi * SOUND_SPEED * abs(s_a)))
 
         if abs(s_a) < 0.000030:
-            auto_scale = 0.90
-        elif abs(s_a) < 0.000045:
-            auto_scale = 0.95
-        else:
             auto_scale = 1.0
+        elif abs(s_a) < 0.000045:
+            auto_scale = 0.85
+        else:
+            auto_scale = 1.2
 
         temp_D *= DIAMETER_SCALE * auto_scale
 
-        if not (2.0 < temp_D < 15.0):
+        if not (5.0 < temp_D < 13.0):
             continue
 
         with lock:
@@ -679,16 +669,11 @@ def _regression_worker():
 
             if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
                 est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
-                # [v5.29] D 기반 동적 오프셋: init_f 확정 시점까지 채워진 물 높이
-                effective_Q_for_offset = _dyn_q if _cand_cnt >= DIAM_CAND_MIN else FLOW_RATE
-                t_water = max(_init_stable_t, SPLASH_GUARD_TIME + 1.0)  # 최소 안전값
-                h_offset = 4.0 * effective_Q_for_offset * t_water / (np.pi * _cur_d**2)
-                h_offset = max(0.5, min(h_offset, 8.0))  # 물리적 범위 클램프
-                est += h_offset
+                est += INIT_AIR_OFFSET_CM
                 if est > 0.5:
                     init_air_len_cm    = est
                     _eff_target_air_cm = max(0.5, est * (1.0 - TARGET_FILL_PCT / 100.0))
-                    print(f'\n[★ 용기 높이 확정] {est:.2f}cm (h_offset={h_offset:.2f}cm, D={_cur_d:.2f}cm)'
+                    print(f'\n[★ 용기 높이 확정] {est:.2f}cm'
                           f' → 목표 공기층 {_eff_target_air_cm:.2f}cm ({TARGET_FILL_PCT:.0f}%)')
 
             target_L_eff = _eff_target_air_cm + END_CORRECTION_K * _cur_d
@@ -705,23 +690,6 @@ def _regression_worker():
                 print(f'\n[★ 지름 확정] D={_cur_d:.3f}cm | dynQ={dynamic_Q:.1f}ml/s'
                       f' | cand={_new_cnt} | t={_elapsed_now:.1f}s')
 
-                # [v5.29] D 확정 시 init_air 재계산 (D가 크게 바뀌었을 수 있음)
-                if _init_f > 0 and init_air_len_cm > 0:
-                    re_est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
-                    t_water = max(_init_stable_t, SPLASH_GUARD_TIME + 1.0)
-                    h_offset = 4.0 * dynamic_Q * t_water / (np.pi * _cur_d**2)
-                    h_offset = max(0.5, min(h_offset, 8.0))
-                    re_est += h_offset
-                    if re_est > 0.5 and abs(re_est - init_air_len_cm) / init_air_len_cm > 0.05:
-                        old_est = init_air_len_cm
-                        init_air_len_cm    = re_est
-                        _eff_target_air_cm = max(0.5, re_est * (1.0 - TARGET_FILL_PCT / 100.0))
-                        target_L_eff = _eff_target_air_cm + END_CORRECTION_K * _cur_d
-                        target_freq  = SOUND_SPEED / (4 * target_L_eff)
-                        print(f'\n[v5.29 재계산] init_air: {old_est:.2f}→{re_est:.2f}cm'
-                              f' (h_offset={h_offset:.2f}cm)'
-                              f' | 목표공기층={_eff_target_air_cm:.2f}cm'
-                              f' | target_f={target_freq:.0f}Hz')
 
 _reg_worker_thread = threading.Thread(target=_regression_worker, daemon=True)
 _reg_worker_thread.start()
@@ -745,7 +713,6 @@ def start_filling_local() -> None:
     global init_air_len_cm, _eff_target_air_cm
     global peak_lock_floor, init_stable_buffer
     global raw_stop_buffer, dynamic_Q
-    global init_stable_time
 
     with lock:
         is_filling              = True
@@ -787,7 +754,6 @@ def start_filling_local() -> None:
         _eff_target_air_cm      = 3.0
         peak_lock_floor         = 0.0
         init_stable_buffer      = deque(maxlen=10)
-        init_stable_time        = 0.0
     print('\n>>> [1단계] 배경 소음 측정 (2.5초)...')
 
 
@@ -821,7 +787,6 @@ def audio_callback(indata, frames, time_info, status):
     global init_air_len_cm, _eff_target_air_cm
     global peak_lock_floor, init_stable_buffer
     global raw_stop_buffer, dynamic_Q
-    global init_stable_time
 
     if not is_filling:
         return
@@ -860,11 +825,11 @@ def audio_callback(indata, frames, time_info, status):
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
         # ── 2단계: SPLASH 구간 펌프 소음 보완 ──────────────────────
-        if filling_elapsed < SPLASH_GUARD_TIME:            # SPLASH_GUARD_TIME(5.0)으로 복원
+        if filling_elapsed < SPLASH_GUARD_TIME:
             windowed = chunk * np.hamming(len(chunk))
             fft_val  = np.abs(np.fft.rfft(windowed))
             freqs    = np.fft.rfftfreq(len(chunk), d=1.0 / SAMPLE_RATE)
-            mask     = (freqs >= 100) & (freqs < 250)      # 700→250 (공명 대역 보호)
+            mask     = (freqs >= 100) & (freqs < 700)
             if np.any(mask):
                 vf, vm   = freqs[mask], fft_val[mask]
                 peaks, _ = signal.find_peaks(vm, prominence=vm.max() * 0.3)
@@ -874,7 +839,7 @@ def audio_callback(indata, frames, time_info, status):
                         if not any(abs(f_n - nf) < 30 for nf in noise_profile):
                             noise_profile.append(f_n)
             return
-        
+
         with lock:
             _last   = float(last_tracked_freq)
             _init   = float(initial_stable_freq)
@@ -1064,10 +1029,8 @@ def audio_callback(indata, frames, time_info, status):
         else:
             stable_f = float(np.median(list(freq_buffer))) if freq_buffer else detected_f
 
-        if _init > 0:
-            init_floor_ratio = 0.92 if _calib_snap else 0.75
-            if stable_f < _init * init_floor_ratio:
-                stable_f = _init * init_floor_ratio
+        if _init > 0 and stable_f < _init * 0.97:
+            stable_f = _init * 0.97
         elif filling_elapsed < EARLY_NOISE_SEC and _last_s > 0:
             if stable_f < _last_s * MONO_DROP_RATIO:
                 stable_f = _last_s
@@ -1076,28 +1039,13 @@ def audio_callback(indata, frames, time_info, status):
             history_time.append(filling_elapsed)
             history_freq.append(stable_f)
             last_stable_f = stable_f
-            if (filling_elapsed > EARLY_NOISE_SEC
+            if (filling_elapsed > SPLASH_GUARD_TIME
                     and initial_stable_freq == 0
                     and stable_f > INIT_STABLE_MIN_HZ):
                 init_stable_buffer.append(stable_f)
                 if len(init_stable_buffer) >= 10:
-                    buf = list(init_stable_buffer)
-                    med = float(np.median(buf))
-                    cv = float(np.std(buf)) / (med + 1e-6)   # 변동계수
-                    if cv < 0.15:
-                        initial_stable_freq = med
-                        init_stable_time = filling_elapsed
-                        # [v5.29] 오염 가능성 있는 회귀 버퍼 초기화
-                        reg_time_buffer.clear()
-                        reg_inv_freq_buffer.clear()
-                        spike_blocked_count = 0
-                        print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz'
-                              f' (cv={cv:.3f}, t={filling_elapsed:.1f}s)'
-                              f' | 회귀버퍼 초기화')
-                    else:
-                        # 불안정 → 버퍼 비우고 재수집
-                        init_stable_buffer.clear()
-                        print(f'\n[초기주파수] 불안정 (cv={cv:.3f}), 재수집')
+                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
+                    print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz')
 
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
@@ -1111,11 +1059,10 @@ def audio_callback(indata, frames, time_info, status):
             if stable_f < hard_floor:
                 stable_f = hard_floor
 
-        if _calib_snap:
-            if stable_f > peak_lock_floor:
-                peak_lock_floor = stable_f
-            if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
-                stable_f = peak_lock_floor * 0.90
+        if stable_f > peak_lock_floor:
+            peak_lock_floor = stable_f
+        if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
+            stable_f = peak_lock_floor * 0.90
 
         # ── 7단계: tracking 모드 진입 판정 ──────────────────────────
         _tracking_thresh = max(TRACKING_ENTRY_HZ, _init * TRACKING_ENTRY_MULT) \
