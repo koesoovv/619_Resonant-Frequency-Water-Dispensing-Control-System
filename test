@@ -94,10 +94,10 @@ INIT_AIR_OFFSET_CM      = 3.5
 # ── [v5.25-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
     50: 0.20,
-    60: 0.45,
-    70: 0.65,
-    80: 0.80,
-    90: 0.90,
+    60: 0.30,
+    70: 0.40,
+    80: 0.50,
+    90: 0.70,
 }
 
 # ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
@@ -118,7 +118,7 @@ DIAM_EMA_SCALE_LARGE   = 0.65  # D  > 8.0cm
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15  # zone 90%+ lag 방지 완화
 
 # ── [v5.25-RAW-STOP] 정지 판단 전용 버퍼 ───────────────────────────
-RAW_STOP_BUF_SIZE      = 5     # median 계산 최소 단위
+RAW_STOP_BUF_SIZE      = 3     # median 계산 최소 단위
 
 # ── [v5.25-DYN-Q] 동적 유량 추적 ────────────────────────────────────
 DYNAMIC_Q_EMA_ALPHA    = 0.15
@@ -134,7 +134,7 @@ REG_SPIKE_GATE_EARLY   = REG_SPIKE_GATE * 2.5   # = 0.20
 
 # ── [v5.28-FILL-RATE] fill_pct 상방향 속도 제한 ─────────────────────
 # 물리 최대 ≈ 0.25%/청크(소형 기준), 3.0%는 약 12배 마진
-FILL_PCT_RATE_LIMIT    = 3.0   # %/청크, 상방향만 적용
+FILL_PCT_RATE_LIMIT    = 2.0   # %/청크, 상방향만 적용
 SNR_THRESHOLD          = 2.0
 NOISE_FLOOR_PCTILE     = 70    # 보정 구간 FFT 백분위
 
@@ -608,8 +608,12 @@ def _regression_worker():
         if _cur_d > 0 and _cand_cnt >= DIAM_CAND_MIN:
             q_implied = abs(s_a) * np.pi * SOUND_SPEED * _cur_d**2 / 16
             if DYNAMIC_Q_MIN <= q_implied <= DYNAMIC_Q_MAX:
-                new_dyn_q = _dyn_q * (1 - DYNAMIC_Q_EMA_ALPHA) + q_implied * DYNAMIC_Q_EMA_ALPHA
-                new_dyn_q = max(DYNAMIC_Q_MIN, min(DYNAMIC_Q_MAX, new_dyn_q))
+                if q_implied <= _dyn_q:                          # 감소 방향만 EMA 갱신
+                    new_dyn_q = _dyn_q * (1 - DYNAMIC_Q_EMA_ALPHA) + q_implied * DYNAMIC_Q_EMA_ALPHA
+                    new_dyn_q = max(DYNAMIC_Q_MIN, min(DYNAMIC_Q_MAX, new_dyn_q))
+                else:                                            # 증가 시도 → 갱신 스킵
+                    new_dyn_q = _dyn_q
+                    print(f'\n[DYN-Q] 증가 차단: 역산Q={q_implied:.1f} > 현재Q={_dyn_q:.1f} → 유지')
                 with lock:
                     dynamic_Q = new_dyn_q
                 _dyn_q = new_dyn_q
