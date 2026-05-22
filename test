@@ -75,7 +75,7 @@ STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
 CALC_START_TIME         = 5.0
 DIAM_CALC_END_TIME      = 30.0
-CONTROL_START_TIME      = 4.0
+CONTROL_START_TIME      = 6.0
 STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
 INIT_AIR_OFFSET_CM      = 3.5
@@ -85,8 +85,8 @@ ZONE_EMA_ALPHA = {
     50: 0.20,
     60: 0.30,
     70: 0.40,
-    80: 0.65,
-    90: 0.85,
+    80: 0.50,
+    90: 0.60,
 }
 
 # ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
@@ -103,7 +103,7 @@ ZONE_ADVANCE_PCT = {
 #   큰 컵에서 alpha를 낮춰 과도한 EMA 반응성 억제
 DIAM_THRESHOLD         = 8.0   # cm, 소형/대형 경계
 DIAM_EMA_SCALE_SMALL   = 1.00  # D ≤ 8.0cm
-DIAM_EMA_SCALE_LARGE   = 0.65  # D  > 8.0cm
+DIAM_EMA_SCALE_LARGE   = 0.90  # D  > 8.0cm
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15  # zone 90%+ lag 방지 완화
 
 # ── [v5.25-RAW-STOP] 정지 판단 전용 버퍼 ───────────────────────────
@@ -112,7 +112,7 @@ RAW_STOP_BUF_SIZE      = 3     # median 계산 최소 단위
 # ── [v5.25-SPIKE-UNI] 단방향 spike gate ─────────────────────────────
 # (current_inv - median) / median > gate → 차단  (역수 급상승 = 주파수 급락)
 # 음수(역수 하강 = 주파수 상승)는 통과
-REG_SPIKE_GATE         = 0.08
+REG_SPIKE_GATE         = 0.05
 SPIKE_EARLY_TIME       = 15.0  # s, 초반 완화 구간
 REG_SPIKE_GATE_EARLY   = REG_SPIKE_GATE * 2.5   # = 0.20
 
@@ -131,7 +131,7 @@ FREQ_MIN_LIMIT           = 300
 CALIBRATION_CUTOFF_RATIO = 0.9
 
 # ── 녹음/타이밍 ──────────────────────────────────────────────────────
-NOISE_CALIBRATION_TIME = 2.5
+NOISE_CALIBRATION_TIME = 3.0
 SPLASH_GUARD_TIME      = 5.0
 SAMPLE_RATE  = 44100
 CHUNK_SIZE   = 4096
@@ -166,7 +166,7 @@ TRACKING_ENTRY_HZ       = 1200
 TRACKING_ENTRY_MULT     = 1.6
 TRACKING_MODE_THRESHOLD = 20
 TRACKING_BAND_HZ        = 700
-TRACKING_FLOOR_RATIO    = 0.90
+TRACKING_FLOOR_RATIO    = 0.80
 
 # ── 초기 구간 보호 ───────────────────────────────────────────────────
 EARLY_NOISE_SEC = 6.0
@@ -188,7 +188,7 @@ FINAL_TRACKING_RISE_ALPHA = 0.45
 # ── Hz/청크 속도 제한 ────────────────────────────────────────────────
 RATE_LIMIT_NORMAL_HZ  = 100.0
 RATE_LIMIT_FINAL_HZ   = 300.0
-SPIKE_RATIO_THRESHOLD = 1.15
+SPIKE_RATIO_THRESHOLD = 1.35
 
 # ── 이론 곡선 가이드 ─────────────────────────────────────────────────
 THEORY_GUIDE_ALPHA        = 0.40
@@ -1017,7 +1017,14 @@ def audio_callback(indata, frames, time_info, status):
                     and stable_f > INIT_STABLE_MIN_HZ):
                 init_stable_buffer.append(stable_f)
                 if len(init_stable_buffer) >= 10:
-                    initial_stable_freq = float(np.percentile(list(init_stable_buffer), 85))
+                    buf = list(init_stable_buffer)
+                    med = float(np.median(buf))
+                    # 중앙값 ±15% 벗어난 값 제거 후 median 사용
+                    filtered = [f for f in buf if abs(f - med) / med <= 0.15]
+                    if len(filtered) >= 5:
+                        initial_stable_freq = float(np.median(filtered))
+                    else:
+                        initial_stable_freq = med  # 필터 후 너무 적으면 그냥 median
                     print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz')
 
         with lock:
