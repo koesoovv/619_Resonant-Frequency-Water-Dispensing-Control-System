@@ -65,7 +65,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 15.0        # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
+FLOW_RATE        = 16.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
 END_CORRECTION_K = 0.3
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
@@ -1029,7 +1029,7 @@ def audio_callback(indata, frames, time_info, status):
                     early_med = float(np.median(buf[:n // 2]))
                     late_med  = float(np.median(buf[n // 2:]))
                     rise_ratio = (late_med - early_med) / (early_med + 1e-9)
-                    if rise_ratio > 0.02:
+                    if rise_ratio > 0.008:
                         # 상승 추세 = 진짜 공명. 초기값은 '상승 시작점'(early_med)
                         initial_stable_freq = early_med
                         print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz '
