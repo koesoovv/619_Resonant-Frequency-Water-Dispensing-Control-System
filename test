@@ -65,7 +65,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 18.0        # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
+FLOW_RATE        = 15.0        # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
 END_CORRECTION_K = 0.3
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ RAW_STOP_BUF_SIZE      = 3     # median 계산 최소 단위
 # ── [v5.25-SPIKE-UNI] 단방향 spike gate ─────────────────────────────
 # (current_inv - median) / median > gate → 차단  (역수 급상승 = 주파수 급락)
 # 음수(역수 하강 = 주파수 상승)는 통과
-REG_SPIKE_GATE         = 0.05
+REG_SPIKE_GATE         = 0.10
 SPIKE_EARLY_TIME       = 15.0  # s, 초반 완화 구간
 REG_SPIKE_GATE_EARLY   = REG_SPIKE_GATE * 2.5   # = 0.20
 
@@ -606,20 +606,22 @@ def _regression_worker():
         with lock:
             cand_list = list(diameter_candidates)
 
+        # outlier 판정 — 참조 중앙값을 모든 분기에서 ref_med로 통일 (cur_med 미정의 버그 제거)
         if len(cand_list) >= 5:
-            recent_med = float(np.median(cand_list[-5:]))   # 최근 5개 기준
+            recent_med = float(np.median(cand_list[-5:]))
             all_med    = float(np.median(cand_list))
-            # 최근 추세와 전체 중앙값 중 새 값에 가까운 쪽 기준으로 판정
             ref_med = recent_med if abs(temp_D - recent_med) < abs(temp_D - all_med) else all_med
             outlier = abs(temp_D - ref_med) / ref_med > DIAM_OUTLIER_RATIO
         elif len(cand_list) >= 3:
-            cur_med = float(np.median(cand_list))
-            outlier = abs(temp_D - cur_med) / cur_med > DIAM_OUTLIER_RATIO
+            ref_med = float(np.median(cand_list))
+            outlier = abs(temp_D - ref_med) / ref_med > DIAM_OUTLIER_RATIO
         else:
+            ref_med = 0.0
             outlier = False
 
         if outlier:
-            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm ±30%, 무시)')
+            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={ref_med:.2f}cm '
+                  f'±{DIAM_OUTLIER_RATIO*100:.0f}%, 무시)')
             continue
 
         with lock:
@@ -644,9 +646,14 @@ def _regression_worker():
                 _scale_val = _get_diam_ema_scale(_cur_d, 0.0)
                 print(f'\n[v5.25] 용기 판별: {_cup_type} | D={_cur_d:.2f}cm | EMA scale={_scale_val:.2f}')
 
-            if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
-                est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
-                est += INIT_AIR_OFFSET_CM
+            if init_air_len_cm == 0.0 and _cur_d > 0:
+                est = 0.0
+                if theory_locked and theory_intercept > 0:
+                    # t=0 외삽값(절편)으로 빈 컵 공기층 직접 계산 — 오프셋 불필요
+                    est = SOUND_SPEED * theory_intercept / 4.0 - END_CORRECTION_K * _cur_d
+                elif _init_f > 0 and _elapsed_now > DIAM_CALC_END_TIME * 0.6:
+                    # theory가 끝내 안 잠길 때만 늦은 fallback (오프셋 없음)
+                    est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
                 if est > 0.5:
                     init_air_len_cm    = est
                     _eff_target_air_cm = max(0.5, est * (1.0 - TARGET_FILL_PCT / 100.0))
@@ -1018,14 +1025,19 @@ def audio_callback(indata, frames, time_info, status):
                 init_stable_buffer.append(stable_f)
                 if len(init_stable_buffer) >= 10:
                     buf = list(init_stable_buffer)
-                    med = float(np.median(buf))
-                    # 중앙값 ±15% 벗어난 값 제거 후 median 사용
-                    filtered = [f for f in buf if abs(f - med) / med <= 0.15]
-                    if len(filtered) >= 5:
-                        initial_stable_freq = float(np.median(filtered))
+                    n = len(buf)
+                    early_med = float(np.median(buf[:n // 2]))
+                    late_med  = float(np.median(buf[n // 2:]))
+                    rise_ratio = (late_med - early_med) / (early_med + 1e-9)
+                    if rise_ratio > 0.02:
+                        # 상승 추세 = 진짜 공명. 초기값은 '상승 시작점'(early_med)
+                        initial_stable_freq = early_med
+                        print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz '
+                              f'(상승추세 {rise_ratio*100:.1f}%)')
                     else:
-                        initial_stable_freq = med  # 필터 후 너무 적으면 그냥 median
-                    print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz')
+                        # 정지(잡음 의심) → 락 보류, 버퍼 절반 비우고 더 관찰
+                        for _ in range(n // 2):
+                            init_stable_buffer.popleft()
 
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
@@ -1081,8 +1093,9 @@ def audio_callback(indata, frames, time_info, status):
                     f' | cand={_cand_cnt}/{DIAM_CAND_MAXLEN}'
                 )
 
-            if _init_f > 0 and raw_f_for_reg > _init_f * 1.005 and raw_f_for_reg < _init_f * 4.0:
-                current_inv = 1.0 / raw_f_for_reg
+            reg_f = stable_f  # 회귀 입력 = GUI 표시값과 동일(평활). 잔여 잡음은 LOESS가 처리.
+            if _init_f > 0 and reg_f > _init_f * 1.005 and reg_f < _init_f * 4.0:
+                current_inv = 1.0 / reg_f
                 with lock:
                     _buf_snapshot = list(reg_inv_freq_buffer)
 
