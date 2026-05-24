@@ -65,7 +65,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 16.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
+FLOW_RATE        = 15.5       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
 END_CORRECTION_K = 0.3
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 6.0
 STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
-INIT_AIR_OFFSET_CM      = 3.5
+INIT_AIR_OFFSET_CM      = 2.0
 
 # ── [v5.25-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
@@ -655,6 +655,7 @@ def _regression_worker():
                     # theory가 끝내 안 잠길 때만 늦은 fallback (오프셋 없음)
                     est = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
                 if est > 0.5:
+                    est += INIT_AIR_OFFSET_CM
                     init_air_len_cm    = est
                     _eff_target_air_cm = max(0.5, est * (1.0 - TARGET_FILL_PCT / 100.0))
                     print(f'\n[★ 용기 높이 확정] {est:.2f}cm'
@@ -734,7 +735,7 @@ def start_filling_local() -> None:
         spike_blocked_count     = 0
         history_freq_snapshot   = []
         init_air_len_cm         = 0.0
-        _eff_target_air_cm      = 3.0
+        _eff_target_air_cm      = 2.0
         peak_lock_floor         = 0.0
         init_stable_buffer      = deque(maxlen=10)
     print('\n>>> [1단계] 배경 소음 측정 (2.5초)...')
