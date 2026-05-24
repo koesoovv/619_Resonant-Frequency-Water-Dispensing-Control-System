@@ -65,7 +65,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 16.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
+FLOW_RATE        = 15.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
 END_CORRECTION_K = 0.3
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
@@ -78,15 +78,15 @@ DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 6.0
 STOP_TRIGGER_COUNT      = 5
 TARGET_MAX_CHANGE_RATIO = 0.25
-INIT_AIR_OFFSET_CM      = 2.0
+INIT_AIR_OFFSET_CM      = 1.5
 
 # ── [v5.25-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
     50: 0.20,
     60: 0.30,
-    70: 0.40,
-    80: 0.50,
-    90: 0.60,
+    70: 0.45,
+    80: 0.60,
+    90: 0.80,
 }
 
 # ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
@@ -102,8 +102,8 @@ ZONE_ADVANCE_PCT = {
 #   물리적 근거: dL/dt = Q / (π·r²)  →  D 클수록 주파수 변화율 낮음
 #   큰 컵에서 alpha를 낮춰 과도한 EMA 반응성 억제
 DIAM_THRESHOLD         = 8.5   # cm, 소형/대형 경계
-DIAM_EMA_SCALE_SMALL   = 1.00  # D ≤ 8.0cm
-DIAM_EMA_SCALE_LARGE   = 0.90  # D  > 8.0cm
+DIAM_EMA_SCALE_SMALL   = 0.95  # D ≤ 8.0cm
+DIAM_EMA_SCALE_LARGE   = 1.35   # D  > 8.0cm
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15  # zone 90%+ lag 방지 완화
 
 # ── [v5.25-RAW-STOP] 정지 판단 전용 버퍼 ───────────────────────────
