@@ -102,7 +102,7 @@ ZONE_ADVANCE_PCT = {
 #   물리적 근거: dL/dt = Q / (π·r²)  →  D 클수록 주파수 변화율 낮음
 #   큰 컵에서 alpha를 낮춰 과도한 EMA 반응성 억제
 DIAM_THRESHOLD         = 8.5   # cm, 소형/대형 경계
-DIAM_EMA_SCALE_SMALL   = 0.95  # D ≤ 8.0cm
+DIAM_EMA_SCALE_SMALL   = 1.05  # D ≤ 8.0cm
 DIAM_EMA_SCALE_LARGE   = 1.35   # D  > 8.0cm
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15  # zone 90%+ lag 방지 완화
 
