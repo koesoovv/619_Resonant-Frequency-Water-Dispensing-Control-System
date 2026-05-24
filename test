@@ -65,7 +65,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 15.5       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
+FLOW_RATE        = 16.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
 END_CORRECTION_K = 0.3
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ TARGET_FILL_PCT         = 50.0
 STOP_ADVANCE_PCT        = 0.0
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
-CALC_START_TIME         = 5.0
+CALC_START_TIME         = 6.0
 DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 6.0
 STOP_TRIGGER_COUNT      = 5
@@ -101,7 +101,7 @@ ZONE_ADVANCE_PCT = {
 # ── [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준 ──────────
 #   물리적 근거: dL/dt = Q / (π·r²)  →  D 클수록 주파수 변화율 낮음
 #   큰 컵에서 alpha를 낮춰 과도한 EMA 반응성 억제
-DIAM_THRESHOLD         = 8.0   # cm, 소형/대형 경계
+DIAM_THRESHOLD         = 8.5   # cm, 소형/대형 경계
 DIAM_EMA_SCALE_SMALL   = 1.00  # D ≤ 8.0cm
 DIAM_EMA_SCALE_LARGE   = 0.90  # D  > 8.0cm
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15  # zone 90%+ lag 방지 완화
@@ -132,7 +132,7 @@ CALIBRATION_CUTOFF_RATIO = 0.9
 
 # ── 녹음/타이밍 ──────────────────────────────────────────────────────
 NOISE_CALIBRATION_TIME = 3.0
-SPLASH_GUARD_TIME      = 5.0
+SPLASH_GUARD_TIME      = 6.0
 SAMPLE_RATE  = 44100
 CHUNK_SIZE   = 4096
 
