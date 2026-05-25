@@ -66,7 +66,7 @@ RELAY_ACTIVE_HIGH = True
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
 FLOW_RATE        = 15.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
-END_CORRECTION_K = 0.3
+END_CORRECTION_K = 0.35
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
 TARGET_FILL_PCT         = 50.0
@@ -82,10 +82,10 @@ INIT_AIR_OFFSET_CM      = 1.5
 
 # ── [v5.25-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
-    50: 0.20,
-    60: 0.30,
-    70: 0.45,
-    80: 0.60,
+    50: 0.55,
+    60: 0.58,
+    70: 0.62,
+    80: 0.70,
     90: 0.80,
 }
 
@@ -118,7 +118,7 @@ REG_SPIKE_GATE_EARLY   = REG_SPIKE_GATE * 2.5   # = 0.20
 
 # ── [v5.28-FILL-RATE] fill_pct 상방향 속도 제한 ─────────────────────
 # 물리 최대 ≈ 0.25%/청크(소형 기준), 2.0%는 약 8배 마진
-FILL_PCT_RATE_LIMIT    = 2.0   # %/청크, 상방향만 적용
+FILL_PCT_RATE_LIMIT    = 1.0   # %/청크, 상방향만 적용
 SNR_THRESHOLD          = 2.0
 NOISE_FLOOR_PCTILE     = 70    # 보정 구간 FFT 백분위
 
@@ -174,7 +174,7 @@ EARLY_BUF_SIZE  = 9
 MONO_DROP_RATIO = 0.85
 
 # ── EMA alpha (구간 밖 fallback) ─────────────────────────────────────
-EMA_ALPHA_NORMAL    = 0.35
+EMA_ALPHA_NORMAL    = 0.15
 EMA_ALPHA_FINAL     = 0.68
 FINAL_APPROACH_MULT = 1.5
 
