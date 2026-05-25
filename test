@@ -1,6 +1,14 @@
-# smart_water_core.py  ── v5.29-asym-ema
+# smart_water_core.py  ── v5.30-stable-ctrl
 #
-# [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA
+# [v5.30-STABLE-CTRL] 제어 주파수를 stable_f로 변경
+#   current_air = c/(4*stable_f) - k*D  (EMA+median 기반)
+#   f_for_stop(_f_stop_ema)는 그래프 비교용으로만 유지
+#
+# [v5.30-PKFLOOR] peak_lock_floor / max_freq_seen spike guard
+#   raw_f_for_reg > last * SPIKE_RATIO_THRESHOLD 시 갱신 차단
+#   spike 오염으로 stable_f가 높게 플로어되는 문제 수정
+#
+# [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA (비교용)
 #   raw_f_for_reg 기반으로 직접 EMA 적용 (raw_stop_buffer / _compute_f_for_stop 제거)
 #   상승 시: alpha_up  (빠르게 반영)
 #   하강 시: alpha_down (아주 조금만 반영)
@@ -45,10 +53,10 @@ RELAY_ACTIVE_HIGH = True
 SOUND_SPEED      = 34300.0
 FLOW_RATE        = 18.0        # ml/s 실측값 (v5.27)
 DIAMETER_EST_FLOW_RATE = 15.0  # [v5.32-DH-RECAL] D 역산용 유효 유량
-END_CORRECTION_K = 0.4
+END_CORRECTION_K = 0.35
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
-TARGET_FILL_PCT         = 50.0
+TARGET_FILL_PCT         = 70.0
 STOP_ADVANCE_PCT        = 0.0
 STOP_OFFSET_HZ          = 0
 DIAMETER_SCALE          = 1.0
@@ -977,18 +985,23 @@ def audio_callback(indata, frames, time_info, status):
         consecutive_loss_count = 0
         raw_f_for_reg = float(detected_f)   # EMA 이전 raw 주파수
 
-        # ── [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA 갱신 ────────────
-        # 상승 → alpha_up (빠르게), 하강 → alpha_down (아주 조금)
+        # 변경
         if _f_stop_ema <= 0:
-            _f_stop_ema = raw_f_for_reg                          # 초기값: 첫 검출값으로 세팅
+            _f_stop_ema = raw_f_for_reg
         elif raw_f_for_reg >= _f_stop_ema:
             _f_stop_ema = (_f_stop_ema * (1 - FSCORE_ALPHA_UP)
-                           + raw_f_for_reg * FSCORE_ALPHA_UP)    # 상승 → 빠르게 반영
+                           + raw_f_for_reg * FSCORE_ALPHA_UP)
         else:
-            _f_stop_ema = (_f_stop_ema * (1 - FSCORE_ALPHA_DOWN)
-                           + raw_f_for_reg * FSCORE_ALPHA_DOWN)  # 하강 → 아주 조금만
+            if not tracking_mode:                                # 트래킹 전: 조금 내려감
+                _f_stop_ema = (_f_stop_ema * (1 - FSCORE_ALPHA_DOWN)
+                               + raw_f_for_reg * FSCORE_ALPHA_DOWN)
+            # 트래킹 모드 진입 후: 하강 무시 → 현재값 유지 (단조 증가)
 
-        f_for_stop_plot = _f_stop_ema   # 그래프 표시용
+        f_for_stop_plot = _f_stop_ema   # 그래프 비교용
+
+        # ── [v5.30-PKFLOOR] spike 감지 플래그 ───────────────────────
+        # raw_f_for_reg가 직전 추적값의 SPIKE_RATIO_THRESHOLD 배 초과 → spike
+        _is_spike = (_last > 0 and raw_f_for_reg > _last * SPIKE_RATIO_THRESHOLD)
 
         # ── 5단계: EMA 스무딩 ────────────────────────────────────────
         with lock:
@@ -1121,8 +1134,9 @@ def audio_callback(indata, frames, time_info, status):
                     initial_stable_time = float(filling_elapsed)
                     print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz | t={initial_stable_time:.1f}s')
 
+        # ── [v5.30-PKFLOOR] spike 시 max_freq_seen 갱신 차단 ─────────
         with lock:
-            if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen:
+            if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen and not _is_spike:
                 max_freq_seen = stable_f
             _max_f_seen = float(max_freq_seen)
 
@@ -1133,7 +1147,8 @@ def audio_callback(indata, frames, time_info, status):
             if stable_f < hard_floor:
                 stable_f = hard_floor
 
-        if stable_f > peak_lock_floor:
+        # ── [v5.30-PKFLOOR] spike 시 peak_lock_floor 갱신 차단 ───────
+        if stable_f > peak_lock_floor and not _is_spike:
             peak_lock_floor = stable_f
         if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
             stable_f = peak_lock_floor * 0.90
@@ -1206,7 +1221,7 @@ def audio_callback(indata, frames, time_info, status):
                     elif raw_f_for_reg >= _init_f * 4.0:
                         print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*4.0 → 배음 의심, 제외')
 
-        # ── 9단계: 정지 판단 [v5.29-ASYM-EMA] ──────────────────────
+        # ── 9단계: 정지 판단 [v5.30-STABLE-CTRL] ────────────────────
         with lock:
             _tf2      = float(target_freq)
             _cd       = bool(calibration_done)
@@ -1214,13 +1229,15 @@ def audio_callback(indata, frames, time_info, status):
             _init_air = float(init_air_len_cm)
 
         if filling_elapsed > CONTROL_START_TIME and _cd and stable_f > 0:
-            # [v5.29-ASYM-EMA] 비대칭 EMA 값을 직접 사용 (버퍼/median 불필요)
+            # [v5.30-STABLE-CTRL] 제어 주파수 = stable_f (EMA+median)
+            # f_for_stop(_f_stop_ema)는 로그/그래프 비교용으로만 유지
             f_for_stop = float(_f_stop_ema) if _f_stop_ema > 0 else stable_f
 
             with lock:
                 last_raw_stop_freq = f_for_stop
-                last_decision_freq = f_for_stop
+                last_decision_freq = stable_f    # 실제 제어 기준 주파수
 
+            # [v5.30] current_air 계산에 stable_f 사용
             current_air = SOUND_SPEED / (4 * f_for_stop) - END_CORRECTION_K * _cur_d2
             with lock:
                 last_current_air = float(current_air)
@@ -1273,7 +1290,7 @@ def audio_callback(indata, frames, time_info, status):
                         f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
                         f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}%{adv_str} '
                         f'| α:{alpha_det:.2f}×{dscale_now:.2f} '
-                        f'| ema:{f_for_stop:.0f}Hz smo:{stable_f:.0f}Hz [{bar}]',
+                        f'| smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz [{bar}]',
                         end='\r'
                     )
                 else:
@@ -1281,7 +1298,7 @@ def audio_callback(indata, frames, time_info, status):
                         f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
                         f'| L:{current_air:.2f}cm (측정중) '
                         f'| α:{alpha_det:.2f}×{dscale_now:.2f} '
-                        f'| ema:{f_for_stop:.0f}Hz smo:{stable_f:.0f}Hz [{bar}]',
+                        f'| smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz [{bar}]',
                         end='\r'
                     )
                 last_print_time = current_time
@@ -1290,7 +1307,7 @@ def audio_callback(indata, frames, time_info, status):
                 print(f'\n[완료] 목표 도달! D:{_cur_d2:.4f}cm'
                       f' | Level:{fill_pct:.1f}%'
                       f' | adv:{total_advance:+.0f}%'
-                      f' | f_stop:{f_for_stop:.0f}Hz'
+                      f' | smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz'
                       f' | L:{current_air:.2f}cm')
                 solenoid_off_async()
                 with lock:
