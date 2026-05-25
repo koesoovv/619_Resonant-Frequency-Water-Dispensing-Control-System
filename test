@@ -1,4 +1,9 @@
-# smart_water_core.py  ── v5.29
+# smart_water_core.py  ── v5.29-harmonic-guard
+#
+# [v5.29-HARMONIC-GUARD] 배음 고정 방지 패치
+#   1) D/Target 확정 전 peak_lock_floor 비활성화
+#   2) last_freq + init/theory/target 기준 배음 접힘 보정
+#   3) D/Target 확정 전 검색 상한·상승 속도 제한 추가
 #
 # [v5.29-SIMPLIFY-Q] dynamic_Q 제거, FLOW_RATE 상수 사용
 #   실측 결과 유량 변화 ≤ 0.5ml/s / 40초 → 사실상 상수
@@ -197,6 +202,17 @@ FINAL_TRACKING_RISE_ALPHA = 0.45
 RATE_LIMIT_NORMAL_HZ  = 100.0
 RATE_LIMIT_FINAL_HZ   = 300.0
 SPIKE_RATIO_THRESHOLD = 1.35
+
+# ── [v5.29-HARMONIC-GUARD] D/Target 확정 전 배음 진입 제한 ─────────────
+# D/Target 확정 전에는 실제 기본파보다 2~3배 높은 배음 피크를 잡기 쉬움.
+# 따라서 확정 전 탐색 상한과 청크당 상승량을 제한한다.
+PRE_D_ABS_CEIL_HZ        = 2200.0  # D 확정 전 절대 탐색 상한
+PRE_D_INIT_RATIO_CEIL    = 2.35    # 초기 주파수 기준 임시 상한 배율
+PRE_D_INIT_MARGIN_HZ     = 1000.0  # 초기 주파수 기준 임시 상한 여유값
+PRE_D_SEARCH_MARGIN_HZ   = 650.0   # 직전 추적값 기준 탐색 상한 여유값
+PRE_D_RISE_LIMIT_HZ      = 60.0    # D 확정 전 청크당 최대 상승 허용값
+HARMONIC_RATIO_TOL       = 0.25    # 2/3/5배 배음 판정 허용 오차
+HARMONIC_FOLD_TOL        = 0.28    # 접은 주파수가 기준값과 가까운지 판정
 
 # ── 이론 곡선 가이드 ─────────────────────────────────────────────────
 THEORY_GUIDE_ALPHA        = 0.40
@@ -468,29 +484,95 @@ def fft_backup_frequency(chunk, last_freq, f_min, f_max):
     return float(pf[np.argmax(score)])
 
 
-def _harmonic_correct(f: float, ref: float) -> float:
-    if ref <= 0 or f <= 0:
-        return f
-    ratio = f / ref
-    if 2.7 <= ratio <= 3.3:
-        return f / 3.0
-    elif 1.8 <= ratio <= 2.2:
-        return f / 2.0
-    elif 4.7 <= ratio <= 5.3:
-        return f / 5.0
-    elif ratio > 2.5:
+def _harmonic_correct(f: float, ref: float, extra_refs=None) -> float:
+    """
+    [v5.29-HARMONIC-GUARD]
+    기존 방식은 직전 주파수(ref)만 기준으로 2/3/5배 배음을 접었다.
+    배음으로 한 번 갈아타면 ref 자체가 배음 쪽으로 이동해 보정이 실패한다.
+    따라서 초기 주파수, theory 주파수, target 주파수도 보조 기준으로 사용한다.
+    """
+    if f <= 0:
         return 0.0
-    return f
+
+    refs = []                                      # 배음 판정 기준 후보 목록
+    if ref and ref > 0:
+        refs.append(float(ref))                    # 1순위: 직전 추적 주파수
+    if extra_refs:
+        for r in extra_refs:
+            if r and r > 0 and np.isfinite(r):
+                refs.append(float(r))              # 보조 기준: init/theory/target 등
+
+    if not refs:
+        return float(f)
+
+    best_fold = 0.0                                # 가장 적절한 접힘 후보
+    best_score = 1e9                               # 후보 선택용 오차 점수
+
+    for r in refs:
+        for n in (2.0, 3.0, 5.0):
+            ratio = f / (r + 1e-12)                # 후보가 기준값의 몇 배인지 계산
+            if abs(ratio - n) / n > HARMONIC_RATIO_TOL:
+                continue                           # 2/3/5배 주변이 아니면 제외
+
+            folded = f / n                         # 배음이면 기본파 영역으로 접음
+            if ref and ref > 0 and folded < ref * 0.80:
+                continue                           # 직전값보다 과하게 낮아지는 접힘은 제외
+
+            fold_err = abs(folded - r) / (r + 1e-12)
+            if fold_err > HARMONIC_FOLD_TOL:
+                continue                           # 접은 값이 기준과 너무 멀면 제외
+
+            score = fold_err + (0.05 if r != ref else 0.0)
+            if score < best_score:
+                best_score = score
+                best_fold = folded
+
+    if best_fold > 0:
+        return float(best_fold)
+
+    # 어떤 기준으로도 설명 안 되는 2.8배 이상 급상승은 배음/오검출 가능성이 큼.
+    # 단, 이 판단은 가장 가까운 기준값 대비로만 적용해 정상 상승을 과하게 막지 않는다.
+    near_ref = min(refs, key=lambda r: abs(f - r))
+    if f > near_ref * 2.8:
+        return 0.0
+
+    return float(f)
 
 
-def get_frequency(chunk, last_freq, f_min, f_max):
+def _pre_d_hz_guard(f: float, last_freq: float, init_freq: float) -> float:
+    """
+    [v5.29-HARMONIC-GUARD]
+    D/Target 확정 전에는 주파수 상승량을 제한한다.
+    목적은 500mL 비커처럼 기본파 변화가 느린 조건에서 2~3kHz 배음으로 튀는 것을 막는 것이다.
+    """
+    if f <= 0:
+        return 0.0
+
+    hard_cap = PRE_D_ABS_CEIL_HZ                   # 기본 절대 상한
+    if init_freq > 0:
+        init_cap = max(init_freq * PRE_D_INIT_RATIO_CEIL,
+                       init_freq + PRE_D_INIT_MARGIN_HZ)
+        hard_cap = min(hard_cap, init_cap)         # 초기 주파수 기반 상한 반영
+
+    if f > hard_cap:
+        if last_freq > 0:
+            return min(last_freq + PRE_D_RISE_LIMIT_HZ, hard_cap)
+        return 0.0
+
+    if last_freq > 0 and f > last_freq + PRE_D_RISE_LIMIT_HZ:
+        return last_freq + PRE_D_RISE_LIMIT_HZ     # 청크당 상승량 제한
+
+    return float(f)
+
+
+def get_frequency(chunk, last_freq, f_min, f_max, extra_refs=None):
     filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
     lpc_f = lpc_main_frequency(filtered, last_freq, f_min, f_max)
-    lpc_f = _harmonic_correct(lpc_f, last_freq)
+    lpc_f = _harmonic_correct(lpc_f, last_freq, extra_refs)
     if lpc_f > 0:
         return float(lpc_f)
     fft_f = fft_backup_frequency(filtered, last_freq, f_min, f_max)
-    fft_f = _harmonic_correct(fft_f, last_freq)
+    fft_f = _harmonic_correct(fft_f, last_freq, extra_refs)
     return float(fft_f)
 
 
@@ -867,6 +949,20 @@ def audio_callback(indata, frames, time_info, status):
             current_ceil  = min(FREQ_MAX_LIMIT, base + 1500.0) if base > 0 else FREQ_MAX_LIMIT
             current_floor = dynamic_min_limit
 
+        # [v5.29-HARMONIC-GUARD] D/Target 확정 전 탐색 상한 제한
+        # D가 아직 불안정한 구간에서는 2~3kHz 배음 피크가 들어오면 그대로 고착될 수 있다.
+        with lock:
+            _pre_d_ready = bool(calibration_done and current_diameter > 0 and target_freq > 0)
+        if not _pre_d_ready:
+            pre_d_ceil = PRE_D_ABS_CEIL_HZ
+            if _init > 0:
+                init_ceil = max(_init * PRE_D_INIT_RATIO_CEIL,
+                                _init + PRE_D_INIT_MARGIN_HZ)
+                pre_d_ceil = min(pre_d_ceil, init_ceil)
+            if _last > 0:
+                pre_d_ceil = min(pre_d_ceil, _last + PRE_D_SEARCH_MARGIN_HZ)
+            current_ceil = min(current_ceil, pre_d_ceil)
+
         if not tracking_mode and _last > 400:
             new_floor = _last * 0.75
             if new_floor > dynamic_min_limit:
@@ -885,18 +981,31 @@ def audio_callback(indata, frames, time_info, status):
         # ── 4단계: 주파수 검출 ───────────────────────────────────────
         with lock:
             _init_confirmed = (initial_stable_freq > 0)
+            _tf_ref         = float(target_freq)
+            _theory_locked  = bool(theory_locked)
+
+        _theory_ref = theory_freq(filling_elapsed) if _theory_locked else 0.0
+        _harm_refs  = [_init, _last_s, _theory_ref, _tf_ref]
 
         if not _init_confirmed:
             filtered   = signal.sosfilt(HP_SOS, chunk.astype(float))
             detected_f = fft_backup_frequency(filtered, _last, current_floor, current_ceil)
-            detected_f = _harmonic_correct(detected_f, _last)
+            detected_f = _harmonic_correct(detected_f, _last, _harm_refs)
         else:
-            detected_f = get_frequency(chunk, _last, current_floor, current_ceil)
+            detected_f = get_frequency(chunk, _last, current_floor, current_ceil, _harm_refs)
 
         if detected_f < current_floor or detected_f == 0:
             detected_f = 0.0
         if filling_elapsed < 3.5 and detected_f > EARLY_CEIL_HZ:
             detected_f = 0.0
+
+        # [v5.29-HARMONIC-GUARD] D/Target 확정 전 Hz 상승 제한
+        # 배음이 검출되더라도 raw/EMA/그래프/회귀 버퍼로 바로 들어가지 못하게 한다.
+        with lock:
+            _pre_d_ready2 = bool(calibration_done and current_diameter > 0 and target_freq > 0)
+            _init_for_guard = float(initial_stable_freq)
+        if not _pre_d_ready2:
+            detected_f = _pre_d_hz_guard(detected_f, _last, _init_for_guard)
 
         if detected_f == 0.0:
             consecutive_loss_count += 1
@@ -1073,10 +1182,17 @@ def audio_callback(indata, frames, time_info, status):
             if stable_f < hard_floor:
                 stable_f = hard_floor
 
-        if stable_f > peak_lock_floor:
-            peak_lock_floor = stable_f
-        if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
-            stable_f = peak_lock_floor * 0.90
+        # [v5.29-HARMONIC-GUARD] peak_lock은 D/Target 확정 후에만 사용
+        # 확정 전에는 배음 최고점이 peak_lock_floor가 되어 기본파 복귀를 막는 문제가 생긴다.
+        with lock:
+            _peak_lock_ready = bool(calibration_done and current_diameter > 0 and target_freq > 0)
+        if _peak_lock_ready:
+            if stable_f > peak_lock_floor:
+                peak_lock_floor = stable_f
+            if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
+                stable_f = peak_lock_floor * 0.90
+        else:
+            peak_lock_floor = 0.0
 
         # ── 7단계: tracking 모드 진입 판정 ──────────────────────────
         _tracking_thresh = max(TRACKING_ENTRY_HZ, _init * TRACKING_ENTRY_MULT) \
