@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+gui_app.py  ─ 실험자용 GUI
+===========================
+튜닝 패널, 실시간 주파수 그래프, 실측 채움률 입력 기능을 포함한
+연구/개발 환경 전용 GUI.
+
+main.py 에서 --mode lab 선택 시 실행된다.
+"""
 import time, threading
 import customtkinter as ctk
 from PIL import Image
@@ -7,7 +16,7 @@ import smart_water_core as core
 from csv_logger import save_to_csv
 
 
-def run_kiosk_gui():
+def run_kiosk_gui(on_ready=None):
     ctk.set_appearance_mode('light')
     ctk.set_default_color_theme('blue')
     C_BG         = '#F6F7FB'
@@ -49,6 +58,8 @@ def run_kiosk_gui():
                 return
 
         line_freq.set_data([], [])
+        line_detected.set_data([], [])
+        line_stop.set_data([], [])
         ax.set_xlim(0, 1)
         ax.set_ylim(core.FREQ_MIN_LIMIT, core.FREQ_MAX_LIMIT)
         target_line.set_alpha(0.0)
@@ -94,7 +105,7 @@ def run_kiosk_gui():
         try:
             import voice_module as vm
             vm._shutdown.set()          # 음성인식 루프 종료 신호
-            stop_dispenser_sound()      # 재생 중인 음원도 정지
+            vm.stop_dispenser_sound()   # 재생 중인 음원도 정지
         except Exception:
             pass
         try:
@@ -393,6 +404,17 @@ def run_kiosk_gui():
                                     font=('Malgun Gothic', 12))
     actual_air_entry.pack(side='left', padx=(0, 6))
 
+    ctk.CTkLabel(actual_air_frame, text='컵:',
+                 text_color=C_NAVY,
+                 font=('Malgun Gothic', 12, 'bold')
+                 ).pack(side='left', padx=(4, 4))
+
+    cup_type_entry = ctk.CTkEntry(actual_air_frame, width=105,
+                                  placeholder_text='250mL_beaker',
+                                  font=('Malgun Gothic', 12))
+    cup_type_entry.insert(0, '250mL_beaker')
+    cup_type_entry.pack(side='left', padx=(0, 6))
+
     def on_confirm_save():
         data = _pending_save[0]
         if data is None:
@@ -409,6 +431,7 @@ def run_kiosk_gui():
         except ValueError:
             fill_pct_input = None
             actual_air = None
+        cup_type = cup_type_entry.get().strip() or 'unknown'
         save_to_csv(
             data['d'], data['init_f'], data['tf'], data['sf'],
             r2_final=data['r2'],
@@ -417,8 +440,12 @@ def run_kiosk_gui():
             stand_type='filled_box',
             stand_height_cm=3.0,
             actual_air_cm=actual_air,
+            estimated_stop_air_cm=data.get('stop_air', None),
             init_air_len_cm=data.get('init_air', 0.0),
             actual_fill_pct=fill_pct_input,
+            cup_type=cup_type,
+            target_fill_pct=data.get('target_pct', core.TARGET_FILL_PCT),
+            stop_elapsed_sec=data.get('stop_elapsed_sec', None),
         )
         _pending_save[0] = None
         actual_air_frame.pack_forget()
@@ -437,8 +464,11 @@ def run_kiosk_gui():
     ax.grid(True, alpha=0.3)
     fig.tight_layout(pad=3.0)
 
-    line_freq,  = ax.plot([], [], linewidth=1.5)
-    target_line = ax.axhline(y=0, linestyle='--', alpha=0.8)
+    line_freq,     = ax.plot([], [], linewidth=1.7, label='stable_f')
+    line_detected, = ax.plot([], [], linewidth=1.0, alpha=0.70, label='detected_f')
+    line_stop,     = ax.plot([], [], linewidth=1.2, linestyle='-.', alpha=0.85, label='f_for_stop')
+    target_line = ax.axhline(y=0, linestyle='--', alpha=0.8, label='target_f')
+    ax.legend(loc='upper left', fontsize=8)
     canvas = FigureCanvasTkAgg(fig, master=plot_frame)
     canvas.get_tk_widget().pack(fill='both', expand=True)
 
@@ -457,10 +487,12 @@ def run_kiosk_gui():
                 if core.request_finish:
                     core.request_finish = False
 
-                t_list     = list(core.history_time)
-                f_list     = list(core.history_freq)
-                t_mode     = bool(core.tracking_mode)
-                init_air_c = float(core.init_air_len_cm)
+                t_list        = list(core.history_time)
+                f_list        = list(core.history_freq)
+                detected_list = list(getattr(core, 'history_detected_freq', []))
+                stop_list     = list(getattr(core, 'history_stop_freq', []))
+                t_mode        = bool(core.tracking_mode)
+                init_air_c    = float(core.init_air_len_cm)
 
             d_var.set(f'지름(D) : {d:.2f} cm' if d > 0 else '지름(D) : - cm')
             f_var.set(f'주파수(F) : {sf:.0f} Hz' if sf > 0 else '주파수(F) : - Hz')
@@ -483,24 +515,53 @@ def run_kiosk_gui():
             progress.configure(progress_color='#0B7A3E' if t_mode else C_NAVY)
 
             if t_list:
-                if len(t_list) > core.PLOT_MAX_POINTS:
-                    t_list = t_list[-core.PLOT_MAX_POINTS:]
-                    f_list = f_list[-core.PLOT_MAX_POINTS:]
+                # 3개 그래프가 같은 x축을 쓰도록 길이를 맞춘다.
+                n_plot = min(len(t_list), len(f_list))
+                if n_plot > 0:
+                    n_plot = min(n_plot, core.PLOT_MAX_POINTS)
+                    t_list = t_list[-n_plot:]
+                    f_list = f_list[-n_plot:]
 
-                line_freq.set_data(t_list, f_list)
-                t_max = max(t_list)
-                ax.set_xlim(max(0, t_max - 30), max(5, t_max))
-                fmn, fmx = min(f_list), max(f_list)
-                pad = max(50, 0.1 * (fmx - fmn))
-                ax.set_ylim(max(0, fmn - pad), fmx + pad)
+                    # detected_f / f_for_stop은 구버전 core와의 호환을 위해 부족하면 빈 그래프로 둔다.
+                    if len(detected_list) >= n_plot:
+                        detected_plot = detected_list[-n_plot:]
+                        line_detected.set_data(t_list, detected_plot)
+                    else:
+                        detected_plot = []
+                        line_detected.set_data([], [])
 
-                if tf > 0:
-                    target_line.set_ydata([tf, tf])
-                    target_line.set_alpha(0.9)
-                else:
-                    target_line.set_alpha(0.0)
+                    if len(stop_list) >= n_plot:
+                        stop_plot = stop_list[-n_plot:]
+                        line_stop.set_data(t_list, stop_plot)
+                    else:
+                        stop_plot = []
+                        line_stop.set_data([], [])
+
+                    line_freq.set_data(t_list, f_list)
+
+                    t_max = max(t_list)
+                    ax.set_xlim(max(0, t_max - 30), max(5, t_max))
+
+                    y_values = []
+                    for arr in (f_list, detected_plot, stop_plot):
+                        y_values.extend([float(v) for v in arr if v is not None and float(v) > 0])
+                    if tf > 0:
+                        y_values.append(float(tf))
+
+                    if y_values:
+                        fmn, fmx = min(y_values), max(y_values)
+                        pad = max(50, 0.1 * (fmx - fmn))
+                        ax.set_ylim(max(0, fmn - pad), fmx + pad)
+
+                    if tf > 0:
+                        target_line.set_ydata([tf, tf])
+                        target_line.set_alpha(0.9)
+                    else:
+                        target_line.set_alpha(0.0)
             else:
                 line_freq.set_data([], [])
+                line_detected.set_data([], [])
+                line_stop.set_data([], [])
                 ax.set_xlim(0, 1)
                 ax.set_ylim(core.FREQ_MIN_LIMIT, core.FREQ_MAX_LIMIT)
                 target_line.set_alpha(0.0)
@@ -511,11 +572,14 @@ def run_kiosk_gui():
                 set_status('측정 완료 → 실제 채움률(%) 입력 후 저장')
 
                 with core.lock:
-                    init_f_save   = float(core.initial_stable_freq)
-                    r2            = float(core.last_r2)
-                    freq_snapshot = list(core.history_freq_snapshot)
-                    t_intercept_s = float(core.theory_intercept)
-                    init_air_save = float(core.init_air_len_cm)
+                    init_f_save      = float(core.initial_stable_freq)
+                    r2               = float(core.last_r2)
+                    freq_snapshot    = list(core.history_freq_snapshot)
+                    t_intercept_s    = float(core.theory_intercept)
+                    init_air_save    = float(core.init_air_len_cm)
+                    stop_air_save    = float(core.last_current_air)
+                    target_pct_save  = float(core.TARGET_FILL_PCT)
+                    stop_elapsed_sec = float(getattr(core, 'last_stop_elapsed_sec', 0.0))
 
                 total_samples = len(freq_snapshot)
                 print(f'\n[DEBUG] 샘플수={total_samples} | R2={r2}')
@@ -529,6 +593,9 @@ def run_kiosk_gui():
                     'total_samples':    total_samples,
                     'theory_intercept': t_intercept_s,
                     'init_air':         init_air_save,
+                    'stop_air':         stop_air_save,
+                    'target_pct':       target_pct_save,
+                    'stop_elapsed_sec': stop_elapsed_sec,
                 }
                 actual_air_entry.delete(0, 'end')
                 actual_air_frame.pack(side='right')
@@ -555,10 +622,10 @@ def run_kiosk_gui():
 
     # ── 음성인식 콜백 등록 ──────────────────────────────────────────
     try:
-        import main as _main_mod
+        import voice_module as vm
 
         # ON/OFF 콜백
-        _main_mod.register_gui_callbacks(gui_on, gui_off)
+        vm.register_gui_callbacks(gui_on, gui_off)
 
         # 수위 설정 콜백: 음성으로 수위 설정 시 슬라이더 + 표시 즉시 갱신
         def _on_voice_level(pct: float):
@@ -582,12 +649,16 @@ def run_kiosk_gui():
             except Exception as e:
                 print(f'\n[GUI] 음성 수위 콜백 오류: {e}')
 
-        _main_mod.register_gui_level_callback(_on_voice_level)
+        vm.register_gui_level_callback(_on_voice_level)
 
     except Exception as e:
         print(f'\n[GUI] 콜백 등록 오류 (단독 실행 시 무시): {e}')
 
     set_status('GPIO 제어 모드 준비 완료')
     periodic_update()
+
+    if callable(on_ready):
+        app.after(300, on_ready)  # GUI 초기화 후 음성인식 스레드 시작
+
     app.mainloop()
 
