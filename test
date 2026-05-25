@@ -66,7 +66,15 @@ RELAY_ACTIVE_HIGH = True
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
 FLOW_RATE        = 15.0       # ml/s 실측값 (실측: 17.5~18.0, 사실상 상수)
-END_CORRECTION_K = 0.35
+END_CORRECTION_K = 0.30
+
+K_EFF_BY_ZONE = {
+    50: 0.30,
+    60: 0.30,
+    70: 0.35,
+    80: 0.35,
+    90: 0.40,
+}
 
 # ── 제어 파라미터 ────────────────────────────────────────────────────
 TARGET_FILL_PCT         = 50.0
@@ -312,6 +320,14 @@ def _get_zone_advance() -> float:
     key = int(TARGET_FILL_PCT // 10) * 10
     return ZONE_ADVANCE_PCT.get(key, 0.0)
 
+def _get_k_eff(fill_pct: float) -> float:
+    """
+    [v5.30-K-ZONE] fill_pct 구간별 실효 끝단 보정 계수 반환.
+    current_air(fill_pct 계산) 전용. init_air·target_freq에는 미사용.
+    _prev_fill(직전 청크 값) 기준으로 호출 → 순환 의존성 없음.
+    """
+    key = int(fill_pct // 10) * 10          # 53.2% → 50, 71.4% → 70
+    return K_EFF_BY_ZONE.get(key, END_CORRECTION_K)
 
 # ════════════════════════════════════════════════════════════════════
 #  [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준
@@ -1023,13 +1039,18 @@ def audio_callback(indata, frames, time_info, status):
             if (filling_elapsed > SPLASH_GUARD_TIME
                     and initial_stable_freq == 0
                     and stable_f > INIT_STABLE_MIN_HZ):
-                init_stable_buffer.append(stable_f)
+                init_stable_buffer.append(raw_f_for_reg)
                 if len(init_stable_buffer) >= 10:
                     buf = list(init_stable_buffer)
                     n = len(buf)
                     early_med = float(np.median(buf[:n // 2]))
                     late_med  = float(np.median(buf[n // 2:]))
                     rise_ratio = (late_med - early_med) / (early_med + 1e-9)
+                    
+                     # [신규] 분산 게이트: 전체 std가 early_med의 5% 초과 시 잡음으로 판정
+                    buf_std = float(np.std(buf))
+                    stable_enough = (buf_std / (early_med + 1e-9)) < 0.05
+    
                     if rise_ratio > 0.008:
                         # 상승 추세 = 진짜 공명. 초기값은 '상승 시작점'(early_med)
                         initial_stable_freq = early_med
@@ -1126,7 +1147,7 @@ def audio_callback(indata, frames, time_info, status):
                     elif raw_f_for_reg >= _init_f * 4.0:
                         print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*4.0 → 배음 의심, 제외')
 
-        # ── 9단계: 정지 판단 [v5.25-RAW-STOP] ──────────────────────
+       # ── 9단계: 정지 판단 [v5.25-RAW-STOP] ──────────────────────
         with lock:
             _tf2       = float(target_freq)
             _cd        = bool(calibration_done)
@@ -1140,20 +1161,24 @@ def audio_callback(indata, frames, time_info, status):
             else:
                 f_for_stop = stable_f
 
-            current_air = SOUND_SPEED / (4 * f_for_stop) - END_CORRECTION_K * _cur_d2
+            # [v5.30-K-ZONE] 직전 fill_pct 기준 k_eff 결정 (순환 의존성 회피)
+            # _prev_fill을 current_air 계산 전에 읽어야 하므로 여기서 lock 획득
+            with lock:
+                _prev_fill = float(last_fill_pct)
+            k_eff = _get_k_eff(_prev_fill)
+
+            current_air = SOUND_SPEED / (4 * f_for_stop) - k_eff * _cur_d2
             with lock:
                 last_current_air = float(current_air)
 
             if _init_air > 0:
                 fill_pct = max(0.0, min(100.0, (1.0 - current_air / _init_air) * 100.0))
 
-                # [v5.28-FILL-RATE] 상방향 속도 제한
-                with lock:
-                    _prev_fill = float(last_fill_pct)
+                # [v5.28-FILL-RATE] 상방향 속도 제한 (_prev_fill 이미 위에서 읽음)
                 if _prev_fill > 0 and fill_pct > _prev_fill + FILL_PCT_RATE_LIMIT:
                     fill_pct = _prev_fill + FILL_PCT_RATE_LIMIT
 
-                # [v5.29] 하방향 제한: 노이즈 보정은 허용, 급하락은 방지
+                # [v5.29] 하방향 제한
                 if _prev_fill > 0 and fill_pct < _prev_fill - FILL_PCT_DROP_LIMIT:
                     fill_pct = _prev_fill - FILL_PCT_DROP_LIMIT
 
