@@ -1,25 +1,47 @@
-from datetime import datetime                                      # 현재 시간 저장용
+from datetime import datetime                                      # 백업 파일명 충돌 방지용
 import csv                                                         # CSV 저장용
 import os                                                          # 파일 존재 여부 확인용
 import smart_water_core as core                                    # 코어 상태값/상수 참조
 
 
-CSV_SCHEMA_VERSION = 'v3_minimal'                                  # CSV 구조 버전
+CSV_SCHEMA_VERSION = 'v6_model_lock_analysis'                         # CSV 구조 버전
 
-HEADER = [                                                         # 꼭 필요한 튜닝용 컬럼만 유지
-    'Run_ID',                                                       # 실험 1회 구분 ID
-    'Timestamp',                                                    # 저장 시각
-    'Diameter_cm',                                                  # 추정 지름(cm)
+HEADER = [                                                         # D/H 모델 안정화 분석용 컬럼
+    'Trial_No',                                                     # 날짜 없는 실험 순번
+    'Cup_Type',                                                     # 컵 종류/용기 구분
+    'Target_Fill_Pct',                                              # 목표 채움률(%)
+    'Diameter_cm',                                                  # 기존 GUI 표시용 추정 지름(cm)
+    'D_Locked_cm',                                                  # 잠금된 지름(cm)
+    'D_Candidate_Median_cm',                                        # D 후보 중앙값(cm)
+    'D_Candidate_MAD_cm',                                           # D 후보 MAD(cm)
     'Init_Freq_Hz',                                                 # 초기 안정 주파수(Hz)
-    'Init_Air_Len_cm',                                              # 추정 초기 공기층(cm)
+    'Init_Air_By_InitFreq_cm',                                      # 초기 주파수 기반 H 후보(cm)
+    'Init_Air_By_Regression_cm',                                    # 회귀 절편 기반 H 후보(cm)
+    'Init_Air_Locked_cm',                                           # 최종 잠금 초기 공기층 H(cm)
     'Target_Freq_Hz',                                               # 목표 주파수(Hz)
-    'Stop_Freq_Hz',                                                 # 정지 순간 주파수(Hz)
-    'Stop_Target_Diff_Hz',                                          # 정지 주파수 - 목표 주파수(Hz)
+    'Raw_Stop_Freq_Hz',                                             # raw 정지 후보 주파수(Hz)
+    'Decision_Freq_Hz',                                             # 실제 정지 판단용 주파수(Hz)
+    'Stop_Freq_Hz',                                                 # 화면/그래프 기준 정지 주파수(Hz)
+    'Stop_Target_Diff_Hz',                                          # Decision_Freq - Target_Freq(Hz)
     'Estimated_Stop_Air_cm',                                        # 코드가 정지 순간 추정한 공기층(cm)
+    'Decision_Fill_Pct',                                            # 실제 정지 판단용 채움률(%)
+    'Estimated_Stop_Fill_Pct',                                      # 공기층 기반 추정 정지 채움률(%)
     'Actual_Air_cm',                                                # 실측 남은 공기층(cm)
+    'Actual_Fill_Pct',                                              # 실측 채움률(%) — 실험자 GUI 입력
+    'Fill_Error_Pct',                                               # 실측 채움률 - 목표 채움률
     'Reg_R2',                                                       # LOESS+LSM 회귀 적합도
+    'Theory_Locked',                                                # 이론 곡선 잠금 여부
+    'Model_Valid',                                                  # 정지 판단 모델 유효 여부
+    'Reject_Reason',                                                # 모델 보류/거부 이유
     'Total_Samples',                                                # 저장된 주파수 샘플 수
     'Max_Freq_Seen_Hz',                                             # 실험 중 관측한 최대 주파수(Hz)
+    'Noise_Floor_Level',                                            # 보정 구간 FFT 기반 노이즈 플로어
+    'Dynamic_Q',                                                    # 동적 유량 추정값(ml/s)
+    'Stop_Hits',                                                    # 정지 조건 누적 횟수
+    'Stop_Trigger_Count',                                           # 정지 기준 횟수
+    'Spike_Blocked_Count',                                          # 스파이크 차단 횟수
+    'Stop_Elapsed_Sec',                                             # 소음 보정 이후 정지까지 걸린 시간(s)
+    'Control_Profile',                                              # 자동 판별된 진단 프로파일
 ]
 
 
@@ -42,9 +64,28 @@ def _blank(value, digits=None):                                    # CSV 공란/
         return value                                               # 문자열 그대로 저장
 
 
-def _calc_init_air_len(diameter, init_freq, theory_intercept):      # 초기 공기층 계산 함수
-    diameter = _num(diameter)                                      # 지름 숫자화
-    init_freq = _num(init_freq)                                    # 초기 주파수 숫자화
+def _safe_str(value, default='unknown'):                           # 문자열 정리 함수
+    text = str(value).strip() if value is not None else ''         # 문자열 변환
+    return text if text else default                               # 빈 문자열이면 기본값 반환
+
+
+def _bool_text(value):                                             # bool 값을 CSV용 문자열로 변환
+    return 'TRUE' if bool(value) else 'FALSE'                      # 엑셀에서 보기 쉬운 형태로 저장
+
+
+def _calc_init_air_len(diameter, init_freq, theory_intercept,      # 초기 공기층 계산 함수
+                       init_air_len_cm=None):                      # 외부에서 직접 넘겨준 값 우선
+    """
+    우선순위:
+      1) init_air_len_cm 가 양수로 직접 제공된 경우 → 그대로 사용
+      2) theory_intercept 기반 외삽
+      3) init_freq 기반 계산
+    """
+    if init_air_len_cm is not None and _num(init_air_len_cm) > 0:  # 직접 제공된 값이 있으면
+        return _num(init_air_len_cm)                               # 바로 반환
+
+    diameter         = _num(diameter)                              # 지름 숫자화
+    init_freq        = _num(init_freq)                             # 초기 주파수 숫자화
     theory_intercept = _num(theory_intercept)                      # 회귀 절편 숫자화
 
     if theory_intercept > 1e-6 and diameter > 0:                   # 회귀 외삽값이 있으면
@@ -57,7 +98,19 @@ def _calc_init_air_len(diameter, init_freq, theory_intercept):      # 초기 공
     return None                                                    # 계산 불가
 
 
-def _prepare_csv_file(filename, header):                            # CSV 헤더 준비 함수
+def _backup_existing_csv(filename):                                # 기존 CSV 백업 함수
+    base, ext = os.path.splitext(filename)                         # 파일명/확장자 분리
+    idx = 1                                                        # 백업 번호 시작값
+    while True:                                                    # 겹치지 않는 백업명 탐색
+        backup = f'{base}_backup_{idx}{ext}'                       # 날짜 없는 백업명 생성
+        if not os.path.exists(backup):                             # 해당 파일명이 비어 있으면
+            os.replace(filename, backup)                           # 기존 CSV 백업
+            print(f'\n[CSV 헤더 변경] 기존 파일 백업: {backup}')     # 백업 안내
+            return                                                 # 종료
+        idx += 1                                                   # 다음 번호 확인
+
+
+def _prepare_csv_file(filename, header):                           # CSV 헤더 준비 함수
     if not os.path.isfile(filename):                               # 파일이 없으면
         return True                                                # 헤더 작성 필요
 
@@ -70,11 +123,29 @@ def _prepare_csv_file(filename, header):                            # CSV 헤더
     if old_header == header:                                       # 현재 헤더와 같으면
         return False                                               # 헤더 작성 불필요
 
-    base, ext = os.path.splitext(filename)                         # 파일명/확장자 분리
-    backup = f'{base}_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}{ext}'  # 백업 파일명 생성
-    os.replace(filename, backup)                                   # 기존 CSV 백업
-    print(f'\n[CSV 헤더 변경] 기존 파일 백업: {backup}')             # 백업 안내
+    _backup_existing_csv(filename)                                 # 다른 구조의 CSV는 백업
     return True                                                    # 새 헤더 작성 필요
+
+
+def _next_trial_no(filename):                                      # 날짜 없는 실험 순번 계산
+    if not os.path.isfile(filename):                               # 파일이 없으면
+        return 1                                                   # 첫 실험
+    try:                                                           # 기존 행 수 확인
+        with open(filename, mode='r', newline='', encoding='utf-8-sig') as f:  # CSV 열기
+            reader = csv.reader(f)                                 # reader 생성
+            next(reader, None)                                     # 헤더 스킵
+            return sum(1 for row in reader if row) + 1             # 데이터 행 수 + 1
+    except Exception:                                              # 읽기 실패 시
+        return 1                                                   # 안전하게 1번부터 시작
+
+
+def _calc_fill_pct_from_air(init_air_len, stop_air):               # 공기층 기반 채움률 계산
+    init_air = _num(init_air_len)                                  # 초기 공기층 숫자화
+    air = _num(stop_air)                                           # 정지 공기층 숫자화
+    if init_air <= 0 or air < 0:                                   # 계산 불가 조건
+        return None                                                # 빈칸 처리
+    fill_pct = (1.0 - air / init_air) * 100.0                      # 채움률 계산
+    return max(0.0, min(100.0, fill_pct))                          # 0~100% 범위 제한
 
 
 def save_to_csv(                                                   # CSV 저장 함수
@@ -89,35 +160,95 @@ def save_to_csv(                                                   # CSV 저장 
     target_air_cm=None,                                            # 기존 코드 호환용, 저장 안 함
     stop_reason=None,                                              # 기존 코드 호환용, 저장 안 함
     note=None,                                                     # 기존 코드 호환용, 저장 안 함
+    init_air_len_cm=None,                                          # 코어에서 직접 읽은 초기 공기층(cm)
+    actual_fill_pct=None,                                          # 실험자가 입력한 실측 채움률(%)
+    cup_type=None,                                                 # 컵 종류/용기 구분
+    target_fill_pct=None,                                          # 목표 채움률(%)
+    stop_elapsed_sec=None,                                         # 정지까지 걸린 시간(s)
 ):
+    """
+    CSV 한 줄 저장.
+
+    분석 목적:
+      - Fill_Error_Pct로 빠른 정지/늦은 정지 구분
+      - Reg_R2, Theory_Locked로 회귀 신뢰도 구분
+      - Noise_Floor_Level, Spike_Blocked_Count로 잡음 영향 확인
+      - Stop_Hits, Stop_Trigger_Count로 정지 판정 조건 튜닝
+    """
     filename = core.CSV_FILENAME                                   # 코어에서 지정한 CSV 파일명 사용
     write_header = _prepare_csv_file(filename, HEADER)             # 헤더 작성 여부 확인
+    trial_no = 1 if write_header else _next_trial_no(filename)     # 날짜 없는 실험 순번
 
-    run_id = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]      # 실험 ID 생성
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')       # 저장 시각 생성
-    init_air_len = _calc_init_air_len(diameter, init_freq, theory_intercept)  # 초기 공기층 계산
+    target_pct = _num(target_fill_pct, _num(getattr(core, 'TARGET_FILL_PCT', 0.0)))  # 목표 % 확보
+    cup_type_text = _safe_str(cup_type)                            # 컵 종류 문자열 정리
+
+    init_air_len = _calc_init_air_len(                             # 초기 공기층 계산
+        diameter, init_freq, theory_intercept,
+        init_air_len_cm=init_air_len_cm,
+    )
 
     if estimated_stop_air_cm is None:                              # GUI에서 정지 공기층을 안 넘겼으면
         estimated_stop_air_cm = getattr(core, 'last_current_air', None)  # 코어의 마지막 추정 공기층 사용
 
-    stop_target_diff = None                                        # 목표 대비 정지 주파수 차이 초기화
-    if _num(target_f) > 0 and _num(final_freq) > 0:                # 둘 다 유효하면
-        stop_target_diff = _num(final_freq) - _num(target_f)       # 정지 주파수 - 목표 주파수 계산
+    estimated_stop_fill_pct = _calc_fill_pct_from_air(             # 추정 정지 채움률 계산
+        init_air_len, estimated_stop_air_cm,
+    )
+
+    if actual_fill_pct is not None and actual_air_cm is None:      # 채움률(%)로 넘어왔으면
+        ref_air = _num(init_air_len) if init_air_len else 0.0      # 초기 공기층 참조
+        if ref_air > 0:                                            # 역변환 가능하면
+            actual_air_cm = (1.0 - _num(actual_fill_pct) / 100.0) * ref_air  # cm 변환
+
+    fill_error_pct = None                                          # 실제 오차 초기화
+    if actual_fill_pct is not None and target_pct > 0:             # 실측 채움률과 목표값이 있으면
+        fill_error_pct = _num(actual_fill_pct) - target_pct        # 실제 - 목표 계산
+
+    decision_freq = getattr(core, 'last_decision_freq', None)       # 실제 정지 판단 주파수
+    raw_stop_freq = getattr(core, 'last_raw_stop_freq', None)       # raw 정지 후보 주파수
+
+    stop_target_diff = None                                        # 목표 대비 decision 주파수 차이 초기화
+    if _num(target_f) > 0 and _num(decision_freq) > 0:             # 둘 다 유효하면
+        stop_target_diff = _num(decision_freq) - _num(target_f)    # decision 주파수 - 목표 주파수 계산
+
+    if stop_elapsed_sec is None:                                   # 외부에서 종료 시간을 안 넘겼으면
+        stop_elapsed_sec = getattr(core, 'last_stop_elapsed_sec', None)  # 코어 종료 시간 사용
 
     row = [                                                        # CSV 한 줄 구성
-        run_id,                                                     # 실험 ID
-        timestamp,                                                  # 저장 시각
-        _blank(diameter, 4),                                        # 추정 지름
-        _blank(init_freq, 1),                                       # 초기 주파수
-        _blank(init_air_len, 4),                                    # 초기 공기층
-        _blank(target_f, 1),                                        # 목표 주파수
-        _blank(final_freq, 1),                                      # 정지 주파수
-        _blank(stop_target_diff, 1),                                # 목표 대비 정지 주파수 차이
-        _blank(estimated_stop_air_cm, 4),                           # 정지 순간 추정 공기층
-        _blank(actual_air_cm, 4),                                   # 실측 공기층
-        _blank(r2_final, 4),                                        # 회귀 R²
-        int(total_samples),                                         # 총 샘플 수
-        _blank(getattr(core, 'max_freq_seen', None), 1),            # 최대 관측 주파수
+        int(trial_no),                                             # 실험 순번
+        cup_type_text,                                             # 컵 종류
+        _blank(target_pct, 1),                                     # 목표 채움률
+        _blank(diameter, 4),                                       # 기존 추정 지름
+        _blank(getattr(core, 'last_d_locked_cm', None), 4),        # 잠금 D
+        _blank(getattr(core, 'last_d_candidate_median', None), 4), # D 후보 중앙값
+        _blank(getattr(core, 'last_d_candidate_mad', None), 4),    # D 후보 MAD
+        _blank(init_freq, 1),                                      # 초기 주파수
+        _blank(getattr(core, 'last_init_air_by_initfreq_cm', None), 4),    # initfreq 기반 H
+        _blank(getattr(core, 'last_init_air_by_regression_cm', None), 4),  # regression 기반 H
+        _blank(getattr(core, 'last_init_air_locked_cm', init_air_len), 4), # 잠금 H
+        _blank(target_f, 1),                                       # 목표 주파수
+        _blank(raw_stop_freq, 1),                                  # raw 정지 후보 주파수
+        _blank(decision_freq, 1),                                  # decision 주파수
+        _blank(final_freq, 1),                                     # 화면/그래프 기준 정지 주파수
+        _blank(stop_target_diff, 1),                               # 목표 대비 decision 주파수 차이
+        _blank(estimated_stop_air_cm, 4),                          # 정지 순간 추정 공기층
+        _blank(getattr(core, 'last_decision_fill_pct', None), 2),  # decision 채움률
+        _blank(estimated_stop_fill_pct, 2),                        # 공기층 기반 추정 채움률
+        _blank(actual_air_cm, 4),                                  # 실측 공기층
+        _blank(actual_fill_pct, 2),                                # 실측 채움률
+        _blank(fill_error_pct, 2),                                 # 실측 오차
+        _blank(r2_final, 4),                                       # 회귀 R²
+        _bool_text(getattr(core, 'theory_locked', False)),         # 이론 곡선 잠금 여부
+        _bool_text(getattr(core, 'last_model_valid', False)),      # 모델 유효 여부
+        _safe_str(getattr(core, 'last_reject_reason', 'unknown')), # 모델 보류/거부 이유
+        int(_num(total_samples, 0)),                               # 총 샘플 수
+        _blank(getattr(core, 'max_freq_seen', None), 1),           # 최대 관측 주파수
+        _blank(getattr(core, 'noise_floor_level', None), 4),       # 노이즈 플로어
+        _blank(getattr(core, 'dynamic_Q', None), 3),               # 동적 유량
+        int(_num(getattr(core, 'consecutive_stop_hits', 0), 0)),   # 정지 누적 횟수
+        int(_num(getattr(core, 'STOP_TRIGGER_COUNT', 0), 0)),      # 정지 기준 횟수
+        int(_num(getattr(core, 'spike_blocked_count', 0), 0)),     # 스파이크 차단 횟수
+        _blank(stop_elapsed_sec, 3),                               # 정지까지 걸린 시간
+        _safe_str(getattr(core, 'last_control_profile', 'default')),  # 진단 프로파일
     ]
 
     try:                                                           # 저장 시도
@@ -128,13 +259,13 @@ def save_to_csv(                                                   # CSV 저장 
             writer.writerow(row)                                   # 데이터 한 줄 저장
 
         print(f'\n[저장 완료] {filename}')                         # 저장 완료 출력
-        print(f'  Run_ID={run_id}')                                # 실험 ID 출력
-        print(f'  D={_num(diameter):.2f}cm | InitAir={_num(init_air_len):.2f}cm')  # 핵심 추정값 출력
-        print(f'  StopF={_num(final_freq):.1f}Hz | TargetF={_num(target_f):.1f}Hz | R²={_num(r2_final):.4f}')  # 주파수/R² 출력
-        if actual_air_cm is not None:                              # 실측값이 있으면
-            print(f'  ActualAir={_num(actual_air_cm):.2f}cm')       # 실측 공기층 출력
+        print(f'  Trial_No={trial_no} | Cup={cup_type_text}')       # 실험 번호/컵 종류 출력
+        print(f'  Target={target_pct:.1f}% | Actual={_blank(actual_fill_pct, 2)}% | Error={_blank(fill_error_pct, 2)}%')  # 오차 출력
+        print(f'  D_locked={_num(getattr(core, "last_d_locked_cm", 0.0)):.2f}cm | H_locked={_num(getattr(core, "last_init_air_locked_cm", init_air_len)):.2f}cm')  # 핵심 모델 출력
+        print(f'  DecisionF={_num(decision_freq):.1f}Hz | RawF={_num(raw_stop_freq):.1f}Hz | TargetF={_num(target_f):.1f}Hz | R²={_num(r2_final):.4f}')  # 주파수/R² 출력
+        print(f'  ModelValid={_bool_text(getattr(core, "last_model_valid", False))} | Reason={_safe_str(getattr(core, "last_reject_reason", "unknown"))}')  # 모델 유효성 출력
+        print(f'  TheoryLocked={_bool_text(getattr(core, "theory_locked", False))} | SpikeBlocked={int(_num(getattr(core, "spike_blocked_count", 0), 0))}')  # 신뢰도 출력
 
     except Exception as e:                                         # 저장 실패 시
         print(f'\n[저장 실패] {e}')                                # 오류 출력
-
 
