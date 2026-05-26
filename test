@@ -1,4 +1,15 @@
-# smart_water_core.py  ── v5.31-stag-log
+# smart_water_core.py  ── v5.32-predict-bridge
+#
+# [v5.32-PREDICT-BRIDGE] 검출 신뢰구간 종료 후 '유량 기반 예측 정지' (옵션 A)
+#   넓은 용기(D 큼)에서는 후반부에 공기층 길이 L이 관 반지름 a보다 짧아져
+#   사분파장 단관 모델(f=c/4L_eff)이 유효범위를 벗어나고, 검출 주파수가 ~2000Hz에서
+#   포화한다(끝보정 k·D가 실제 L보다 커지는 지점). 그래서 90% 목표 주파수에
+#   도달하지 못하고 항상 넘침.
+#   → 검출이 신뢰구간(~PREDICT_ENTRY_PCT)을 지나 '정체'하면, 그 직전 신뢰구간의
+#     충전속도 dL/dt(직선적합)를 시간 외삽해 후반부 수위를 메우고 정지 결정을 내린다.
+#   → 정체가 없으면(검출이 끝까지 잘 오르는 소형 용기) 예측은 발동하지 않음 → 기존 동작 유지.
+#   ※ 중력식이라 시간↑ → Q↓ 이므로 신뢰구간 기울기로 외삽하면 약간 '이른' 정지(=약간 덜 참)
+#     쪽으로 편향됨 — 넘침 방지 관점에서는 안전한 방향. PREDICT_* 상수로 튜닝.
 #
 # [v5.31-STAG-LOG] 후반부 '주파수 정체' 진단 로그 추가 (제어/검출 경로 변경 없음)
 #   정체 구간에서 raw / stable_f / f_for_stop 변화율을 콘솔에 찍어
@@ -58,7 +69,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 18.0        # ml/s 실측값 (v5.27)
+FLOW_RATE        = 15.0        # ml/s 실측값 (v5.27)
 DIAMETER_EST_FLOW_RATE = 15.0  # [v5.32-DH-RECAL] D 역산용 유효 유량
 END_CORRECTION_K = 0.35
 
@@ -96,11 +107,11 @@ ZONE_EMA_ALPHA = {
 
 # ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
 ZONE_ADVANCE_PCT = {
-    50:  0.0,
-    60:  0.0,
-    70:  0.0,
-    80:  0.0,
-    90:  0.0,
+    50:  1.0,
+    60:  1.0,
+    70:  1.0,
+    80:  1.0,
+    90:  1.0,
 }
 
 # ── [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준 ──────────
@@ -121,6 +132,16 @@ REG_SPIKE_GATE_EARLY = REG_SPIKE_GATE * 2.5   # = 0.20
 
 # ── [v5.28-FILL-RATE] fill_pct 상방향 속도 제한 ─────────────────────
 FILL_PCT_RATE_LIMIT = 2.0   # %/청크, 상방향만 적용
+
+# ── [v5.32-PREDICT-BRIDGE] 검출 신뢰구간 종료 후 유량 기반 예측 정지 ──────
+#   검출이 PREDICT_ENTRY_PCT를 넘은 뒤 정체하면, 직전 신뢰구간의 dL/dt 직선을
+#   시간 외삽해 후반부 수위를 메운다. (정체가 없으면 미발동)
+PREDICT_ENTRY_PCT     = 65.0   # 검출 수위가 이 %를 넘은 뒤 '정체'하면 예측 발동
+PREDICT_STALL_WIN_SEC = 1.5    # 정체 판정 구간(초)
+PREDICT_STALL_PCT     = 2.0    # 위 구간 동안 검출수위 상승 < 이 값(%)이면 정체로 판단
+PREDICT_RATE_WIN_SEC  = 2.5    # dL/dt 직선적합에 쓸 신뢰구간 길이(초)
+PREDICT_RATE_LAG_SEC  = 1.2    # 정체 직전(현재-LAG)까지를 신뢰구간 끝으로 사용
+PREDICT_MIN_PTS       = 6      # 직선적합 최소 표본 수
 
 # ── [v5.25-SNR] 노이즈 플로어 ────────────────────────────────────────
 SNR_THRESHOLD      = 2.0
@@ -300,6 +321,12 @@ dynamic_Q       = FLOW_RATE   # [v5.25-DYN-Q]
 _stag_buffer   = deque(maxlen=40)   # (t, raw_f, stable_f, f_for_stop)
 _stag_last_log = 0.0
 
+# [v5.32-PREDICT-BRIDGE] 유량 기반 예측 정지 상태
+_predict_buf    = deque(maxlen=80)   # (t, current_air) 신뢰구간 표본
+_predict_active = False              # 예측 모드 진입 여부
+_predict_m      = 0.0                # current_air ≈ m·t + b 의 기울기(cm/s, 충전 중 음수)
+_predict_b      = 0.0
+
 _reg_event = threading.Event()
 
 # ── GPIO 초기화 ──────────────────────────────────────────────────────
@@ -371,6 +398,32 @@ def _get_init_air_offset(init_f: float, diameter: float) -> float:
     if init_f < INIT_OFFSET_MID_FREQ_HZ:
         return INIT_OFFSET_LARGE_MID_CM if diameter >= INIT_OFFSET_LARGE_D_CM else INIT_OFFSET_SMALL_MID_CM
     return INIT_OFFSET_HIGH_FREQ_CM
+
+
+# ════════════════════════════════════════════════════════════════════
+#  [v5.32-PREDICT-BRIDGE] 신뢰구간 dL/dt 직선 적합
+# ════════════════════════════════════════════════════════════════════
+def _estimate_air_line(buf, t_end, win, lag):
+    """신뢰구간 [t_end-lag-win, t_end-lag]의 (t, current_air) 표본으로
+    current_air ≈ m·t + b 직선을 적합한다. 충전 중이면 m<0.
+    적합 불가(표본 부족/스팬 부족/예외) 시 (None, None) 반환."""
+    if not buf:
+        return None, None
+    t_hi = t_end - lag
+    t_lo = t_end - lag - win
+    ts = [t for (t, a) in buf if t_lo <= t <= t_hi]
+    ar = [a for (t, a) in buf if t_lo <= t <= t_hi]
+    if len(ts) < PREDICT_MIN_PTS:           # 표본 부족
+        return None, None
+    ts = np.array(ts, dtype=float)
+    ar = np.array(ar, dtype=float)
+    if ts.max() - ts.min() < 0.8:           # 시간 스팬 부족 → 기울기 불안정
+        return None, None
+    try:
+        m, b = np.polyfit(ts, ar, 1)
+    except Exception:
+        return None, None
+    return float(m), float(b)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -769,6 +822,7 @@ def start_filling_local() -> None:
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
     global _stag_buffer, _stag_last_log
+    global _predict_buf, _predict_active, _predict_m, _predict_b
 
     with lock:
         is_filling              = True
@@ -830,6 +884,10 @@ def start_filling_local() -> None:
         init_stable_buffer      = deque(maxlen=10)
         _stag_buffer            = deque(maxlen=40)   # [v5.31-STAG-LOG]
         _stag_last_log          = 0.0
+        _predict_buf            = deque(maxlen=80)   # [v5.32-PREDICT-BRIDGE]
+        _predict_active         = False
+        _predict_m              = 0.0
+        _predict_b              = 0.0
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
 
@@ -872,6 +930,7 @@ def audio_callback(indata, frames, time_info, status):
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
     global _stag_buffer, _stag_last_log
+    global _predict_buf, _predict_active, _predict_m, _predict_b
 
     if not is_filling:
         return
@@ -1242,6 +1301,7 @@ def audio_callback(indata, frames, time_info, status):
             _cd       = bool(calibration_done)
             _cur_d2   = float(current_diameter)
             _init_air = float(init_air_len_cm)
+            _eff_tgt2 = float(_eff_target_air_cm)   # [v5.32] 목표 공기층(cm)
 
         if filling_elapsed > CONTROL_START_TIME and _cd and stable_f > 0:
             # [v5.30-STABLE-CTRL] 제어 주파수 = stable_f (EMA+median)
@@ -1260,7 +1320,58 @@ def audio_callback(indata, frames, time_info, status):
                 last_current_air = float(current_air)
 
             if _init_air > 0:
-                fill_pct = max(0.0, min(100.0, (1.0 - current_air / _init_air) * 100.0))
+                # ── 검출 기반 수위 (f_for_stop) ──
+                fill_pct_det = max(0.0, min(100.0, (1.0 - current_air / _init_air) * 100.0))
+
+                # ── [v5.32-PREDICT-BRIDGE] 유량 기반 예측 브릿지 ──────────────
+                #   검출이 신뢰구간(~PREDICT_ENTRY_PCT)을 지나 '정체'하면, 직전 신뢰구간의
+                #   dL/dt 직선(air=m·t+b)을 시간 외삽해 후반부 수위를 메운다.
+                #   정체가 없으면 발동하지 않음 → 검출이 잘 되는 소형 용기는 기존 동작 유지.
+                if not _predict_active:
+                    _predict_buf.append((filling_elapsed, current_air))
+
+                    # 정체 감지: 최근 STALL_WIN초 동안 검출 수위 상승량 < STALL_PCT
+                    _recent = [a for (t, a) in _predict_buf
+                               if t >= filling_elapsed - PREDICT_STALL_WIN_SEC]
+                    _stalled = False
+                    if (len(_recent) >= 3
+                            and fill_pct_det >= PREDICT_ENTRY_PCT
+                            and fill_pct_det < TARGET_FILL_PCT):
+                        _fill_old = (1.0 - _recent[0] / _init_air) * 100.0
+                        if (fill_pct_det - _fill_old) < PREDICT_STALL_PCT:
+                            _stalled = True
+
+                    if _stalled:
+                        _m, _b = _estimate_air_line(list(_predict_buf), filling_elapsed,
+                                                    PREDICT_RATE_WIN_SEC, PREDICT_RATE_LAG_SEC)
+                        if _m is not None and _m < 0:
+                            # dL/dt 물리범위 clamp: |dL/dt| ∈ [DYNAMIC_Q_MIN, FLOW_RATE]/단면적
+                            _A = np.pi * (_cur_d2 / 2.0) ** 2          # 단면적 cm²
+                            if _A > 1e-6:
+                                _rate_fast = -FLOW_RATE / _A           # 가장 빠른(가장 음수)
+                                _rate_slow = -DYNAMIC_Q_MIN / _A       # 가장 느린
+                                _m_clamped = max(_rate_fast, min(_rate_slow, _m))
+                                if _m_clamped != _m:
+                                    # 기울기를 clamp하면 신뢰구간 끝점(앵커)을 통과하도록 b 재계산
+                                    # → clamp 후에도 직선이 마지막 신뢰값과 연속되게 유지
+                                    _anchor_t   = filling_elapsed - PREDICT_RATE_LAG_SEC
+                                    _anchor_air = _m * _anchor_t + _b
+                                    _b = _anchor_air - _m_clamped * _anchor_t
+                                    _m = _m_clamped
+                            _predict_active = True
+                            _predict_m, _predict_b = _m, _b
+                            print(f'\n[★ 예측브릿지 ON] t={filling_elapsed:.1f}s '
+                                  f'검출정체({fill_pct_det:.0f}%) | air={_m:.3f}·t+{_b:.2f} '
+                                  f'(dL/dt={_m:.3f}cm/s)')
+
+                if _predict_active:
+                    _pred_air      = _predict_m * filling_elapsed + _predict_b
+                    _pred_air      = max(_pred_air, _eff_tgt2 * 0.3)        # 폭주 방지 하한
+                    _fill_pct_pred = max(0.0, min(100.0, (1.0 - _pred_air / _init_air) * 100.0))
+                    fill_pct       = max(fill_pct_det, _fill_pct_pred)      # 검출/예측 중 큰 값
+                else:
+                    _fill_pct_pred = 0.0
+                    fill_pct       = fill_pct_det
 
                 # [v5.28-FILL-RATE] 상방향 속도 제한
                 with lock:
@@ -1318,21 +1429,23 @@ def audio_callback(indata, frames, time_info, status):
                 mode_str   = '[T]' if tracking_mode else '   '
                 lock_str   = '[R]' if theory_locked  else '   '
                 fin_str    = '[F]' if in_final        else '   '
+                pred_str   = '[P]' if _predict_active else '   '   # [v5.32] 예측브릿지
                 bar_len    = min(_hits, STOP_TRIGGER_COUNT)
                 bar        = '#' * bar_len + '-' * (STOP_TRIGGER_COUNT - bar_len)
                 adv_str    = f' adv:{total_advance:+.0f}%' if zone_adv != 0 else ''
                 dscale_now = _get_diam_ema_scale(_cur_d2, fill_pct if _init_air > 0 else 0.0)
                 if _init_air > 0:
+                    _det_str = f'det:{fill_pct_det:.0f}% ' if _predict_active else ''
                     print(
-                        f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
-                        f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}%{adv_str} '
+                        f'{mode_str}{lock_str}{fin_str}{pred_str}[제어] D:{_cur_d2:.2f}cm '
+                        f'| Level:{fill_pct:.1f}%/{TARGET_FILL_PCT:.1f}%{adv_str} {_det_str}'
                         f'| α:{alpha_det:.2f}×{dscale_now:.2f} '
                         f'| smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz [{bar}]',
                         end='\r'
                     )
                 else:
                     print(
-                        f'{mode_str}{lock_str}{fin_str}[제어] D:{_cur_d2:.2f}cm '
+                        f'{mode_str}{lock_str}{fin_str}{pred_str}[제어] D:{_cur_d2:.2f}cm '
                         f'| L:{current_air:.2f}cm (측정중) '
                         f'| α:{alpha_det:.2f}×{dscale_now:.2f} '
                         f'| smo:{stable_f:.0f}Hz ema:{f_for_stop:.0f}Hz [{bar}]',
