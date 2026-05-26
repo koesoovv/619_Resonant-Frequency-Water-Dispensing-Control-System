@@ -1,4 +1,11 @@
-# smart_water_core.py  ── v5.30-stable-ctrl
+# smart_water_core.py  ── v5.31-stag-log
+#
+# [v5.31-STAG-LOG] 후반부 '주파수 정체' 진단 로그 추가 (제어/검출 경로 변경 없음)
+#   정체 구간에서 raw / stable_f / f_for_stop 변화율을 콘솔에 찍어
+#   정체 원인이 '검출단계(LPC/FFT)'인지 '후처리(median/EMA)'인지 구분한다.
+#   ※ 동작(제어·검출)은 v5.30과 100% 동일. 로그만 추가.
+#   ※ current_air가 stable_f가 아닌 f_for_stop을 쓰는 주석/동작 불일치는
+#     '동작 변경 없이' 주석만 사실에 맞게 수정 (어느 쪽으로 통일할지는 그래프 확인 후 결정).
 #
 # [v5.30-STABLE-CTRL] 제어 주파수를 stable_f로 변경
 #   current_air = c/(4*stable_f) - k*D  (EMA+median 기반)
@@ -288,6 +295,10 @@ init_stable_buffer    = deque(maxlen=10)
 
 peak_lock_floor = 0.0
 dynamic_Q       = FLOW_RATE   # [v5.25-DYN-Q]
+
+# [v5.31-STAG-LOG] 후반부 정체 진단용 (제어/검출에 영향 없음, 로그 전용)
+_stag_buffer   = deque(maxlen=40)   # (t, raw_f, stable_f, f_for_stop)
+_stag_last_log = 0.0
 
 _reg_event = threading.Event()
 
@@ -757,6 +768,7 @@ def start_filling_local() -> None:
     global last_d_locked_cm, last_d_candidate_median, last_d_candidate_mad
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
+    global _stag_buffer, _stag_last_log
 
     with lock:
         is_filling              = True
@@ -816,6 +828,8 @@ def start_filling_local() -> None:
         _eff_target_air_cm      = 3.0
         peak_lock_floor         = 0.0
         init_stable_buffer      = deque(maxlen=10)
+        _stag_buffer            = deque(maxlen=40)   # [v5.31-STAG-LOG]
+        _stag_last_log          = 0.0
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
 
@@ -857,6 +871,7 @@ def audio_callback(indata, frames, time_info, status):
     global last_d_locked_cm, last_d_candidate_median, last_d_candidate_mad
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
+    global _stag_buffer, _stag_last_log
 
     if not is_filling:
         return
@@ -1237,7 +1252,9 @@ def audio_callback(indata, frames, time_info, status):
                 last_raw_stop_freq = f_for_stop
                 last_decision_freq = stable_f    # 실제 제어 기준 주파수
 
-            # [v5.30] current_air 계산에 stable_f 사용
+            # [주의/v5.31] 헤더의 'stable_f 제어' 주석과 달리 실제 제어는 f_for_stop을 사용한다.
+            #   동작은 v5.30과 동일하게 유지(변경 금지) — 그래프(검증법 참고)로 어느 신호가
+            #   후반부 상승을 가장 잘 따라가는지 확인한 뒤, 한쪽으로 통일할 것.
             current_air = SOUND_SPEED / (4 * f_for_stop) - END_CORRECTION_K * _cur_d2
             with lock:
                 last_current_air = float(current_air)
@@ -1256,6 +1273,26 @@ def audio_callback(indata, frames, time_info, status):
                     last_decision_fill_pct = fill_pct
                     last_model_valid       = True
                     last_reject_reason     = 'ok'
+
+                # ── [v5.31-STAG-LOG] 후반부 정체 진단 (제어에 영향 없음, 로그 전용) ──
+                # 최근 ~약 40청크 동안의 raw / stable_f / f_for_stop 변화율(Hz/s)을 계산.
+                # stable_f가 사실상 안 오르는데(<10Hz/s) 목표까지 5%+ 남았으면 정체로 판단하고,
+                # raw도 안 오르면 '검출단계', raw는 오르는데 stable만 평평하면 '후처리' 문제.
+                _stag_buffer.append((filling_elapsed, raw_f_for_reg, stable_f, f_for_stop))
+                if (current_time - _stag_last_log >= 1.0          # 1초에 한 번만 출력
+                        and len(_stag_buffer) >= 10               # 표본 충분
+                        and fill_pct < TARGET_FILL_PCT - 5.0):     # 아직 목표까지 5%+ 남음
+                    _arr = list(_stag_buffer)
+                    _dt  = max(_arr[-1][0] - _arr[0][0], 1e-6)     # 0 나눗셈 방지
+                    _d_raw  = (_arr[-1][1] - _arr[0][1]) / _dt     # raw 검출 변화율
+                    _d_smo  = (_arr[-1][2] - _arr[0][2]) / _dt     # stable_f 변화율
+                    _d_stop = (_arr[-1][3] - _arr[0][3]) / _dt     # f_for_stop 변화율
+                    if abs(_d_smo) < 10.0:                          # stable_f 정체
+                        _src = '검출단계(LPC/FFT)' if abs(_d_raw) < 10.0 else '후처리(median/EMA)'
+                        print(f'\n[정체감지] t={filling_elapsed:.1f}s 추정원인={_src}'
+                              f' | d_raw={_d_raw:+.0f} d_smo={_d_smo:+.0f} d_stop={_d_stop:+.0f} Hz/s'
+                              f' | fill={fill_pct:.0f}%/{TARGET_FILL_PCT:.0f}%')
+                    _stag_last_log = current_time
 
                 zone_adv      = _get_zone_advance()
                 total_advance = STOP_ADVANCE_PCT + zone_adv
