@@ -1,0 +1,1251 @@
+# user_kiosk_gui.py ── 사용자 전용 키오스크 GUI (customtkinter)
+#
+#  python user_kiosk_gui.py
+#  ESC → 전체화면 해제 (개발 중 편의용)
+
+import platform
+import os
+import time
+import datetime
+import threading
+import tkinter as tk
+import customtkinter as ctk
+import smart_water_core as core
+from csv_logger import save_to_csv
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
+
+# ── 플랫폼별 폰트 ────────────────────────────────────────────────────
+_os = platform.system()
+
+if _os == 'Windows':
+    import ctypes as _ct
+    _font_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts')
+    for _fn in [
+        'Pretendard-Regular.ttf', 'Pretendard-Bold.ttf', 'Pretendard-SemiBold.ttf',
+        'Pretendard-Medium.ttf', 'Pretendard-Light.ttf',
+        'JetBrainsMono-Regular.ttf', 'JetBrainsMono-Bold.ttf', 'JetBrainsMono-Medium.ttf',
+    ]:
+        _fp = os.path.join(_font_dir, _fn)
+        if os.path.exists(_fp):
+            _ct.windll.gdi32.AddFontResourceExW(_fp, 0x10, 0)
+
+# 전체 UI 폰트
+# Windows에서는 Pretendard를 우선 사용하고, Raspberry Pi/Linux에서는 Noto Sans CJK KR을 우선 사용한다.
+# 해당 폰트가 없으면 Tk가 시스템 기본 폰트로 자동 대체한다.
+FONT_SANS = 'NanumBarunGothic' if _os == 'Windows' else 'NanumBarunGothic'
+FONT_MONO = 'NanumBarunGothic' if _os == 'Windows' else 'NanumBarunGothic'
+FONT_NUM  = FONT_SANS  # 사용자 화면의 큰 숫자는 딱딱한 모노 폰트 대신 둥근 UI 폰트 사용
+
+# ── 색상 ─────────────────────────────────────────────
+BG        = '#070c18'
+SURFACE   = '#0d1526'
+BORDER    = '#1e3a5f'
+CYAN      = '#67e8f9'
+BLUE      = '#3b82f6'
+AMBER     = '#fbbf24'
+GREEN_CLR = '#22c55e'
+MUTED     = '#4b6280'
+
+# ── 화면 스케일 ─────────────────────────────────────
+# 컵이 작게 보이지 않도록 사용자 환경 GUI 기준으로 확대한다.
+SCALE = 0.66
+
+# ── 컵 캔버스 크기 ───────────────────────────────────
+CUP_CW, CUP_CH = int(610 * SCALE), int(620 * SCALE)
+
+# 원통형 컵 기준 좌표
+CUP_TX, CUP_TY   = int(305 * SCALE), int(108 * SCALE)
+CUP_TRX, CUP_TRY = int(162 * SCALE), int(23  * SCALE)
+CUP_BX, CUP_BY   = int(305 * SCALE), int(516 * SCALE)
+CUP_BRX, CUP_BRY = int(128 * SCALE), int(17  * SCALE)
+CUP_INNER_H = CUP_BY - CUP_TY
+
+# 원형 링
+RING_CX, RING_CY = int(305 * SCALE), int(314 * SCALE)
+RING_R = int(215 * SCALE)
+
+# ── 사용자 GUI 표시용 수위 보정 ─────────────────────────
+# 실제 급수 제어용 값은 건드리지 않고, 화면에 보이는 퍼센트만 자연스럽게 보정한다.
+DISPLAY_RAW_DISPLAY_BOOST_PCT = 2.0  # 현재 % 생성 후 지연 보정용으로 화면에는 +2% 높게 표시
+DISPLAY_FALL_PER_SEC   = 8.0         # 목표 수위를 낮추거나 정지 보정 시 내려가는 최대 속도(%/s)
+
+# ── GUI 부드러움/부하 조절 ─────────────────────────────────────────
+# Raspberry Pi에서 무리가 가지 않도록 20fps 수준으로 컵 애니메이션만 올리고,
+# 상태값 갱신은 12.5fps 수준으로 유지한다.
+CANVAS_ANIM_MS = 45                  # 컵 물결/수위 애니메이션 주기(ms), 80ms → 50ms
+UI_UPDATE_MS   = 70                  # core 상태값을 GUI에 반영하는 주기(ms), 100ms → 80ms
+VOICE_ORB_RENDER_SKIP = 3            # 음성 오브 PIL 렌더링은 2프레임마다 1회만 수행
+WATER_GRADIENT_STRIPS = 8           # 물 그라디언트 조각 수. 14 → 10으로 줄여 CPU 부하 완화
+VOICE_ORB_POINTS = 40                # 음성 오브 외곽 점 개수. 56 → 40으로 줄여 부하 완화
+
+# 초반 주파수 기반 컵 크기 판정값.
+# 큰 컵은 초반 공명 주파수가 낮고, 작은 컵은 초반 공명 주파수가 높게 나오는 특성을 이용한다.
+DISPLAY_PROFILE_UNKNOWN = 'unknown'  # 아직 컵 크기 추정 전
+DISPLAY_PROFILE_LARGE   = 'large'    # 대략 700~920Hz 시작: 큰 컵
+DISPLAY_PROFILE_MID     = 'mid'      # 대략 920~1050Hz 시작: 중간 컵
+DISPLAY_PROFILE_SMALL   = 'small'    # 대략 1050Hz 이상 시작: 작은 컵
+
+DISPLAY_FREQ_MIN_HZ        = 650.0   # 프로파일 판정에 사용할 최소 유효 초반 주파수
+DISPLAY_FREQ_MAX_HZ        = 1350.0  # 프로파일 판정에 사용할 최대 유효 초반 주파수
+DISPLAY_LARGE_MAX_HZ       = 920.0   # 큰 컵 초반 주파수가 800대까지 나오는 점을 반영
+DISPLAY_SMALL_MIN_HZ       = 1050.0  # 이 값 이상이면 작은 컵 표시 속도
+DISPLAY_PROFILE_MIN_COUNT  = 6       # 최소 유효 주파수 샘플 수
+DISPLAY_PROFILE_LOCK_SEC   = 1.3     # 출수 후 이 시간 이상 지나면 중앙값으로 프로파일 확정
+DISPLAY_PROFILE_FORCE_SEC  = 2.6     # 샘플이 적어도 이 시간 이후에는 가능한 값으로 강제 확정
+
+# 표시 속도는 목표 %가 아니라 초반 주파수로 추정한 컵 크기 프로파일을 따른다.
+# small일수록 같은 유량에서 실제 채움률 변화가 빠르므로 GUI 표시 속도도 빠르게 둔다.
+DISPLAY_PROFILE_TABLE = {
+    DISPLAY_PROFILE_UNKNOWN: {
+        'time_per_sec': 2.8,         # 주파수/프로파일 없음: 임시 상승을 느리게 둠(%/s)
+        'rise_per_sec': 4.2,         # 주파수 없는 초반 구간에서 화면이 너무 먼저 올라가지 않게 제한
+        'catchup_per_sec': 14.0,     # 현재 % 생성 후 따라붙는 속도는 과하지 않게 유지
+        'canvas_alpha': 0.18,        # 컵 그림 보간 반응성
+        'canvas_max_step': 24.0,     # 컵 그림 초당 최대 변화량(%/s)
+    },
+    DISPLAY_PROFILE_LARGE: {
+        'time_per_sec': 4.0,         # 큰 컵: 800Hz대까지 large로 보고 천천히 상승
+        'rise_per_sec': 6.5,
+        'catchup_per_sec': 15.0,
+        'canvas_alpha': 0.19,
+        'canvas_max_step': 30.0,
+    },
+    DISPLAY_PROFILE_MID: {
+        'time_per_sec': 5.0,         # 중간 컵: 기본 속도
+        'rise_per_sec': 8.0,
+        'catchup_per_sec': 20.0,
+        'canvas_alpha': 0.23,
+        'canvas_max_step': 38.0,
+    },
+    DISPLAY_PROFILE_SMALL: {
+        'time_per_sec': 6.7,         # 작은 컵: 기존보다 약 25~30% 낮춘 빠른 속도
+        'rise_per_sec': 10.5,
+        'catchup_per_sec': 28.0,
+        'canvas_alpha': 0.28,
+        'canvas_max_step': 52.0,
+    },
+}
+
+DISPLAY_WATER_SETTLE_SECONDS = 0.25  # solenoid_on 직후 실제 물이 나오기까지의 짧은 기계 지연 보정
+DISPLAY_START_GUARD_SECONDS = 2.0    # 실제 물 출수 직후 비정상 추정값을 화면에 바로 반영하지 않는 시간
+DISPLAY_EARLY_SPIKE_LIMIT_PCT = 25.0 # 시작 직후 이 값보다 큰 추정 수위는 순간 튐으로 보고 무시
+DISPLAY_MIN_VALID_AIR_CM = 0.3       # air=0 같은 초기화값이 100%로 계산되는 것을 차단
+DISPLAY_MAX_BEHIND_RAW_PCT = 10.0    # 표시 수위가 안정 추정 수위보다 너무 뒤처지지 않게 제한
+DISPLAY_RAW_SOFT_AHEAD_PCT = 14.0    # 안정 추정 수위보다 이 정도 앞서는 것은 허용
+DISPLAY_RAW_STALE_RELAX_SECONDS = 0.5 # 안정 추정값이 갱신되지 않아도 이 시간 이후부터 상한 완화
+DISPLAY_RAW_STALE_RELAX_PER_SEC = 8.0 # 안정 추정값이 오래 멈춰 있을 때 표시 상한 완화 속도
+DISPLAY_RAW_UP_CONFIRM_SECONDS = 0.35 # 실제 추정 수위 상승이 이 시간 이상 반복될 때만 표시 목표에 반영
+DISPLAY_RAW_UP_MARGIN_PCT = 0.7      # 이 값 이상 오른 추정값만 상승 후보로 봄
+DISPLAY_RAW_JITTER_RESET_PCT = 5.5   # 상승 후보가 이 이상 흔들리면 확인 시간 초기화
+
+
+def _get_display_profile_value(profile: str, key: str, default: float) -> float:
+    """초반 주파수 기반 표시 프로파일에서 속도 값을 꺼낸다."""
+    table = DISPLAY_PROFILE_TABLE.get(profile) or DISPLAY_PROFILE_TABLE[DISPLAY_PROFILE_UNKNOWN]
+    try:
+        return float(table.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _profile_from_early_freq(freq_hz: float) -> str:
+    """초반 주파수 중앙값으로 GUI 표시용 컵 크기 프로파일을 판정한다."""
+    try:
+        f = float(freq_hz)
+    except (TypeError, ValueError):
+        return DISPLAY_PROFILE_UNKNOWN
+    if f <= 0:
+        return DISPLAY_PROFILE_UNKNOWN
+    if f < DISPLAY_LARGE_MAX_HZ:
+        return DISPLAY_PROFILE_LARGE
+    if f >= DISPLAY_SMALL_MIN_HZ:
+        return DISPLAY_PROFILE_SMALL
+    return DISPLAY_PROFILE_MID
+
+
+import random, math
+
+
+class CupCanvas(tk.Canvas):
+    _RIPPLE_WAVES = 1
+    _RIPPLE_DELAY = 14
+    _RIPPLE_SPEED = 1.8
+    _RIPPLE_MAX   = int(30 * SCALE)
+
+    _ORB_LAYERS = [
+        {'color': (100,  80, 255), 'r_mult': 1.00, 'amp': 0.13, 'spd': 0.9,  'phase': 0.0, 'alpha': 75},
+        {'color': (160,  60, 255), 'r_mult': 0.82, 'amp': 0.18, 'spd': 1.2,  'phase': 1.1, 'alpha': 95},
+        {'color': (240,  50, 180), 'r_mult': 0.64, 'amp': 0.22, 'spd': 0.75, 'phase': 2.2, 'alpha': 110},
+        {'color': (255,  80, 130), 'r_mult': 0.46, 'amp': 0.20, 'spd': 1.45, 'phase': 3.3, 'alpha': 120},
+    ]
+
+    def __init__(self, master, **kw):
+        super().__init__(master, width=CUP_CW, height=CUP_CH,
+                         bg=BG, highlightthickness=0, **kw)
+        self._pct            = 0.0       # 현재 화면에 실제로 그려지는 수위
+        self._pct_target     = 0.0       # 화면이 부드럽게 따라갈 목표 수위
+        self._last_smooth_t  = time.time()  # 수위 보간용 마지막 프레임 시각
+        self._target         = 70.0      # 목표 급수량
+        self._display_profile = DISPLAY_PROFILE_UNKNOWN  # 초반 주파수 기반 GUI 표시 속도 프로파일
+        self._filling        = False
+        self._voice          = False
+        self._voice_t        = 0
+        self._wave_t         = 0
+        self._bubbles        = [self._new_bubble() for _ in range(5)]
+        self._complete_active = False
+        self._complete_t      = 0
+        self._anim_id        = None
+        self._voice_photo    = None
+        self._orb_frame       = 0     # 음성 오브 렌더링 부하 조절용 프레임 카운터
+        self._redraw()
+        self._animate()
+
+    def _new_bubble(self):
+        x = random.uniform(CUP_BX - CUP_BRX * 0.6, CUP_BX + CUP_BRX * 0.6)
+        y = random.uniform(CUP_BY - 10, CUP_BY - 5)
+        return [x, y, random.uniform(2, 4), random.uniform(0.4, 1.0)]
+
+    def _rx_at(self, y):
+        r = (CUP_BY - y) / CUP_INNER_H
+        return CUP_BRX + (CUP_TRX - CUP_BRX) * r
+
+    def _animate(self):
+        # 표시 수위 자체를 부드럽게 보간한다.
+        # periodic_update()에서 목표 수위가 계단식으로 들어와도 컵 그림은 천천히 따라간다.
+        now = time.time()
+        dt = max(0.016, min(0.12, now - self._last_smooth_t))
+        self._last_smooth_t = now
+
+        diff = self._pct_target - self._pct
+        if abs(diff) < 0.05:
+            self._pct = self._pct_target
+        else:
+            # 초반 주파수로 판정한 컵 크기 프로파일에 따라 컵 애니메이션 속도를 조절한다.
+            smooth_alpha = _get_display_profile_value(self._display_profile, 'canvas_alpha', 0.22)
+            max_step = _get_display_profile_value(self._display_profile, 'canvas_max_step', 34.0) * dt
+            step = diff * smooth_alpha
+            step = max(-max_step, min(max_step, step))
+            self._pct = max(0.0, min(100.0, self._pct + step))
+
+        if self._pct > 2:
+            wy = CUP_BY - CUP_INNER_H * (self._pct / 100.0)
+            for b in self._bubbles:
+                b[1] -= b[3]
+                if b[1] < wy + 4:
+                    b[:] = self._new_bubble()
+        if self._voice:
+            self._voice_t += 1
+        if self._filling:
+            self._wave_t += 1
+        if self._complete_active:
+            self._complete_t += 1
+            total = self._RIPPLE_DELAY * self._RIPPLE_WAVES + self._RIPPLE_MAX / self._RIPPLE_SPEED
+            if self._complete_t > total:
+                self._complete_active = False
+                self._complete_t = 0
+        self._redraw()
+        self._anim_id = self.after(CANVAS_ANIM_MS, self._animate)
+
+    def _redraw(self):
+        self.delete('all')
+        pct = self._pct
+
+        # ① 시리 오브 — PIL RGBA 렌더링으로 반투명 유리 질감
+        if self._voice:
+            self._orb_frame += 1
+            need_render = (self._voice_photo is None or
+                           self._orb_frame % VOICE_ORB_RENDER_SKIP == 0)
+
+            if need_render:
+                vol = float(getattr(core, 'mic_volume', 0.5))
+                cx, cy = RING_CX, RING_CY
+                t = self._voice_t * 0.08
+
+                base_r = int((205 + vol * 70) * SCALE)
+
+                orb = Image.new('RGBA', (CUP_CW, CUP_CH), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(orb)
+
+                for layer in self._ORB_LAYERS:
+                    r   = base_r * layer['r_mult']
+                    amp = r * layer['amp'] * (0.4 + vol * 0.6)
+                    N   = VOICE_ORB_POINTS
+                    pts = []
+                    for j in range(N):
+                        angle  = 2 * math.pi * j / N
+                        deform = (amp * math.sin(3 * angle + t * layer['spd'] + layer['phase'])
+                                + amp * 0.5 * math.sin(5 * angle - t * layer['spd'] * 0.8 + layer['phase'])
+                                + amp * 0.3 * math.sin(2 * angle + t * layer['spd'] * 1.3))
+                        rr = r + deform
+                        pts.append((cx + rr * math.cos(angle),
+                                    cy + rr * math.sin(angle)))
+                    cr, cg, cb = layer['color']
+                    draw.polygon(pts, fill=(cr, cg, cb, layer['alpha']))
+
+                orb = orb.filter(ImageFilter.GaussianBlur(radius=int(9 * SCALE)))
+                self._voice_photo = ImageTk.PhotoImage(orb)
+
+            if self._voice_photo is not None:
+                self.create_image(0, 0, anchor='nw', image=self._voice_photo)
+        else:
+            self._voice_photo = None
+            self._orb_frame = 0
+
+        # ② 원형 링 — 급수 중일 때만 표시
+        if self._filling:
+            r = RING_R
+            cx, cy = RING_CX, RING_CY
+            self.create_oval(cx-r, cy-r, cx+r, cy+r,
+                             outline='#0d2010', width=14, fill='')
+            self.create_oval(cx-r, cy-r, cx+r, cy+r,
+                             outline='#1a3a1a', width=9, fill='')
+            if pct > 0.5 and self._target > 0:
+                extent = min(360, (pct / self._target) * 360)
+                self.create_arc(cx-r, cy-r, cx+r, cy+r,
+                                start=90, extent=-extent,
+                                outline='#14532d', width=20, style='arc')
+                self.create_arc(cx-r, cy-r, cx+r, cy+r,
+                                start=90, extent=-extent,
+                                outline='#4ade80', width=10, style='arc')
+
+        # ③ 컵 몸통 배경
+        sides = [CUP_TX-CUP_TRX, CUP_TY, CUP_BX-CUP_BRX, CUP_BY,
+                 CUP_BX+CUP_BRX, CUP_BY, CUP_TX+CUP_TRX, CUP_TY]
+        self.create_polygon(sides, fill='#06111f', outline='')
+
+        # ④ 물 채움 (그라디언트)
+        if pct > 0.2:
+            wy  = CUP_BY - CUP_INNER_H * (pct / 100.0)
+            wrx = self._rx_at(wy)
+            wry = CUP_BRY + (CUP_TRY - CUP_BRY) * (pct / 100.0)
+
+            strips = WATER_GRADIENT_STRIPS
+            colors = ['#1e3a8a','#1e40af','#1d4ed8','#2055e0',
+                      '#2563eb','#2b6cb0','#1e56c8','#1a4fc0',
+                      '#1565c0','#1976d2','#1e88e5','#2196f3',
+                      '#42a5f5','#1e40af']
+            strip_h = (CUP_BY - wy) / strips
+            for i in range(strips):
+                y0 = CUP_BY - strip_h * (i + 1)
+                y1 = CUP_BY - strip_h * i
+                r0 = (CUP_BY - y0) / CUP_INNER_H
+                r1 = (CUP_BY - y1) / CUP_INNER_H
+                x0l = CUP_BX - (CUP_BRX + (CUP_TRX - CUP_BRX) * r0)
+                x0r = CUP_BX + (CUP_BRX + (CUP_TRX - CUP_BRX) * r0)
+                x1l = CUP_BX - (CUP_BRX + (CUP_TRX - CUP_BRX) * r1)
+                x1r = CUP_BX + (CUP_BRX + (CUP_TRX - CUP_BRX) * r1)
+                self.create_polygon(x0l, y0, x0r, y0, x1r, y1, x1l, y1,
+                                    fill=colors[i], outline='')
+
+            N = 36
+            amp = max(2, int(5 * SCALE)) if self._filling else 1
+            wave_pts = []
+            for j in range(N + 1):
+                frac = j / N
+                x = (CUP_BX - wrx) + 2 * wrx * frac
+                y = wy + amp * math.sin(2 * math.pi * (2.5 * frac - self._wave_t / 18.0))
+                wave_pts += [x, y]
+            poly_pts = wave_pts + [CUP_BX + CUP_BRX, CUP_BY, CUP_BX - CUP_BRX, CUP_BY]
+            self.create_polygon(poly_pts, fill='#1e40af', outline='', smooth=False)
+            self.create_line(wave_pts, fill='#93c5fd', width=2, smooth=True)
+
+            for bx, by2, br, _ in self._bubbles:
+                if wy < by2 < CUP_BY:
+                    self.create_oval(bx-br, by2-br, bx+br, by2+br,
+                                     outline='#93c5fd', width=1, fill='')
+
+        # ⑤ 하단 타원
+        self.create_oval(CUP_BX-CUP_BRX, CUP_BY-CUP_BRY,
+                         CUP_BX+CUP_BRX, CUP_BY+CUP_BRY,
+                         fill='#0a1628', outline='#1e3a8a', width=6)
+        self.create_oval(CUP_BX-CUP_BRX, CUP_BY-CUP_BRY,
+                         CUP_BX+CUP_BRX, CUP_BY+CUP_BRY,
+                         fill='', outline='#3b82f6', width=2)
+
+        # ⑥ 컵 벽
+        lx = CUP_TX - CUP_TRX
+        self.create_line(lx, CUP_TY, CUP_BX-CUP_BRX, CUP_BY,
+                         fill='#1e3a8a', width=10)
+        self.create_line(lx+2, CUP_TY, CUP_BX-CUP_BRX+2, CUP_BY,
+                         fill='#60a5fa', width=2)
+        rx = CUP_TX + CUP_TRX
+        self.create_line(rx, CUP_TY, CUP_BX+CUP_BRX, CUP_BY,
+                         fill='#1e3a8a', width=10)
+        self.create_line(rx-2, CUP_TY, CUP_BX+CUP_BRX-2, CUP_BY,
+                         fill='#2563eb', width=2)
+
+        # ⑦ 상단 림 타원
+        self.create_oval(CUP_TX-CUP_TRX-2, CUP_TY-CUP_TRY-2,
+                         CUP_TX+CUP_TRX+2, CUP_TY+CUP_TRY+2,
+                         fill='#0d1a3a', outline='#1e3a8a', width=7)
+        self.create_oval(CUP_TX-CUP_TRX, CUP_TY-CUP_TRY,
+                         CUP_TX+CUP_TRX, CUP_TY+CUP_TRY,
+                         fill='', outline='#67e8f9', width=2)
+
+        # ⑧ 급수완료 파동 애니메이션
+        if self._complete_active:
+            cx, cy = RING_CX, RING_CY
+            fade_colors = ['#4ade80','#36d474','#28c065','#1aaa52',
+                           '#128e3f','#0a6e2e','#064e1e','#03300e']
+            for i in range(self._RIPPLE_WAVES):
+                start_t = i * self._RIPPLE_DELAY
+                elapsed = self._complete_t - start_t
+                if elapsed <= 0:
+                    continue
+                progress = elapsed * self._RIPPLE_SPEED
+                if progress > self._RIPPLE_MAX:
+                    continue
+                r_wave = RING_R + progress
+                fade = 1.0 - progress / self._RIPPLE_MAX
+                ci = int((1 - fade) * (len(fade_colors) - 1))
+                lw = max(1, int(5 * fade + 1))
+                self.create_oval(cx - r_wave, cy - r_wave,
+                                 cx + r_wave, cy + r_wave,
+                                 outline=fade_colors[ci], width=lw, fill='')
+
+        # ⑨ 수위 % 텍스트
+        self.create_text(CUP_CW//2, CUP_CH//2,
+                         text=f'{round(pct)}%',
+                         font=(FONT_NUM, int(52 * SCALE), 'bold'), fill='white')
+
+    def set_fill(self, pct: float, immediate: bool = False):
+        pct = max(0.0, min(100.0, pct))
+        self._pct_target = pct
+        if immediate:
+            self._pct = pct
+            self._last_smooth_t = time.time()
+
+    def get_fill(self) -> float:
+        return float(self._pct)
+
+    def freeze_fill(self):
+        # 급수가 멈춘 뒤 이전 목표값을 계속 따라가며 올라가는 것을 막는다.
+        self._pct_target = float(self._pct)
+        self._last_smooth_t = time.time()
+
+    def set_filling(self, filling: bool):
+        self._filling = filling
+
+    def set_target(self, target: float):
+        self._target = max(1.0, target)
+
+    def set_display_profile(self, profile: str):
+        if profile not in DISPLAY_PROFILE_TABLE:
+            profile = DISPLAY_PROFILE_UNKNOWN
+        self._display_profile = profile
+
+    def trigger_complete(self):
+        self._complete_active = True
+        self._complete_t = 0
+
+    def set_voice(self, active: bool):
+        self._voice = active
+        if not active:
+            self._voice_t = 0
+
+
+# ════════════════════════════════════════════════════════════════════
+def run_kiosk_gui(on_ready=None):
+    ctk.set_appearance_mode('dark')
+    ctk.set_default_color_theme('blue')
+
+    app = ctk.CTk()
+    app.title('기주공명 음성인식 스마트 정수기')
+    app.configure(fg_color=BG)
+
+    app.attributes('-fullscreen', True)
+    app.bind('<Escape>', lambda e: app.attributes('-fullscreen', not app.attributes('-fullscreen')))
+
+    _last_saved_t  = [0.0]
+    target_pct_var = tk.IntVar(value=70)
+
+    # 화면 표시 전용 수위 상태값.
+    # core의 실제 제어값을 그대로 쓰지 않고, 0%에서 시작해 목표 수위까지만 부드럽게 올라가도록 분리한다.
+    display_pct_state = [0.0]
+    display_last_t = [time.time()]
+    display_start_t = [time.time()]
+    display_was_filling = [False]
+    display_completed = [False]
+    display_raw_ready = [False]
+    display_raw_mode = [False]      # 현재 %가 한 번이라도 생성되면 시간 기준 임의 상승을 끄고 현재 %를 추종
+    display_last_raw_pct = [0.0]
+    display_water_started = [False]  # 실제 solenoid_on 이후에만 화면 수위를 올린다.
+    display_confirmed_raw_goal = [0.0]     # 화면에 반영하기로 확정한 안정 추정 수위.
+    display_confirmed_raw_time = [0.0]     # 안정 추정 수위가 마지막으로 확정된 시각.
+    display_pending_raw_goal = [None]      # 상승 후보 추정 수위.
+    display_pending_raw_since = [0.0]      # 상승 후보가 유지되기 시작한 시각.
+
+    # 초반 주파수 기반 표시 속도 프로파일 상태값.
+    # 700~800Hz 근처로 시작하면 큰 컵, 1000Hz 근처로 시작하면 작은 컵으로 보고 GUI 상승 속도를 다르게 적용한다.
+    display_profile = [DISPLAY_PROFILE_UNKNOWN]
+    display_profile_locked = [False]
+    display_profile_freqs = [[]]
+    display_profile_start_t = [0.0]
+    display_profile_median_hz = [0.0]
+
+    hit_dots: list[tk.Label] = []
+
+    app.grid_rowconfigure(0, weight=0)
+    app.grid_rowconfigure(1, weight=1)
+    app.grid_columnconfigure(0, weight=6)
+    app.grid_columnconfigure(1, weight=4)
+
+    # ── 헤더 ──────────────────────────────────────────
+    hdr = tk.Frame(app, bg='#0d1526', height=40)
+    hdr.grid(row=0, column=0, columnspan=2, sticky='ew')
+    hdr.grid_propagate(False)
+    hdr.grid_columnconfigure(1, weight=1)
+
+    tk.Label(hdr, text='기주공명·음성인식 스마트 정수기',
+             bg='#0d1526', fg=CYAN,
+             font=(FONT_SANS, 14, 'bold')
+             ).place(x=20, rely=0.5, anchor='w')
+
+    hdr_right = tk.Frame(hdr, bg='#0d1526')
+    hdr_right.place(relx=1.0, rely=0.5, anchor='e', x=-20)
+    for t, fg in [('동의대 전자공학과 11조', '#e2e8f0'),
+                   ('  |  ',               '#4b6280'),
+                   ('동물원',              '#e2e8f0'),
+                   ('  |  ',               '#4b6280')]:
+        tk.Label(hdr_right, text=t, bg='#0d1526', fg=fg,
+                 font=(FONT_SANS, 10)).pack(side='left')
+    clock_lbl = tk.Label(hdr_right, text='', bg='#0d1526',
+                         fg=CYAN, font=(FONT_MONO, 13, 'bold'))
+    clock_lbl.pack(side='left')
+
+    tk.Frame(app, bg=BORDER, height=1).grid(row=0, column=0, columnspan=2, sticky='sew')
+
+    # ── 왼쪽: 컵 + 상태 ──────────────────────────────
+    left_f = tk.Frame(app, bg=BG)
+    left_f.grid(row=1, column=0, sticky='nsew')
+    left_f.grid_columnconfigure(0, weight=1)
+    left_f.grid_rowconfigure(0, weight=1)
+    left_f.grid_rowconfigure(1, weight=0)
+
+    cup_wrap = tk.Frame(left_f, bg=BG)
+    cup_wrap.grid(row=0, column=0)
+
+    cup_canvas = CupCanvas(cup_wrap)
+    cup_canvas.pack(pady=(4, 0))
+
+    # ── 왼쪽 하단 상태/음성 카드 ─────────────────────
+    # 기존처럼 '현재 수위 → 인식된 음성 → 안내 음성'을 세로로 길게 쌓지 않고,
+    # 안내 문장을 중심으로 한 카드형 레이아웃으로 묶어 가독성을 높인다.
+    STAT_BG  = '#081326'
+    MSG_BG   = '#0b1628'
+    USER_BG  = '#10233d'
+    GUIDE_BG = '#312e81'   # 안내 태그 배경: 어두운 남보라 계열로 전체 남색 UI와 통일
+    GUIDE_FG = '#ddd6fe'   # 안내 문장 색: 밝은 라벤더로 배경과 명확히 구분
+
+    # 메시지 길이에 따라 카드 크기가 흔들리지 않도록 하단 카드 높이를 고정한다.
+    STATUS_CARD_HEIGHT = 170
+    GUIDE_ROW_HEIGHT   = 56
+    USER_ROW_HEIGHT    = 32
+
+    stat_f = ctk.CTkFrame(left_f, fg_color=STAT_BG,
+                          border_color=BORDER, border_width=1,
+                          corner_radius=18, height=STATUS_CARD_HEIGHT)
+    stat_f.grid(row=1, column=0, pady=(0, 10), padx=28, sticky='ew')
+    stat_f.grid_propagate(False)
+    stat_f.grid_columnconfigure(1, weight=1)
+    stat_f.grid_rowconfigure(1, minsize=GUIDE_ROW_HEIGHT)
+    stat_f.grid_rowconfigure(2, minsize=USER_ROW_HEIGHT)
+
+    tk.Label(stat_f, text='진행 상태', bg=STAT_BG,
+             fg='#e2e8f0', font=(FONT_SANS, 13, 'bold')
+             ).grid(row=0, column=0, sticky='w', padx=(16, 8), pady=(10, 5))
+
+    status_lbl = tk.Label(stat_f, text='대 기  중', bg=STAT_BG,
+                          fg=CYAN, font=(FONT_SANS, 18, 'bold'))
+    status_lbl.grid(row=0, column=1, sticky='e', padx=(8, 16), pady=(10, 5))
+
+    guide_row = tk.Frame(stat_f, bg=MSG_BG, highlightthickness=0, height=GUIDE_ROW_HEIGHT)
+    guide_row.grid(row=1, column=0, columnspan=2, sticky='ew',
+                   padx=12, pady=(0, 7))
+    guide_row.grid_propagate(False)
+    guide_row.grid_columnconfigure(1, weight=1)
+    guide_row.grid_rowconfigure(0, weight=1)
+
+    tk.Label(guide_row, text='안내', bg=GUIDE_BG, fg=GUIDE_FG,
+             font=(FONT_SANS, 12, 'bold'), width=6
+             ).grid(row=0, column=0, sticky='nsw', padx=(8, 8), pady=7)
+
+    tts_text_lbl = tk.Label(guide_row, text='안내 대기 중',
+                            bg=MSG_BG, fg=MUTED,
+                            font=(FONT_SANS, 13, 'bold'),
+                            wraplength=650, justify='left', anchor='w', height=2)
+    tts_text_lbl.grid(row=0, column=1, sticky='nsew', padx=(0, 10), pady=0)
+
+    user_row = tk.Frame(stat_f, bg=STAT_BG, highlightthickness=0, height=USER_ROW_HEIGHT)
+    user_row.grid(row=2, column=0, columnspan=2, sticky='ew',
+                  padx=12, pady=(0, 10))
+    user_row.grid_propagate(False)
+    user_row.grid_columnconfigure(1, weight=1)
+    user_row.grid_rowconfigure(0, weight=1)
+
+    tk.Label(user_row, text='사용자', bg=USER_BG, fg='#bfdbfe',
+             font=(FONT_SANS, 11, 'bold'), width=6
+             ).grid(row=0, column=0, sticky='nsw', padx=(8, 8), pady=(0, 2))
+
+    speech_text_lbl = tk.Label(user_row, text='호출어 또는 명령을 말해주세요',
+                               bg=STAT_BG, fg=MUTED,
+                               font=(FONT_SANS, 12, 'bold'),
+                               wraplength=650, justify='left', anchor='w')
+    speech_text_lbl.grid(row=0, column=1, sticky='nsew', padx=(0, 10), pady=(0, 2))
+
+    def _fit_text_to_fixed_label(label, text, base_size=13, small_size=10, kind='tts'):
+        """고정 카드 안에서 긴 문장이 들어오면 글자 크기만 줄이고 레이아웃은 고정한다."""
+        safe_text = str(text).strip() if text is not None else ''
+        text_len = len(safe_text)
+
+        if kind == 'tts':
+            if text_len <= 26:
+                size = base_size
+            elif text_len <= 38:
+                size = 12
+            elif text_len <= 54:
+                size = 11
+            else:
+                size = small_size
+            label.configure(font=(FONT_SANS, size, 'bold'), wraplength=650, height=2)
+        else:
+            if text_len <= 18:
+                size = 12
+            elif text_len <= 32:
+                size = 11
+            else:
+                size = 10
+            label.configure(font=(FONT_SANS, size, 'bold'), wraplength=650)
+
+        label.configure(text=safe_text)
+
+    tk.Frame(app, bg=BORDER, width=1).grid(row=1, column=0, sticky='nse')
+
+    # ── 오른쪽: 컨트롤 패널 ──────────────────────────
+    right_f = tk.Frame(app, bg='#0a1224')
+    right_f.grid(row=1, column=1, sticky='nsew')
+    right_f.grid_columnconfigure(0, weight=1)
+    right_f.grid_rowconfigure(2, weight=1)
+
+    # ── 주파수 카드 ──────────────────────────────────
+    fcard = ctk.CTkFrame(right_f, fg_color=SURFACE,
+                         border_color=BORDER, border_width=1,
+                         corner_radius=14)
+    fcard.grid(row=0, column=0, padx=20, pady=(10, 6), sticky='ew')
+
+    tk.Label(fcard, text='기주공명 주파수 추적',
+             bg=SURFACE, fg='#e2e8f0',
+             font=(FONT_SANS, 13)
+             ).pack(anchor='w', padx=12, pady=(8, 4))
+
+    freq_row = tk.Frame(fcard, bg=SURFACE)
+    freq_row.pack(fill='x', padx=12, pady=(0, 6))
+    freq_row.columnconfigure(0, weight=1)
+    freq_row.columnconfigure(1, weight=1)
+
+    cur_col = tk.Frame(freq_row, bg=SURFACE)
+    cur_col.grid(row=0, column=0, sticky='w')
+    tk.Label(cur_col, text='현재', bg=SURFACE, fg='#e2e8f0',
+             font=(FONT_SANS, 13)).pack(side='left', anchor='s', padx=(0, 6))
+    freq_cur_lbl = tk.Label(cur_col, text='--- Hz', bg=SURFACE,
+                            fg=AMBER, font=(FONT_MONO, 14, 'bold'))
+    freq_cur_lbl.pack(side='left', anchor='s')
+
+    tgt_col = tk.Frame(freq_row, bg=SURFACE)
+    tgt_col.grid(row=0, column=1, sticky='e')
+    tk.Label(tgt_col, text='목표', bg=SURFACE, fg='#e2e8f0',
+             font=(FONT_SANS, 13)).pack(side='left', anchor='s', padx=(0, 6))
+    freq_tgt_lbl = tk.Label(tgt_col, text='--- Hz', bg=SURFACE,
+                            fg=BLUE, font=(FONT_MONO, 14, 'bold'))
+    freq_tgt_lbl.pack(side='left', anchor='s')
+
+    freq_bar_cv = tk.Canvas(fcard, height=10, bg=SURFACE, highlightthickness=0)
+    freq_bar_cv.pack(fill='x', padx=12, pady=(0, 4))
+
+    dot_f = tk.Frame(fcard, bg=SURFACE)
+    dot_f.pack(pady=(0, 6))
+
+    def rebuild_dots(n):
+        for w in hit_dots:
+            w.destroy()
+        hit_dots.clear()
+        for _ in range(n):
+            dw = tk.Label(dot_f, text='●', bg=SURFACE,
+                          fg=BORDER, font=('Arial', 5))
+            dw.pack(side='left', padx=1)
+            hit_dots.append(dw)
+
+    rebuild_dots(core.STOP_TRIGGER_COUNT)
+
+    # ── 목표 수위 카드 (다이얼식) ─────────────────────
+    tcard = ctk.CTkFrame(right_f, fg_color=SURFACE,
+                         border_color=BORDER, border_width=1,
+                         corner_radius=14)
+    tcard.grid(row=1, column=0, padx=20, pady=6, sticky='ew')
+
+    tk.Label(tcard, text='목표 수위', bg=SURFACE, fg='#e2e8f0',
+             font=(FONT_SANS, 13)).pack(anchor='w', padx=14, pady=(8, 4))
+
+    DIAL_VALUES = [50, 60, 70, 80, 90]
+    dial_idx    = [DIAL_VALUES.index(70)]
+    ROW_H       = 38
+    VISIBLE     = 5
+    DIAL_H      = ROW_H * VISIBLE
+
+    dial_cv = tk.Canvas(tcard, width=220, height=DIAL_H,
+                        bg=SURFACE, highlightthickness=0)
+    dial_cv.pack(fill='x', padx=16, pady=(0, 6))
+
+    hl_y0 = ROW_H * 2
+    hl_y1 = ROW_H * 3
+    dial_cv.create_rectangle(0, hl_y0, 9999, hl_y1,
+                             fill='#0f2a4a', outline='#1e3a5f', width=1)
+    dial_cv.create_line(0, hl_y0, 9999, hl_y0, fill=BORDER, width=1)
+    dial_cv.create_line(0, hl_y1, 9999, hl_y1, fill=BORDER, width=1)
+
+    def dial_draw(width=None):
+        dial_cv.delete('dial_text')
+        cx = (width if width and width > 220 else max(dial_cv.winfo_width(), 220)) // 2
+        idx = dial_idx[0]
+        for offset in range(-2, 3):
+            vi = idx + offset
+            y  = ROW_H * (2 + offset) + ROW_H // 2
+            if 0 <= vi < len(DIAL_VALUES):
+                label = f'{DIAL_VALUES[vi]}%'
+                if offset == 0:
+                    fg, font = CYAN, (FONT_NUM, 30, 'bold')
+                elif abs(offset) == 1:
+                    fg, font = MUTED, (FONT_NUM, 19)
+                else:
+                    fg, font = '#2a3a4a', (FONT_NUM, 14)
+            else:
+                label, fg, font = '', MUTED, (FONT_NUM, 14)
+            dial_cv.create_text(cx, y, text=label, fill=fg, font=font,
+                                tags='dial_text')
+
+    def dial_set(idx):
+        idx = max(0, min(len(DIAL_VALUES) - 1, idx))
+        dial_idx[0] = idx
+        v = DIAL_VALUES[idx]
+        target_pct_var.set(v)
+        dial_draw()
+        core.TARGET_FILL_PCT = float(v)
+        with core.lock:
+            filling  = bool(core.is_filling)
+            calib    = bool(core.calibration_done)
+            d        = float(core.current_diameter)
+            init_air = float(core.init_air_len_cm)
+        if filling and calib and d > 0 and init_air > 0.5:
+            with core.lock:
+                core._eff_target_air_cm = max(0.5, init_air * (1.0 - v / 100.0))
+                if core._eff_target_air_cm > 0:
+                    core.target_freq = float(
+                        core.SOUND_SPEED / (4 * (core._eff_target_air_cm
+                                                  + core.END_CORRECTION_K * d))
+                    )
+
+    dial_cv.bind('<MouseWheel>',
+                 lambda e: dial_set(dial_idx[0] + (-1 if e.delta > 0 else 1)))
+
+    def dial_click(e):
+        offset = e.y // ROW_H - 2
+        dial_set(dial_idx[0] + offset)
+    dial_cv.bind('<Button-1>', dial_click)
+
+    arrow_f = tk.Frame(tcard, bg=SURFACE)
+    arrow_f.pack(pady=(0, 6))
+    tk.Button(arrow_f, text='▲', bg=SURFACE, fg=CYAN, bd=0,
+              font=('Arial', 15, 'bold'), activebackground='#0f2a4a', activeforeground=CYAN,
+              highlightbackground=CYAN, highlightcolor=CYAN, highlightthickness=1,
+              padx=12, pady=5,
+              command=lambda: dial_set(dial_idx[0] - 1)).pack(side='left', padx=6)
+    tk.Button(arrow_f, text='▼', bg=SURFACE, fg=CYAN, bd=0,
+              font=('Arial', 15, 'bold'), activebackground='#0f2a4a', activeforeground=CYAN,
+              highlightbackground=CYAN, highlightcolor=CYAN, highlightthickness=1,
+              padx=12, pady=5,
+              command=lambda: dial_set(dial_idx[0] + 1)).pack(side='left', padx=6)
+
+    dial_cv.bind('<Configure>', lambda e: dial_draw(e.width))
+    tcard.after(50, dial_draw)
+
+    # ── 버튼 ──────────────────────────────────────────
+    btn_f = tk.Frame(right_f, bg='#0a1224')
+    btn_f.grid(row=2, column=0, pady=(0, 10), padx=20, sticky='nsew')
+    btn_f.grid_columnconfigure(0, weight=1)
+    btn_f.grid_columnconfigure(1, weight=1)
+    btn_f.grid_rowconfigure(0, weight=1)
+
+    def gui_on():
+        with core.lock:
+            if core.is_filling:
+                return
+
+        # 새 급수 시작 시 사용자 화면 수위는 무조건 0%부터 시작한다.
+        now = time.time()
+        display_pct_state[0] = 0.0
+        display_last_t[0] = now
+        display_start_t[0] = now
+        display_was_filling[0] = False
+        display_completed[0] = False
+        display_raw_ready[0] = False
+        display_raw_mode[0] = False
+        display_last_raw_pct[0] = 0.0
+        display_water_started[0] = False
+        display_confirmed_raw_goal[0] = 0.0
+        display_confirmed_raw_time[0] = 0.0
+        display_pending_raw_goal[0] = None
+        display_pending_raw_since[0] = 0.0
+        display_profile[0] = DISPLAY_PROFILE_UNKNOWN
+        display_profile_locked[0] = False
+        display_profile_freqs[0] = []
+        display_profile_start_t[0] = 0.0
+        display_profile_median_hz[0] = 0.0
+        cup_canvas.set_display_profile(DISPLAY_PROFILE_UNKNOWN)
+        cup_canvas.set_fill(0.0, immediate=True)
+
+        pct = target_pct_var.get()
+        core.TARGET_FILL_PCT = float(pct)
+        with core.lock:
+            init_air = float(core.init_air_len_cm)
+        if init_air > 0.5:
+            with core.lock:
+                core._eff_target_air_cm = max(0.5, init_air * (1.0 - pct / 100.0))
+        core.ensure_audio_stream()
+        core.start_filling_local()
+
+        def _pump():
+            time.sleep(core.NOISE_CALIBRATION_TIME + 0.1)
+            with core.lock:
+                if core.is_filling:
+                    core.solenoid_on()
+                    # 사용자 화면의 수위 증가는 버튼 누른 시점이 아니라 실제 밸브가 열린 시점부터 시작한다.
+                    now2 = time.time()
+                    display_water_started[0] = True
+                    display_start_t[0] = now2 + DISPLAY_WATER_SETTLE_SECONDS
+                    display_last_t[0] = now2
+                    display_pct_state[0] = 0.0
+                    display_raw_ready[0] = False
+                    display_raw_mode[0] = False
+                    display_last_raw_pct[0] = 0.0
+                    display_confirmed_raw_goal[0] = 0.0
+                    display_confirmed_raw_time[0] = 0.0
+                    display_pending_raw_goal[0] = None
+                    display_pending_raw_since[0] = 0.0
+                    display_profile[0] = DISPLAY_PROFILE_UNKNOWN
+                    display_profile_locked[0] = False
+                    display_profile_freqs[0] = []
+                    display_profile_start_t[0] = now2
+                    display_profile_median_hz[0] = 0.0
+                    cup_canvas.set_display_profile(DISPLAY_PROFILE_UNKNOWN)
+                    print('\n>>> 펌프 가동!')
+
+        threading.Thread(target=_pump, daemon=True).start()
+
+    def gui_off():
+        # 수동 정지 시에는 남아 있던 애니메이션 목표값을 따라 계속 올라가지 않도록 현재 화면값에서 고정한다.
+        with core.lock:
+            was_filling = bool(core.is_filling)
+        frozen_pct = cup_canvas.get_fill() if was_filling else 0.0
+        core.solenoid_off()
+        core.stop_filling_local(save_result=True)
+        display_pct_state[0] = max(0.0, min(100.0, frozen_pct))
+        display_completed[0] = was_filling
+        display_water_started[0] = False
+        display_raw_ready[0] = False
+        display_raw_mode[0] = False
+        display_confirmed_raw_goal[0] = 0.0
+        display_confirmed_raw_time[0] = 0.0
+        display_pending_raw_goal[0] = None
+        display_pending_raw_since[0] = 0.0
+        display_profile_locked[0] = False
+        display_profile_freqs[0] = []
+        display_profile_start_t[0] = 0.0
+        display_profile_median_hz[0] = 0.0
+        cup_canvas.set_fill(display_pct_state[0], immediate=True)
+        cup_canvas.freeze_fill()
+        cup_canvas.set_filling(False)
+
+    btn_start = ctk.CTkButton(
+        btn_f, text='▶  시작',
+        height=94,
+        fg_color='#0e2819', hover_color='#15803d',
+        text_color='#86efac',
+        font=(FONT_SANS, 52, 'bold'),
+        corner_radius=12,
+        command=gui_on,
+    )
+    btn_start.grid(row=0, column=0, sticky='nsew', padx=(0, 7))
+
+    btn_stop = ctk.CTkButton(
+        btn_f, text='■  정지',
+        height=94,
+        fg_color='#2a0f0f', hover_color='#991b1b',
+        text_color='#fecaca',
+        font=(FONT_SANS, 52, 'bold'),
+        corner_radius=12,
+        command=gui_off,
+    )
+    btn_stop.grid(row=0, column=1, sticky='nsew', padx=(7, 0))
+
+    # ── 종료 ─────────────────────────────────────────
+    def on_close():
+        core.solenoid_off()
+        try:
+            import voice_module as vm
+            vm._shutdown.set()          # 음성인식 루프 종료 신호
+            vm.stop_dispenser_sound()   # 재생 중인 음원도 정지
+        except Exception:
+            pass
+        for obj in (core.audio_stream, ):
+            if obj:
+                try:
+                    obj.stop(); obj.close()
+                except Exception:
+                    pass
+        for obj in (core.sw_on, core.sw_off, core.solenoid):
+            try:
+                obj.close()
+            except Exception:
+                pass
+        app.destroy()
+
+    app.protocol('WM_DELETE_WINDOW', on_close)
+    core.sw_on.when_pressed  = gui_on
+    core.sw_off.when_pressed = gui_off
+
+    # ── 음성인식 콜백 등록 ────────────────────────────
+    try:
+        import voice_module as vm
+        vm.register_gui_callbacks(gui_on, gui_off)
+
+        def _on_voice_level(pct: float):
+            try:
+                closest = min(DIAL_VALUES, key=lambda x: abs(x - pct))
+                idx = DIAL_VALUES.index(closest)
+                dial_set(idx)
+                print(f'\n[GUI] 음성 목표 수위 갱신: {pct:.0f}% → {closest}%')
+            except Exception as e:
+                print(f'\n[GUI] 음성 수위 콜백 오류: {e}')
+
+        vm.register_gui_level_callback(_on_voice_level)
+    except Exception as e:
+        print(f'\n[GUI] 콜백 등록 오류 (단독 실행 시 무시): {e}')
+
+    # ── 100ms 주기 갱신 ──────────────────────────────
+    def periodic_update():
+        try:
+            DAYS = ['월', '화', '수', '목', '금', '토', '일']
+            n = datetime.datetime.now()
+            clock_lbl.configure(
+                text=(f'{n.year}.{n.month:02d}.{n.day:02d}'
+                      f' ({DAYS[n.weekday()]}) | {n.hour:02d}:{n.minute:02d}')
+            )
+
+            with core.lock:
+                d        = float(core.current_diameter)
+                sf       = float(core.last_stable_f)
+                tf       = float(core.target_freq)
+                air      = float(core.last_current_air)
+                hits     = int(core.consecutive_stop_hits)
+                max_hits = int(core.STOP_TRIGGER_COUNT)
+                filling  = bool(core.is_filling)
+                init_air = float(core.init_air_len_cm)
+                t_mode   = bool(core.tracking_mode)
+                finish   = bool(core.request_finish)
+                init_f   = float(core.initial_stable_freq)
+                r2       = float(core.last_r2)
+                t_inter  = float(core.theory_intercept)
+                snap     = list(core.history_freq_snapshot)
+                target_pct_save = float(core.TARGET_FILL_PCT)
+                stop_elapsed_sec = float(getattr(core, 'last_stop_elapsed_sec', 0.0))
+                core_fill_pct = float(getattr(core, 'last_fill_pct', 0.0) or 0.0)
+                voice    = bool(getattr(core, 'voice_active', False))
+                speech_text = str(getattr(core, 'last_recognized_text', '') or '')
+                tts_text = str(getattr(core, 'last_tts_text', '') or '')
+                tts_time = float(getattr(core, 'last_tts_time', 0.0) or 0.0)
+                if finish:
+                    core.request_finish = False
+
+            cup_canvas.set_voice(voice)
+
+            if voice:
+                _fit_text_to_fixed_label(speech_text_lbl, '듣는 중 ...', kind='user')
+                speech_text_lbl.configure(fg=CYAN)
+            elif speech_text:
+                _fit_text_to_fixed_label(speech_text_lbl, speech_text, kind='user')
+                speech_text_lbl.configure(fg='#e2e8f0')
+            else:
+                _fit_text_to_fixed_label(speech_text_lbl, '호출어 또는 명령을 말해주세요', kind='user')
+                speech_text_lbl.configure(fg=MUTED)
+
+            now_tts = time.time()
+            if tts_text and (now_tts - tts_time <= 30.0):
+                _fit_text_to_fixed_label(tts_text_lbl, tts_text, base_size=13, small_size=10, kind='tts')
+                tts_text_lbl.configure(fg=GUIDE_FG)
+            elif tts_text:
+                _fit_text_to_fixed_label(tts_text_lbl, tts_text, base_size=13, small_size=10, kind='tts')
+                tts_text_lbl.configure(fg='#8b85c9')
+            else:
+                _fit_text_to_fixed_label(tts_text_lbl, '안내 대기 중', base_size=13, small_size=10, kind='tts')
+                tts_text_lbl.configure(fg=MUTED)
+
+            if finish:
+                cup_canvas.trigger_complete()
+
+            now = time.time()
+            if finish and (now - _last_saved_t[0]) > 2.0:
+                _last_saved_t[0] = now
+                threading.Thread(
+                    target=save_to_csv,
+                    args=(d, init_f, tf, sf),
+                    kwargs=dict(
+                        r2_final=r2, total_samples=len(snap),
+                        theory_intercept=t_inter,
+                        stand_type='filled_box', stand_height_cm=3.0,
+                        estimated_stop_air_cm=air,
+                        init_air_len_cm=init_air,
+                        actual_fill_pct=None,
+                        cup_type='user_mode',
+                        target_fill_pct=target_pct_save,
+                        stop_elapsed_sec=stop_elapsed_sec,
+                    ),
+                    daemon=True,
+                ).start()
+
+            # core에서 계산한 실제 추정 수위.
+            # 이 값은 제어에는 그대로 쓰되, 사용자 화면에는 직접 넣지 않는다.
+            # 특히 air=0 같은 초기화값은 계산식상 100%가 되므로 표시용 입력에서 제외한다.
+            raw_fill_pct = 0.0
+            raw_fill_valid = False
+            water_started = bool(display_water_started[0])
+            if filling and water_started:
+                # core에서 현재 %가 생성되면 이것을 최우선으로 따라간다.
+                # 아직 현재 %가 없을 때만 air/init_air 계산값을 보조로 사용한다.
+                if 0.0 < core_fill_pct <= 100.0:
+                    raw_fill_pct = max(0.0, min(100.0, core_fill_pct))
+                    raw_fill_valid = True
+                elif (init_air > 0.5 and DISPLAY_MIN_VALID_AIR_CM <= air <= init_air * 1.05):
+                    raw_fill_pct = max(0.0, min(100.0,
+                                       (1.0 - air / init_air) * 100.0))
+                    raw_fill_valid = True
+
+            target_pct = float(target_pct_var.get())
+            now_for_display = time.time()
+            dt = max(0.01, min(0.5, now_for_display - display_last_t[0]))
+            display_last_t[0] = now_for_display
+
+            # 초반 주파수 기반 컵 크기 프로파일 판정.
+            # 목표 %가 아니라 실제로 먼저 들어오는 공명 주파수로 GUI 상승 속도를 결정한다.
+            if filling and water_started:
+                if display_profile_start_t[0] <= 0.0:
+                    display_profile_start_t[0] = now_for_display
+
+                profile_elapsed = max(0.0, now_for_display - display_profile_start_t[0])
+                candidate_freq = 0.0
+
+                if DISPLAY_FREQ_MIN_HZ <= sf <= DISPLAY_FREQ_MAX_HZ:
+                    candidate_freq = sf
+                elif DISPLAY_FREQ_MIN_HZ <= init_f <= DISPLAY_FREQ_MAX_HZ:
+                    candidate_freq = init_f
+
+                if candidate_freq > 0.0 and not display_profile_locked[0]:
+                    display_profile_freqs[0].append(candidate_freq)
+                    if len(display_profile_freqs[0]) > 30:
+                        display_profile_freqs[0] = display_profile_freqs[0][-30:]
+
+                enough_samples = len(display_profile_freqs[0]) >= DISPLAY_PROFILE_MIN_COUNT
+                enough_time = profile_elapsed >= DISPLAY_PROFILE_LOCK_SEC
+                force_time = profile_elapsed >= DISPLAY_PROFILE_FORCE_SEC
+
+                if not display_profile_locked[0] and display_profile_freqs[0] and ((enough_samples and enough_time) or force_time):
+                    vals = sorted(display_profile_freqs[0])
+                    mid_i = len(vals) // 2
+                    if len(vals) % 2:
+                        median_hz = vals[mid_i]
+                    else:
+                        median_hz = (vals[mid_i - 1] + vals[mid_i]) / 2.0
+                    display_profile_median_hz[0] = median_hz
+                    display_profile[0] = _profile_from_early_freq(median_hz)
+                    display_profile_locked[0] = True
+                    print(f'\n[GUI] 표시 프로파일 확정: {display_profile[0]} ({median_hz:.0f} Hz)')
+
+            time_per_sec = _get_display_profile_value(display_profile[0], 'time_per_sec', 4.8)
+            rise_per_sec = _get_display_profile_value(display_profile[0], 'rise_per_sec', 7.5)
+            catchup_per_sec = _get_display_profile_value(display_profile[0], 'catchup_per_sec', 18.0)
+            cup_canvas.set_display_profile(display_profile[0])
+
+            # 급수 시작 순간: 실제 추정값이 40~100%로 튀어도 화면은 0%에서 시작한다.
+            if filling and not display_was_filling[0]:
+                already_water_started = bool(display_water_started[0])
+                display_pct_state[0] = 0.0
+                if not already_water_started:
+                    display_start_t[0] = now_for_display
+                display_completed[0] = False
+                display_raw_ready[0] = False
+                display_raw_mode[0] = False
+                display_last_raw_pct[0] = 0.0
+                display_confirmed_raw_goal[0] = 0.0
+                display_confirmed_raw_time[0] = 0.0
+                display_pending_raw_goal[0] = None
+                display_pending_raw_since[0] = 0.0
+                if not already_water_started:
+                    display_water_started[0] = False
+                    water_started = False
+                else:
+                    water_started = True
+
+            if finish:
+                # 목표 도달로 급수가 끝난 순간: 표시값은 목표 수위에 정확히 맞춘다.
+                display_pct_state[0] = target_pct
+                display_completed[0] = True
+                display_raw_ready[0] = False
+                display_raw_mode[0] = False
+                display_confirmed_raw_time[0] = 0.0
+                display_pending_raw_goal[0] = None
+                display_pending_raw_since[0] = 0.0
+            elif filling:
+                # 실제 밸브가 아직 열리지 않았으면 화면 수위는 0%에서 대기한다.
+                # 이 부분이 버튼 직후 6% 정도로 먼저 올라가던 문제를 막는다.
+                if not water_started or now_for_display < display_start_t[0]:
+                    display_pct_state[0] = 0.0
+                else:
+                    elapsed_water = max(0.0, now_for_display - display_start_t[0])
+
+                    # 출수 직후의 비정상 추정값 차단.
+                    # 실제 물이 막 나오기 시작한 구간에서 25% 이상 튀면 표시용 입력에서 제외한다.
+                    if (elapsed_water < DISPLAY_START_GUARD_SECONDS
+                            and raw_fill_pct >= DISPLAY_EARLY_SPIKE_LIMIT_PCT):
+                        raw_fill_valid = False
+
+                    corrected_raw_goal = None
+                    if raw_fill_valid:
+                        display_raw_ready[0] = True
+                        display_last_raw_pct[0] = raw_fill_pct
+                        corrected_raw_goal = max(0.0, raw_fill_pct + DISPLAY_RAW_DISPLAY_BOOST_PCT)
+                        corrected_raw_goal = max(0.0, min(target_pct, corrected_raw_goal))
+
+                        # 현재 %가 생성된 순간부터는 시간 기준 임의 상승을 중단한다.
+                        # 이후 화면은 core 현재 %에 지연 보정(+2%)을 더한 값만 따라간다.
+                        if not display_raw_mode[0]:
+                            display_raw_mode[0] = True
+                            if display_pct_state[0] > corrected_raw_goal:
+                                display_pct_state[0] = corrected_raw_goal
+
+                        # 물은 실제로 줄지 않으므로 현재 %는 기본적으로 단조 증가값으로 확정한다.
+                        # 단, 처음 생성된 현재 %는 그대로 기준값으로 잡는다.
+                        confirmed = float(display_confirmed_raw_goal[0])
+                        if confirmed <= 0.0:
+                            display_confirmed_raw_goal[0] = corrected_raw_goal
+                        else:
+                            display_confirmed_raw_goal[0] = max(confirmed, corrected_raw_goal)
+                        display_confirmed_raw_time[0] = now_for_display
+                        display_pending_raw_goal[0] = None
+                        display_pending_raw_since[0] = 0.0
+
+                    time_goal = min(target_pct, elapsed_water * time_per_sec)
+                    stable_raw_goal = float(display_confirmed_raw_goal[0])
+                    cur_display = display_pct_state[0]
+
+                    if display_raw_mode[0] and stable_raw_goal > 0.0:
+                        # 현재 % 생성 후: 시간 기준으로 더 올라가지 않는다.
+                        # 현재 %보다 낮으면 따라붙고, 혹시 앞서갔으면 천천히 내려 맞춘다.
+                        desired_pct = max(0.0, min(target_pct, stable_raw_goal))
+                        if cur_display < desired_pct:
+                            cur_display = min(desired_pct,
+                                              cur_display + catchup_per_sec * dt)
+                        elif cur_display > desired_pct:
+                            cur_display = max(desired_pct,
+                                              cur_display - DISPLAY_FALL_PER_SEC * dt)
+                    else:
+                        # 현재 %가 아직 없을 때만 시간/주파수 기반 임시 상승을 사용한다.
+                        desired_pct = time_goal
+                        if target_pct < cur_display:
+                            cur_display = max(target_pct, cur_display - DISPLAY_FALL_PER_SEC * dt)
+                        elif desired_pct >= cur_display:
+                            cur_display = min(desired_pct,
+                                              cur_display + rise_per_sec * dt,
+                                              target_pct)
+
+                    display_pct_state[0] = max(0.0, min(target_pct, cur_display))
+            else:
+                # 대기 중에는 core의 남은 air 값이 0으로 초기화되어도 화면에 100%를 찍지 않는다.
+                if not display_completed[0]:
+                    display_pct_state[0] = 0.0
+                display_raw_ready[0] = False
+                display_raw_mode[0] = False
+                display_last_raw_pct[0] = 0.0
+                display_water_started[0] = False
+                display_confirmed_raw_goal[0] = 0.0
+                display_confirmed_raw_time[0] = 0.0
+                display_pending_raw_goal[0] = None
+                display_pending_raw_since[0] = 0.0
+
+            display_fill_pct = display_pct_state[0]
+            display_was_filling[0] = filling
+
+            if finish:
+                # 자동 정지 순간에는 목표값을 즉시 반영하고 고정해, 정지 후에도 컵이 계속 차오르는 느낌을 막는다.
+                cup_canvas.set_fill(display_fill_pct, immediate=True)
+                cup_canvas.freeze_fill()
+            elif not filling:
+                # 대기/정지 상태에서는 이전 애니메이션 목표를 계속 따라가지 않도록 즉시 고정한다.
+                cup_canvas.set_fill(display_fill_pct, immediate=True)
+                cup_canvas.freeze_fill()
+            else:
+                cup_canvas.set_fill(display_fill_pct)                  # 급수 중에는 목표값만 넘겨 부드럽게 추종
+            cup_canvas.set_filling(filling)
+            cup_canvas.set_target(target_pct)
+
+            water_started_now = bool(display_water_started[0])  # 실제 밸브가 열린 뒤 True가 됨
+
+            if not filling:
+                status_lbl.configure(text='대 기  중', fg=CYAN)  # 급수 대기 상태
+            elif not water_started_now:
+                status_lbl.configure(text='소음 측정 중 ...', fg=AMBER)  # 밸브 열리기 전까지만 표시
+            else:
+                status_lbl.configure(text='급 수 중', fg=GREEN_CLR)  # 소음 측정 종료 후 급수 중 표시
+
+            freq_cur_lbl.configure(
+                text=f'{sf:.0f} Hz' if sf > 0 else '--- Hz',
+                fg=GREEN_CLR if t_mode else AMBER,
+            )
+            freq_tgt_lbl.configure(
+                text=f'{tf:.0f} Hz' if tf > 0 else '--- Hz',
+            )
+
+            freq_bar_cv.delete('all')
+            bw = max(freq_bar_cv.winfo_width(), 10)
+            freq_bar_cv.create_rectangle(0, 0, bw, 16, fill='#1e3a5f', outline='')
+            if sf > 0 and tf > 0:
+                ratio = min(1.0, sf / tf)
+                fill_w = int(bw * ratio)
+                freq_bar_cv.create_rectangle(0, 0, fill_w, 16, fill=CYAN, outline='')
+
+            if len(hit_dots) != max_hits:
+                rebuild_dots(max_hits)
+            for i, dw in enumerate(hit_dots):
+                dw.configure(fg=BLUE if i < hits else BORDER)
+
+            btn_start.configure(
+                fg_color='#14532d' if filling else '#0e2819',
+                text_color='#86efac',
+            )
+
+        except Exception as e:
+            print(f'\n[periodic_update 오류] {e}')
+        finally:
+            app.after(UI_UPDATE_MS, periodic_update)
+
+    core.solenoid_off()
+    periodic_update()
+
+    if callable(on_ready):
+        app.after(300, on_ready)  # GUI 초기화 후 음성인식 스레드 시작
+
+    app.mainloop()
+
+
+if __name__ == '__main__':
+    run_kiosk_gui()
+
+
