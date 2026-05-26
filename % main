@@ -2,25 +2,30 @@
 """
 main.py  ─ 스마트 정수기 통합 실행 파일
 =========================================
-구성 (5개 파일)
-  main.py          ← 진입점, 스레드 시작
-  voice_module.py  ← 음성인식 상태머신
-  smart_water_core.py ← 급수 제어 로직
-  gui_app.py       ← 터치 GUI
-  csv_logger.py    ← 실험 결과 저장
+구성 (6개 파일)
+  main.py              ← 진입점, 모드 선택, 스레드 시작
+  voice_module.py      ← 음성인식 상태머신
+  smart_water_core.py  ← 급수 제어 로직
+  gui_app.py           ← 실험자용 GUI (튜닝 패널, 그래프 포함)
+  user_kiosk_gui.py    ← 일반인용 GUI (키오스크 스타일)
+  csv_logger.py        ← 실험 결과 저장
 
 실행:
-  python3 main.py
+  python3 main.py              ← 실행 시 콘솔에서 모드 선택
+  python3 main.py --mode lab   ← 실험자 모드 직접 실행
+  python3 main.py --mode user  ← 일반인 모드 직접 실행
 """
 
+import argparse
 import threading
 import time
-import audio_diag_patch
+import sys
+
 import voice_module as voice
-from gui_app import run_kiosk_gui
 
 
-# GUI 콜백 등록 함수 (gui_app.py 에서 호출)
+# ── GUI 콜백 등록 함수 (gui_app.py / user_kiosk_gui.py 에서 호출) ──
+
 def register_gui_callbacks(on_cb, off_cb):
     voice.register_gui_callbacks(on_cb, off_cb)
 
@@ -29,28 +34,158 @@ def register_gui_level_callback(cb):
     voice.register_gui_level_callback(cb)
 
 
+# ── 모드 선택 ─────────────────────────────────────────────────────────
+
+def _select_mode_console() -> str:
+    """CLI 환경에서 모드를 대화형으로 선택한다."""
+    print()
+    print('+============================================================+')
+    print('| 스마트 정수기 통합 시스템                                   |')
+    print('| 음성인식(silero+Google STT) + 급수제어(LPC+LOESS+LSM)       |')
+    print('+============================================================+')
+    print()
+    print('  실행 모드를 선택하세요:')
+    print('  [1] 실험자 모드  ─ 튜닝 패널 / 실시간 그래프 포함 GUI')
+    print('  [2] 일반인 모드  ─ 키오스크 스타일 GUI (시연용)')
+    print()
+    while True:
+        try:
+            choice = input('  입력 (1 or 2): ').strip()
+        except (EOFError, KeyboardInterrupt):
+            print('\n  종료합니다.')
+            sys.exit(0)
+        if choice == '1':
+            return 'lab'
+        if choice == '2':
+            return 'user'
+        print('  1 또는 2 를 입력하세요.')
+
+
+def _select_mode_tkinter() -> str:
+    """
+    GUI 환경에서 모달 다이얼로그로 모드를 선택한다.
+    (터치스크린 환경에서 콘솔 입력이 불편할 때 사용)
+    """
+    import tkinter as tk
+    import customtkinter as ctk
+
+    result = ['lab']  # 기본값
+
+    ctk.set_appearance_mode('dark')
+    ctk.set_default_color_theme('blue')
+
+    dlg = ctk.CTk()
+    dlg.title('실행 모드 선택')
+    dlg.geometry('480x280+400+280')
+    dlg.resizable(False, False)
+    dlg.configure(fg_color='#0d1526')
+
+    ctk.CTkLabel(
+        dlg, text='스마트 정수기 — 실행 모드 선택',
+        font=('Malgun Gothic', 18, 'bold'), text_color='#67e8f9'
+    ).pack(pady=(30, 10))
+
+    ctk.CTkLabel(
+        dlg, text='사용 목적에 맞는 모드를 선택하세요',
+        font=('Malgun Gothic', 12), text_color='#94a3b8'
+    ).pack(pady=(0, 24))
+
+    btn_frame = ctk.CTkFrame(dlg, fg_color='transparent')
+    btn_frame.pack()
+
+    def choose(mode):
+        result[0] = mode
+        dlg.destroy()
+
+    ctk.CTkButton(
+        btn_frame, text='실험자 모드\n(튜닝 패널 / 그래프)',
+        width=180, height=80,
+        fg_color='#0B2D5B', hover_color='#123A73',
+        font=('Malgun Gothic', 13, 'bold'),
+        command=lambda: choose('lab')
+    ).grid(row=0, column=0, padx=14)
+
+    ctk.CTkButton(
+        btn_frame, text='일반인 모드\n(키오스크 시연)',
+        width=180, height=80,
+        fg_color='#1e1245', hover_color='#3d2a80',
+        font=('Malgun Gothic', 13, 'bold'),
+        command=lambda: choose('user')
+    ).grid(row=0, column=1, padx=14)
+
+    dlg.mainloop()
+    return result[0]
+
+
+# ── 진입점 ────────────────────────────────────────────────────────────
+
 def main():
-    print(flush=True)
-    print('+============================================================+', flush=True)
-    print('| 스마트 정수기 통합 시스템                                   |', flush=True)
-    print('| 음성인식(silero+Google STT) + 급수제어(LPC+LOESS+LSM)       |', flush=True)
-    print('| 초음파 도착감지(GPIO20/21) + ESP32 컵위치(HTTP)              |', flush=True)
-    print('+============================================================+', flush=True)
-
-    # 음성인식 루프를 별도 데몬 스레드로 시작
-    voice_thread = threading.Thread(
-        target=voice.voice_loop,
-        name='VoiceLoop',
-        daemon=True,
+    parser = argparse.ArgumentParser(description='스마트 정수기 통합 시스템')
+    parser.add_argument(
+        '--mode', choices=['lab', 'user'],
+        help="'lab' = 실험자 모드 | 'user' = 일반인 모드"
     )
-    voice_thread.start()
-    print(f'  [{time.strftime("%H:%M:%S")}] 음성인식 스레드 시작됨', flush=True)
+    parser.add_argument(
+        '--select-gui', action='store_true',
+        help='콘솔 대신 GUI 다이얼로그로 모드 선택'
+    )
+    args = parser.parse_args()
 
-    # GUI는 메인 스레드에서 실행 (Tkinter 요구사항)
-    run_kiosk_gui()
+    # 모드 결정
+    if args.mode:
+        mode = args.mode
+    elif args.select_gui:
+        mode = _select_mode_tkinter()
+    else:
+        mode = _select_mode_console()
+
+    mode_label = '실험자 모드' if mode == 'lab' else '일반인 모드'
+    print()
+    print('+============================================================+')
+    print(f'| 선택된 모드: {mode_label:<48}|')
+    print('+============================================================+')
+
+    # GUI 모듈을 먼저 import한다.
+    # 이유: 음성인식 스레드(torch/silero/audio/GPIO)를 먼저 시작하면
+    # customtkinter import와 동시에 여러 초기화가 겹쳐 간헐적 KeyError가 발생할 수 있다.
+    if mode == 'lab':
+        from gui_app import run_kiosk_gui
+        print(f'  [{time.strftime("%H:%M:%S")}] 실험자 GUI import 완료', flush=True)
+    else:
+        from user_kiosk_gui import run_kiosk_gui
+        print(f'  [{time.strftime("%H:%M:%S")}] 일반인 GUI import 완료', flush=True)
+
+    voice_thread = None
+
+    def start_voice_thread_once():
+        """GUI 초기화가 끝난 뒤 음성인식 스레드를 1회만 시작한다."""
+        nonlocal voice_thread
+        if voice_thread is not None and voice_thread.is_alive():
+            return
+        voice._shutdown.clear()
+        voice_thread = threading.Thread(
+            target=voice.voice_loop,
+            name='VoiceLoop',
+            daemon=True,
+        )
+        voice_thread.start()
+        print(f'  [{time.strftime("%H:%M:%S")}] 음성인식 스레드 시작됨', flush=True)
+
+    try:
+        # GUI 내부에서 CTk 위젯 생성과 콜백 등록이 끝난 뒤 on_ready를 호출한다.
+        run_kiosk_gui(on_ready=start_voice_thread_once)
+    finally:
+        # GUI 종료 시 남은 음성/음원 스레드에 종료 신호를 준다.
+        try:
+            voice._shutdown.set()
+            voice.stop_dispenser_sound()
+        except Exception:
+            pass
+
     import os
     os._exit(0)
 
+
 if __name__ == '__main__':
     main()
-
+    
