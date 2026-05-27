@@ -464,9 +464,9 @@ def run_kiosk_gui(on_ready=None):
     ax.grid(True, alpha=0.3)
     fig.tight_layout(pad=3.0)
 
-    line_freq,     = ax.plot([], [], linewidth=1.7, label='stable_f')
-    line_detected, = ax.plot([], [], linewidth=1.0, alpha=0.70, label='detected_f')
-    line_stop,     = ax.plot([], [], linewidth=1.2, linestyle='-.', alpha=0.85, label='f_for_stop')
+    line_freq,     = ax.plot([], [], linewidth=1.7, label='3rd_freq')
+    line_stop,     = ax.plot([], [], linewidth=1.2, linestyle='-.', alpha=0.85, label='2nd_freq')
+    line_detected, = ax.plot([], [], linewidth=1.0, alpha=0.70, label='1st_freq')
     target_line = ax.axhline(y=0, linestyle='--', alpha=0.8, label='target_f')
     ax.legend(loc='upper left', fontsize=8)
     canvas = FigureCanvasTkAgg(fig, master=plot_frame)
