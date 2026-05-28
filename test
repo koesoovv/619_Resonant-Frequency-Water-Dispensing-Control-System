@@ -1435,11 +1435,17 @@ def audio_callback(indata, frames, time_info, status):
             with lock:
                 _fill_for_switch = float(last_fill_pct)   # 직전 청크의 확정 수위
             if bridge_active or _fill_for_switch >= BRIDGE_ARM_PCT:
-                control_f       = f_for_stop
-                control_profile = 'extrap_ready'
+                control_f       = f_for_stop                                      # 70% 이후는 기존처럼 f_for_stop 사용
+                control_profile = 'extrap_ready'                                  # 외삽 준비/브릿지 구간
             else:
-                control_f       = stable_f
-                control_profile = 'stable_realtime'
+                if TARGET_FILL_PCT <= 70.0 and _fill_for_switch >= 45.0:           # 50~70% 목표에서 후반부만 선행 보정
+                    lead_f = stable_f * 0.30 + f_for_stop * 0.70                  # stable_f 60%, f_for_stop 40% 혼합
+                    lead_f = min(lead_f, stable_f * 1.08)                         # 순간 스파이크로 조기정지되는 것 방지
+                    control_f = max(stable_f, lead_f)                             # stable_f보다 낮아지지는 않게 제한
+                    control_profile = 'stable_lead'                               # 안정값 기반 선행 제어
+                else:
+                    control_f       = stable_f                                    # 초반부는 기존 stable_f 유지
+                    control_profile = 'stable_realtime'                           # 기존 실시간 안정 제어
 
             with lock:
                 last_raw_stop_freq   = f_for_stop
