@@ -75,7 +75,7 @@ BRIDGE_ENABLE           = True
 BRIDGE_TARGET_MIN_PCT   = 80.0
 BRIDGE_ARM_PCT          = 70.0
 BRIDGE_STOP_ADVANCE_PCT = 2.0
-BRIDGE_Q_SCALE          = 0.90
+BRIDGE_Q_SCALE          = 0.95
 BRIDGE_LOG_INTERVAL     = 0.5
 
 TARGET_MAX_CHANGE_RATIO = 0.25
@@ -1427,12 +1427,19 @@ def audio_callback(indata, frames, time_info, status):
             # 80~90% : f_for_stop + time/Q bridge
             f_for_stop = float(_f_stop_ema) if _f_stop_ema > 0 else stable_f
 
-            if TARGET_FILL_PCT < BRIDGE_TARGET_MIN_PCT:
-                control_f       = stable_f
-                control_profile = 'stable_50_70'
-            else:
+            # [실시간 전환] target이 아니라 '직전 실측 수위(last_fill_pct)'로 방식 결정.
+            #   - 실측 ≤ 70%(BRIDGE_ARM_PCT)      : stable_f 로 제어
+            #   - 실측 > 70% (또는 이미 브릿지 진입): f_for_stop + 외삽
+            # bridge_active 는 한 번 켜지면 유지되므로(래치), 70% 부근 노이즈로
+            # 인한 방식 왕복(flapping)은 발생하지 않는다.
+            with lock:
+                _fill_for_switch = float(last_fill_pct)   # 직전 청크의 확정 수위
+            if bridge_active or _fill_for_switch >= BRIDGE_ARM_PCT:
                 control_f       = f_for_stop
-                control_profile = 'ema_80_90_bridge_ready'
+                control_profile = 'extrap_ready'
+            else:
+                control_f       = stable_f
+                control_profile = 'stable_realtime'
 
             with lock:
                 last_raw_stop_freq   = f_for_stop
@@ -1521,7 +1528,7 @@ def audio_callback(indata, frames, time_info, status):
                 # ── time/Q 예측 브릿지 (80~90% 목표 전용) ──
                 bridge_used = False
                 if (BRIDGE_ENABLE
-                        and TARGET_FILL_PCT >= BRIDGE_TARGET_MIN_PCT
+                        and TARGET_FILL_PCT > BRIDGE_ARM_PCT      # 70% 이하 목표는 외삽 불필요(넘칠 일 없음)
                         and _init_air > 0
                         and _cur_d2 > 0
                         and (fill_pct >= BRIDGE_ARM_PCT or bridge_active)):
