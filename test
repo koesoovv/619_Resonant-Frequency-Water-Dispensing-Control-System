@@ -58,7 +58,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 16.0        # ml/s 실측값
+FLOW_RATE        = 15.0        # ml/s 실측값
 DIAMETER_EST_FLOW_RATE = 15.0  # D 역산용 유효 유량
 END_CORRECTION_K = 0.35        # 변경 금지
 
