@@ -47,22 +47,30 @@ GREEN_CLR = '#22c55e'
 MUTED     = '#4b6280'
 
 # ── 화면 스케일 ─────────────────────────────────────
-# 컵이 작게 보이지 않도록 사용자 환경 GUI 기준으로 확대한다.
+# 전체 레이아웃 크기는 유지하고, 컵 그림과 음성 아우라만 내부에서 키운다.
 SCALE = 0.66
+CUP_VISUAL_SCALE = 1.12          # 컵 몸통/물 채움/컵 테두리 확대 배율. 레이아웃은 유지
+RING_VISUAL_SCALE = 1.08         # 원형 진행 링 확대 배율
+VOICE_ORB_MIN_VOL = 0.34         # 음성 입력이 작아도 아우라가 너무 작게 보이지 않게 하는 최소 표시값
+VOICE_ORB_BASE_R = 220           # 음성 아우라 기본 반지름
+VOICE_ORB_GAIN_R = 90            # 음성 아우라 볼륨 반응 폭
 
 # ── 컵 캔버스 크기 ───────────────────────────────────
 CUP_CW, CUP_CH = int(610 * SCALE), int(620 * SCALE)
 
 # 원통형 컵 기준 좌표
-CUP_TX, CUP_TY   = int(305 * SCALE), int(108 * SCALE)
-CUP_TRX, CUP_TRY = int(162 * SCALE), int(23  * SCALE)
-CUP_BX, CUP_BY   = int(305 * SCALE), int(516 * SCALE)
-CUP_BRX, CUP_BRY = int(128 * SCALE), int(17  * SCALE)
+# RING_CY를 중심으로 위/아래 좌표를 확대해 컵이 더 크게 보이도록 한다.
+CUP_TX = int(305 * SCALE)
+CUP_TY = int((314 - (314 - 108) * CUP_VISUAL_SCALE) * SCALE)
+CUP_TRX, CUP_TRY = int(162 * SCALE * CUP_VISUAL_SCALE), int(23 * SCALE * CUP_VISUAL_SCALE)
+CUP_BX = int(305 * SCALE)
+CUP_BY = int((314 + (516 - 314) * CUP_VISUAL_SCALE) * SCALE)
+CUP_BRX, CUP_BRY = int(128 * SCALE * CUP_VISUAL_SCALE), int(17 * SCALE * CUP_VISUAL_SCALE)
 CUP_INNER_H = CUP_BY - CUP_TY
 
 # 원형 링
 RING_CX, RING_CY = int(305 * SCALE), int(314 * SCALE)
-RING_R = int(215 * SCALE)
+RING_R = int(215 * SCALE * RING_VISUAL_SCALE)
 
 # ── 사용자 GUI 표시용 수위 보정 ─────────────────────────
 # 실제 급수 제어용 값은 건드리지 않고, 화면에 보이는 퍼센트만 자연스럽게 보정한다.
@@ -72,11 +80,14 @@ DISPLAY_FALL_PER_SEC   = 8.0         # 목표 수위를 낮추거나 정지 보�
 # ── GUI 부드러움/부하 조절 ─────────────────────────────────────────
 # Raspberry Pi에서 무리가 가지 않도록 20fps 수준으로 컵 애니메이션만 올리고,
 # 상태값 갱신은 12.5fps 수준으로 유지한다.
-CANVAS_ANIM_MS = 45                  # 컵 물결/수위 애니메이션 주기(ms), 80ms → 50ms
-UI_UPDATE_MS   = 70                  # core 상태값을 GUI에 반영하는 주기(ms), 100ms → 80ms
-VOICE_ORB_RENDER_SKIP = 3            # 음성 오브 PIL 렌더링은 2프레임마다 1회만 수행
-WATER_GRADIENT_STRIPS = 8           # 물 그라디언트 조각 수. 14 → 10으로 줄여 CPU 부하 완화
-VOICE_ORB_POINTS = 40                # 음성 오브 외곽 점 개수. 56 → 40으로 줄여 부하 완화
+CANVAS_ANIM_MS = 75                  # 컵/아우라 애니메이션 주기(ms), 급수 후 지속 버벅임 완화용
+UI_UPDATE_MS   = 110                 # core 상태값 GUI 반영 주기(ms), 라즈베리파이 부하 완화
+VOICE_ORB_RENDER_SKIP = 2            # 예비값. 캐시 사용 중에도 음성 오브 갱신 부담 완화용
+WATER_GRADIENT_STRIPS = 6            # 물 그라디언트 조각 수. 급수 후 GUI 부하 완화
+VOICE_ORB_POINTS = 28                # 음성 오브 외곽 점 개수. 급수 후 아우라 버벅임 완화
+VOICE_ORB_VOL_STEPS = 4              # 아우라 볼륨 단계 수. 캐시 크기/렌더링 부담 완화
+VOICE_ORB_FRAME_COUNT = 10           # 아우라 애니메이션 프레임 수. 급수 후 지속 버벅임 완화
+POST_FILL_ANIM_RESET_MS = 80         # 급수 종료 후 애니메이션 루프 재정렬 지연(ms)
 
 # 초반 주파수 기반 컵 크기 판정값.
 # 큰 컵은 초반 공명 주파수가 낮고, 작은 컵은 초반 공명 주파수가 높게 나오는 특성을 이용한다.
@@ -100,29 +111,41 @@ DISPLAY_PROFILE_TABLE = {
         'time_per_sec': 2.8,         # 주파수/프로파일 없음: 임시 상승을 느리게 둠(%/s)
         'rise_per_sec': 4.2,         # 주파수 없는 초반 구간에서 화면이 너무 먼저 올라가지 않게 제한
         'catchup_per_sec': 14.0,     # 현재 % 생성 후 따라붙는 속도는 과하지 않게 유지
-        'canvas_alpha': 0.18,        # 컵 그림 보간 반응성
-        'canvas_max_step': 24.0,     # 컵 그림 초당 최대 변화량(%/s)
+        'canvas_alpha': 0.18,        # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_max_step': 24.0,     # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_tau': 0.28,          # 컵 수위 보간 시간상수. 클수록 더 부드럽고 느림
+        'canvas_max_up': 24.0,       # 컵 수위 상승 최대 속도(%/s)
+        'canvas_max_down': 80.0,     # 초기화/하강 최대 속도(%/s)
     },
     DISPLAY_PROFILE_LARGE: {
         'time_per_sec': 4.0,         # 큰 컵: 800Hz대까지 large로 보고 천천히 상승
         'rise_per_sec': 6.5,
         'catchup_per_sec': 15.0,
-        'canvas_alpha': 0.19,
-        'canvas_max_step': 30.0,
+        'canvas_alpha': 0.19,        # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_max_step': 30.0,     # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_tau': 0.25,          # 큰 컵은 천천히 부드럽게 따라감
+        'canvas_max_up': 30.0,       # 큰 컵 상승 최대 속도(%/s)
+        'canvas_max_down': 80.0,     # 초기화/하강 최대 속도(%/s)
     },
     DISPLAY_PROFILE_MID: {
         'time_per_sec': 5.0,         # 중간 컵: 기본 속도
         'rise_per_sec': 8.0,
         'catchup_per_sec': 20.0,
-        'canvas_alpha': 0.23,
-        'canvas_max_step': 38.0,
+        'canvas_alpha': 0.23,        # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_max_step': 38.0,     # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_tau': 0.22,          # 중간 컵 기본 보간값
+        'canvas_max_up': 38.0,       # 중간 컵 상승 최대 속도(%/s)
+        'canvas_max_down': 80.0,     # 초기화/하강 최대 속도(%/s)
     },
     DISPLAY_PROFILE_SMALL: {
         'time_per_sec': 6.7,         # 작은 컵: 기존보다 약 25~30% 낮춘 빠른 속도
         'rise_per_sec': 10.5,
         'catchup_per_sec': 28.0,
-        'canvas_alpha': 0.28,
-        'canvas_max_step': 52.0,
+        'canvas_alpha': 0.28,        # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_max_step': 52.0,     # 기존 호환용 값. 새 보간식에서는 직접 사용하지 않음
+        'canvas_tau': 0.20,          # 작은 컵은 조금 빠르게 따라감
+        'canvas_max_up': 46.0,       # 작은 컵 상승 최대 속도(%/s). 52보다 낮춰 급격한 튐 방지
+        'canvas_max_down': 80.0,     # 초기화/하강 최대 속도(%/s)
     },
 }
 
@@ -137,6 +160,7 @@ DISPLAY_RAW_STALE_RELAX_PER_SEC = 8.0 # 안정 추정값이 오래 멈춰 있을
 DISPLAY_RAW_UP_CONFIRM_SECONDS = 0.35 # 실제 추정 수위 상승이 이 시간 이상 반복될 때만 표시 목표에 반영
 DISPLAY_RAW_UP_MARGIN_PCT = 0.7      # 이 값 이상 오른 추정값만 상승 후보로 봄
 DISPLAY_RAW_JITTER_RESET_PCT = 5.5   # 상승 후보가 이 이상 흔들리면 확인 시간 초기화
+CORE_AUDIO_CLOSE_DELAY_SEC = 0.8     # 급수 종료 후 급수 분석용 오디오 스트림 정리 지연(s)
 
 
 def _get_display_profile_value(profile: str, key: str, default: float) -> float:
@@ -191,12 +215,15 @@ class CupCanvas(tk.Canvas):
         self._voice          = False
         self._voice_t        = 0
         self._wave_t         = 0
-        self._bubbles        = [self._new_bubble() for _ in range(5)]
+        self._bubbles        = [self._new_bubble() for _ in range(3)]  # 물방울 4개 → 3개
         self._complete_active = False
         self._complete_t      = 0
         self._anim_id        = None
         self._voice_photo    = None
         self._orb_frame       = 0     # 음성 오브 렌더링 부하 조절용 프레임 카운터
+        self._voice_orb_cache = {}    # 보라색 음성 오브 PhotoImage 캐시. PIL 실시간 렌더링 반복을 줄임
+        self._post_fill_recover_until = 0.0  # 급수 종료 후 애니메이션 타이밍 재정렬 구간
+        self.after(300, self._prebuild_voice_orb_cache)  # 앱 시작 후 아우라 프레임을 미리 생성
         self._redraw()
         self._animate()
 
@@ -205,26 +232,62 @@ class CupCanvas(tk.Canvas):
         y = random.uniform(CUP_BY - 10, CUP_BY - 5)
         return [x, y, random.uniform(2, 4), random.uniform(0.4, 1.0)]
 
+    def _prebuild_voice_orb_cache(self):
+        """아우라 이미지를 미리 생성해 급수 후 첫 음성 입력 때 PIL 렌더링이 몰리지 않게 한다."""
+        try:
+            for vol_idx in range(VOICE_ORB_VOL_STEPS):
+                vol = vol_idx / float(max(1, VOICE_ORB_VOL_STEPS - 1))
+                for frame_idx in range(VOICE_ORB_FRAME_COUNT):
+                    key = (vol_idx, frame_idx)
+                    if key not in self._voice_orb_cache:
+                        self._voice_orb_cache[key] = self._render_voice_orb_photo(vol, frame_idx)
+            print('\n[GUI] voice orb cache prebuilt')
+        except Exception as e:
+            print(f'\n[GUI] voice orb cache prebuild 오류: {e}')
+
+    def recover_animation_after_fill(self):
+        """급수 후 밀린 애니메이션 타이밍을 재정렬한다. 음성인식 로직은 건드리지 않는다."""
+        self._last_smooth_t = time.time()
+        self._voice_t = 0
+        self._orb_frame = 0
+        self._post_fill_recover_until = time.time() + 0.15
+
+        try:
+            if self._anim_id is not None:
+                self.after_cancel(self._anim_id)
+        except Exception:
+            pass
+
+        self._anim_id = self.after(POST_FILL_ANIM_RESET_MS, self._animate)
+
     def _rx_at(self, y):
         r = (CUP_BY - y) / CUP_INNER_H
         return CUP_BRX + (CUP_TRX - CUP_BRX) * r
 
     def _animate(self):
-        # 표시 수위 자체를 부드럽게 보간한다.
-        # periodic_update()에서 목표 수위가 계단식으로 들어와도 컵 그림은 천천히 따라간다.
-        now = time.time()
+        frame_start = time.time() 
+        now = frame_start
         dt = max(0.016, min(0.12, now - self._last_smooth_t))
         self._last_smooth_t = now
 
         diff = self._pct_target - self._pct
-        if abs(diff) < 0.05:
+        if abs(diff) < 0.08:
             self._pct = self._pct_target
         else:
-            # 초반 주파수로 판정한 컵 크기 프로파일에 따라 컵 애니메이션 속도를 조절한다.
-            smooth_alpha = _get_display_profile_value(self._display_profile, 'canvas_alpha', 0.22)
-            max_step = _get_display_profile_value(self._display_profile, 'canvas_max_step', 34.0) * dt
-            step = diff * smooth_alpha
-            step = max(-max_step, min(max_step, step))
+            # 프레임 시간 기반 보간을 사용해 FPS 흔들림에도 수위 움직임이 일정하게 보이도록 한다.
+            smooth_tau = _get_display_profile_value(self._display_profile, 'canvas_tau', 0.22)
+            smooth_tau = max(0.08, float(smooth_tau))
+            alpha = 1.0 - math.exp(-dt / smooth_tau)
+
+            max_up_step = _get_display_profile_value(self._display_profile, 'canvas_max_up', 38.0) * dt
+            max_down_step = _get_display_profile_value(self._display_profile, 'canvas_max_down', 80.0) * dt
+
+            step = diff * alpha
+            if step > 0:
+                step = min(step, max_up_step)
+            else:
+                step = max(step, -max_down_step)
+
             self._pct = max(0.0, min(100.0, self._pct + step))
 
         if self._pct > 2:
@@ -244,47 +307,74 @@ class CupCanvas(tk.Canvas):
                 self._complete_active = False
                 self._complete_t = 0
         self._redraw()
-        self._anim_id = self.after(CANVAS_ANIM_MS, self._animate)
+        elapsed_ms = int((time.time() - frame_start) * 1000)
+        next_delay = max(1, CANVAS_ANIM_MS - elapsed_ms)
+
+        if time.time() < self._post_fill_recover_until:
+            next_delay = max(1, min(next_delay, CANVAS_ANIM_MS))  # 20ms 강제 고속 루프 제거
+
+        self._anim_id = self.after(next_delay, self._animate)
+
+    def _get_voice_orb_photo(self, vol: float):
+        """보라색 음성 오브 이미지를 캐시해서 반환한다."""
+        try:
+            vol = float(vol)
+        except (TypeError, ValueError):
+            vol = 0.5
+        vol = max(0.0, min(1.0, vol))
+
+        # 음성 입력이 작아도 시각적으로 충분히 보이도록 최소 표시값을 보장한다.
+        if vol > 0.02:
+            vol = max(vol, VOICE_ORB_MIN_VOL)
+
+        vol_idx = int(round(vol * (VOICE_ORB_VOL_STEPS - 1)))
+        vol_idx = max(0, min(VOICE_ORB_VOL_STEPS - 1, vol_idx))
+        frame_idx = int(self._voice_t) % VOICE_ORB_FRAME_COUNT
+        key = (vol_idx, frame_idx)
+
+        if key not in self._voice_orb_cache:
+            cache_vol = vol_idx / float(max(1, VOICE_ORB_VOL_STEPS - 1))
+            self._voice_orb_cache[key] = self._render_voice_orb_photo(cache_vol, frame_idx)
+
+        return self._voice_orb_cache[key]
+
+    def _render_voice_orb_photo(self, vol: float, frame_idx: int):
+        """음성 오브 PhotoImage 1장을 생성한다. 생성 결과는 캐시에 저장되어 반복 사용된다."""
+        cx, cy = RING_CX, RING_CY
+        t = frame_idx * 0.42
+        base_r = int((VOICE_ORB_BASE_R + vol * VOICE_ORB_GAIN_R) * SCALE)
+
+        orb = Image.new('RGBA', (CUP_CW, CUP_CH), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(orb)
+
+        for layer in self._ORB_LAYERS:
+            r = base_r * layer['r_mult']
+            amp = r * layer['amp'] * (0.4 + vol * 0.6)
+            pts = []
+            for j in range(VOICE_ORB_POINTS):
+                angle = 2 * math.pi * j / VOICE_ORB_POINTS
+                deform = (
+                    amp * math.sin(3 * angle + t * layer['spd'] + layer['phase'])
+                    + amp * 0.5 * math.sin(5 * angle - t * layer['spd'] * 0.8 + layer['phase'])
+                    + amp * 0.3 * math.sin(2 * angle + t * layer['spd'] * 1.3)
+                )
+                rr = r + deform
+                pts.append((cx + rr * math.cos(angle), cy + rr * math.sin(angle)))
+            cr, cg, cb = layer['color']
+            draw.polygon(pts, fill=(cr, cg, cb, layer['alpha']))
+
+        orb = orb.filter(ImageFilter.GaussianBlur(radius=int(9 * SCALE)))
+        return ImageTk.PhotoImage(orb)
 
     def _redraw(self):
         self.delete('all')
         pct = self._pct
 
-        # ① 시리 오브 — PIL RGBA 렌더링으로 반투명 유리 질감
+        # ① 시리 오브 — 캐시된 PhotoImage를 사용해 부드러움은 유지하고 CPU 부하는 줄인다.
         if self._voice:
             self._orb_frame += 1
-            need_render = (self._voice_photo is None or
-                           self._orb_frame % VOICE_ORB_RENDER_SKIP == 0)
-
-            if need_render:
-                vol = float(getattr(core, 'mic_volume', 0.5))
-                cx, cy = RING_CX, RING_CY
-                t = self._voice_t * 0.08
-
-                base_r = int((205 + vol * 70) * SCALE)
-
-                orb = Image.new('RGBA', (CUP_CW, CUP_CH), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(orb)
-
-                for layer in self._ORB_LAYERS:
-                    r   = base_r * layer['r_mult']
-                    amp = r * layer['amp'] * (0.4 + vol * 0.6)
-                    N   = VOICE_ORB_POINTS
-                    pts = []
-                    for j in range(N):
-                        angle  = 2 * math.pi * j / N
-                        deform = (amp * math.sin(3 * angle + t * layer['spd'] + layer['phase'])
-                                + amp * 0.5 * math.sin(5 * angle - t * layer['spd'] * 0.8 + layer['phase'])
-                                + amp * 0.3 * math.sin(2 * angle + t * layer['spd'] * 1.3))
-                        rr = r + deform
-                        pts.append((cx + rr * math.cos(angle),
-                                    cy + rr * math.sin(angle)))
-                    cr, cg, cb = layer['color']
-                    draw.polygon(pts, fill=(cr, cg, cb, layer['alpha']))
-
-                orb = orb.filter(ImageFilter.GaussianBlur(radius=int(9 * SCALE)))
-                self._voice_photo = ImageTk.PhotoImage(orb)
-
+            vol = float(getattr(core, 'mic_volume', 0.5))
+            self._voice_photo = self._get_voice_orb_photo(vol)
             if self._voice_photo is not None:
                 self.create_image(0, 0, anchor='nw', image=self._voice_photo)
         else:
@@ -482,6 +572,43 @@ def run_kiosk_gui(on_ready=None):
     display_profile_freqs = [[]]
     display_profile_start_t = [0.0]
     display_profile_median_hz = [0.0]
+
+    def _close_core_audio_stream_later(delay_sec=CORE_AUDIO_CLOSE_DELAY_SEC):
+        """급수 종료 후 급수제어용 오디오 스트림을 늦게 닫아 음성/GUI 부하를 줄인다."""
+        stream_ref = getattr(core, 'audio_stream', None)          # 현재 열린 급수 분석 스트림 참조
+        if stream_ref is None:                                    # 열린 스트림이 없으면 정리할 것이 없음
+            return
+
+        def _worker():
+            time.sleep(max(0.0, float(delay_sec)))                # stop_filling/CSV 스냅샷 반영 시간 확보
+            try:
+                with core.lock:
+                    filling = bool(core.is_filling)               # 새 급수가 시작됐으면 닫으면 안 됨
+                if filling:
+                    return
+
+                current = getattr(core, 'audio_stream', None)     # 현재 스트림 재확인
+                if current is None:
+                    return
+                if current is not stream_ref:                     # 다음 급수에서 새 스트림이 열렸으면 보호
+                    return
+
+                try:
+                    current.stop()                                # 급수 분석 스트림 정지
+                except Exception:
+                    pass
+                try:
+                    current.close()                               # 오디오 장치 해제
+                except Exception:
+                    pass
+
+                core.audio_stream = None                          # 다음 급수 때 ensure_audio_stream()이 새로 열도록 함
+                print('\n[GUI] 급수 종료 후 core audio_stream 정리 완료')
+            except Exception as e:
+                print(f'\n[GUI] core audio_stream 정리 오류: {e}')
+
+        threading.Thread(target=_worker, daemon=True).start()      # GUI 메인 루프를 막지 않음
+
 
     hit_dots: list[tk.Label] = []
 
@@ -864,6 +991,8 @@ def run_kiosk_gui(on_ready=None):
         cup_canvas.set_fill(display_pct_state[0], immediate=True)
         cup_canvas.freeze_fill()
         cup_canvas.set_filling(False)
+        cup_canvas.recover_animation_after_fill()                  # 수동 정지 후 아우라/컵 애니메이션 타이밍 재정렬
+        _close_core_audio_stream_later()                           # 수동 정지 후 급수 분석 스트림 해제
 
     btn_start = ctk.CTkButton(
         btn_f, text='▶  시작',
@@ -900,6 +1029,8 @@ def run_kiosk_gui(on_ready=None):
             if obj:
                 try:
                     obj.stop(); obj.close()
+                    if obj is core.audio_stream:
+                        core.audio_stream = None
                 except Exception:
                     pass
         for obj in (core.sw_on, core.sw_off, core.solenoid):
@@ -963,17 +1094,31 @@ def run_kiosk_gui(on_ready=None):
                 speech_text = str(getattr(core, 'last_recognized_text', '') or '')
                 tts_text = str(getattr(core, 'last_tts_text', '') or '')
                 tts_time = float(getattr(core, 'last_tts_time', 0.0) or 0.0)
+                voice_ready = bool(getattr(core, 'voice_ready', False))
+                voice_ready_text = str(getattr(core, 'voice_ready_text', '') or '')
                 if finish:
                     core.request_finish = False
 
-            cup_canvas.set_voice(voice)
+            visual_voice = bool(voice)                                      # 실제 발화 감지 중일 때만 무거운 아우라 렌더링
+            cup_canvas.set_voice(visual_voice)
 
             if voice:
                 _fit_text_to_fixed_label(speech_text_lbl, '듣는 중 ...', kind='user')
                 speech_text_lbl.configure(fg=CYAN)
+            elif voice_ready:
+                ready_msg = voice_ready_text if voice_ready_text else '말씀해 주세요'
+                _fit_text_to_fixed_label(speech_text_lbl, ready_msg, kind='user')
+                speech_text_lbl.configure(fg=CYAN)
             elif speech_text:
-                _fit_text_to_fixed_label(speech_text_lbl, speech_text, kind='user')
+                display_speech_text = speech_text                              # voice_module에서 이미 보정된 표시 문장
+
+                _fit_text_to_fixed_label(
+                    speech_text_lbl,
+                    display_speech_text,
+                    kind='user'
+                )
                 speech_text_lbl.configure(fg='#e2e8f0')
+                
             else:
                 _fit_text_to_fixed_label(speech_text_lbl, '호출어 또는 명령을 말해주세요', kind='user')
                 speech_text_lbl.configure(fg=MUTED)
@@ -991,6 +1136,15 @@ def run_kiosk_gui(on_ready=None):
 
             if finish:
                 cup_canvas.trigger_complete()
+                cup_canvas.recover_animation_after_fill()                     # 자동 정지 후 아우라/컵 애니메이션 타이밍 재정렬
+                _close_core_audio_stream_later()                              # 자동 정지 후 급수 분석 스트림 해제
+                try:
+                    import voice_module as vm
+                    vm.notify_water_finished(source='user_gui')               # 자동 정지 시 완료 안내 보장
+                    if hasattr(vm, 'request_voice_audio_restart'):
+                        vm.request_voice_audio_restart('fill_finished')        # 급수 후 음성 입력 스트림 재시작 요청
+                except Exception as e:
+                    print(f'\n[GUI] 음성 복구 요청 오류: {e}')
 
             now = time.time()
             if finish and (now - _last_saved_t[0]) > 2.0:
@@ -1247,5 +1401,6 @@ def run_kiosk_gui(on_ready=None):
 
 if __name__ == '__main__':
     run_kiosk_gui()
+
 
 
