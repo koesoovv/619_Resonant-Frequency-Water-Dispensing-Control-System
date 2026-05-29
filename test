@@ -1,52 +1,3 @@
-# smart_water_core.py  ── v5.32-time-q-bridge
-#
-# [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 추가
-#   80~90% 고수위 목표에서 주파수 검출이 1800~2000Hz 부근에서 정체될 때,
-#   70%까지의 신뢰 가능한 수위 추정값을 기준점으로 잡고
-#   D, 초기 공기층(H), 기준 유량(Q)으로 남은 채움률을 시간 외삽한다.
-#   기존 LPC/FFT/EMA 검출 경로는 유지하고, TARGET_FILL_PCT >= 80%일 때만 브릿지가 개입한다.
-#   브릿지 정지 기준은 TARGET_FILL_PCT - BRIDGE_STOP_ADVANCE_PCT 이다.
-#
-# [v5.31-STAG-LOG] 후반부 '주파수 정체' 진단 로그 추가 (제어/검출 경로 변경 없음)
-#   정체 구간에서 raw / stable_f / f_for_stop 변화율을 콘솔에 찍어
-#   정체 원인이 '검출단계(LPC/FFT)'인지 '후처리(median/EMA)'인지 구분한다.
-#   ※ 동작(제어·검출)은 v5.30과 100% 동일. 로그만 추가.
-#   ※ current_air가 stable_f가 아닌 f_for_stop을 쓰는 주석/동작 불일치는
-#     '동작 변경 없이' 주석만 사실에 맞게 수정 (어느 쪽으로 통일할지는 그래프 확인 후 결정).
-#
-# [v5.30-STABLE-CTRL] 제어 주파수를 stable_f로 변경
-#   current_air = c/(4*stable_f) - k*D  (EMA+median 기반)
-#   f_for_stop(_f_stop_ema)는 그래프 비교용으로만 유지
-#
-# [v5.30-PKFLOOR] peak_lock_floor / max_freq_seen spike guard
-#   raw_f_for_reg > last * SPIKE_RATIO_THRESHOLD 시 갱신 차단
-#   spike 오염으로 stable_f가 높게 플로어되는 문제 수정
-#
-# [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA (비교용)
-#   raw_f_for_reg 기반으로 직접 EMA 적용 (raw_stop_buffer / _compute_f_for_stop 제거)
-#   상승 시: alpha_up  (빠르게 반영)
-#   하강 시: alpha_down (아주 조금만 반영)
-#   → 실제 주파수 상승을 즉시 추적하면서, 일시 dropout/spike 하강에 강건
-#
-# [v5.28-FILL-RATE] fill_pct 상방향 속도 제한
-#   물리적 최대: Q/A × 청크시간 / 컵높이 ≈ 0.25%/청크 (소형 기준)
-#   제한값: FILL_PCT_RATE_LIMIT = 2.0%/청크 (물리 최대의 약 8배, 여유 마진)
-#   상방향(증가)만 제한, 하방향(감소/보정)은 자유
-#
-# ═══ v5.25 변경 사항 (v5.23 기반, 5가지 개선 전부 반영) ══════════════
-#
-# [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준, 2단계
-# [v5.25-DYN-Q] 동적 유량 EMA 추적
-# [v5.25-SPIKE-UNI] spike gate 단방향화 + 초반 완화
-# [v5.25-SNR] 노이즈 플로어 추적 + SNR 체크
-#
-# [v5.27-FLOW-RATE] 실측 유량 반영 (FLOW_RATE=18)
-# [v5.26-DYN-Q-CAP] dynamic_Q 상한을 FLOW_RATE로 제한
-# [v5.32-DH-RECAL] D 역산용 유효 유량 / H 보정량 선택
-#
-# ※ STOP_ADVANCE_CM, END_CORRECTION_K=0.35 변경 금지
-# ═══════════════════════════════════════════════════════════════════
-
 import numpy as np
 import sounddevice as sd
 import scipy.signal as signal
@@ -55,7 +6,6 @@ import threading
 from collections import deque
 from gpiozero import OutputDevice, Button
 
-# ── 파일/GPIO 설정 ──────────────────────────────────────────────────
 CSV_FILENAME      = 'experiment_results.csv'
 INPUT_DEVICE      = 1
 SOLENOID_GPIO     = 7
@@ -63,13 +13,11 @@ SW_ON_GPIO        = 3
 SW_OFF_GPIO       = 5
 RELAY_ACTIVE_HIGH = True
 
-# ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 15.0        # ml/s 실측값 (v5.27)
-DIAMETER_EST_FLOW_RATE = 15.0  # [v5.32-DH-RECAL] D 역산용 유효 유량
+FLOW_RATE        = 15.0
+DIAMETER_EST_FLOW_RATE = 15.0
 END_CORRECTION_K = 0.35
 
-# ── 제어 파라미터 ────────────────────────────────────────────────────
 TARGET_FILL_PCT         = 70.0
 STOP_ADVANCE_PCT        = 0.0
 STOP_OFFSET_HZ          = 0
@@ -79,29 +27,28 @@ DIAM_CALC_END_TIME      = 30.0
 CONTROL_START_TIME      = 7.0
 STOP_TRIGGER_COUNT      = 5
 
-# ── [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 ─────────────
-BRIDGE_ENABLE           = True   # True: 고수위 목표에서 70% 이후 시간/유량 기반으로 보정
-BRIDGE_TARGET_MIN_PCT   = 80.0   # 80% 이상 목표에서만 브릿지 사용
-BRIDGE_ARM_PCT          = 70.0   # 음향 추정 수위가 이 값 이상이면 브릿지 시작
-BRIDGE_STOP_ADVANCE_PCT = 2.0    # 정지 히트 지연 보정용 선행 정지율(%)
-BRIDGE_Q_SCALE          = 1.00   # 1.00=FLOW_RATE 기준, 크게 하면 더 이르게 정지
-BRIDGE_LOG_INTERVAL     = 0.5    # 브릿지 로그 출력 간격(s)
+FINAL_MODE_MIN_FILL_PCT = 80.0
+
+BRIDGE_ENABLE           = True
+BRIDGE_TARGET_MIN_PCT   = 80.0
+BRIDGE_ARM_PCT          = 70.0
+BRIDGE_STOP_ADVANCE_PCT = 2.0
+BRIDGE_Q_SCALE          = 1.00
+BRIDGE_LOG_INTERVAL     = 0.5
 
 TARGET_MAX_CHANGE_RATIO = 0.25
-INIT_AIR_OFFSET_CM      = 1.0   # fallback only
+INIT_AIR_OFFSET_CM      = 1.0
 
-# ── [v5.32-DH-RECAL] 초기 공기층(H) 보정 ─────────────────────────
 INIT_OFFSET_LOW_FREQ_HZ      = 650.0
 INIT_OFFSET_MID_FREQ_HZ      = 850.0
 INIT_OFFSET_LARGE_D_CM       = 8.5
 INIT_OFFSET_VERY_LOW_CM      = 1.7
 INIT_OFFSET_LARGE_MID_CM     = 5.6
 INIT_OFFSET_SMALL_MID_CM     = 4.1
-INIT_OFFSET_HIGH_FREQ_CM     = 4.0
+INIT_OFFSET_HIGH_FREQ_CM     = 3.0
 INIT_AIR_BLEND_TOL_CM        = 1.8
 INIT_AIR_REG_BLEND           = 0.20
 
-# ── [v5.25-ZONE-EMA] 구간별 EMA alpha ───────────────────────────────
 ZONE_EMA_ALPHA = {
     50: 0.15,
     60: 0.25,
@@ -110,7 +57,6 @@ ZONE_EMA_ALPHA = {
     90: 0.92,
 }
 
-# ── [v5.23-ZONE-ADV] 구간별 progressive advance (%) ─────────────────
 ZONE_ADVANCE_PCT = {
     50:  0.0,
     60:  0.0,
@@ -119,46 +65,37 @@ ZONE_ADVANCE_PCT = {
     90:  0.0,
 }
 
-# ── [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준 ──────────
 DIAM_THRESHOLD             = 8.0
 DIAM_EMA_SCALE_SMALL       = 1.00
 DIAM_EMA_SCALE_LARGE       = 0.65
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15
 
-# ── [v5.25-DYN-Q] 동적 유량 추적 ────────────────────────────────────
 DYNAMIC_Q_EMA_ALPHA = 0.15
 DYNAMIC_Q_MIN       = 12.0
-DYNAMIC_Q_MAX       = FLOW_RATE   # 초기 설정값이 최대 (중력식: 시간↑ → Q↓)
+DYNAMIC_Q_MAX       = FLOW_RATE
 
-# ── [v5.25-SPIKE-UNI] 단방향 spike gate ─────────────────────────────
 REG_SPIKE_GATE       = 0.08
 SPIKE_EARLY_TIME     = 15.0
-REG_SPIKE_GATE_EARLY = REG_SPIKE_GATE * 2.5   # = 0.20
+REG_SPIKE_GATE_EARLY = REG_SPIKE_GATE * 2.5
 
-# ── [v5.28-FILL-RATE] fill_pct 상방향 속도 제한 ─────────────────────
-FILL_PCT_RATE_LIMIT = 2.0   # %/청크, 상방향만 적용
+FILL_PCT_RATE_LIMIT = 2.0
 
-# ── [v5.25-SNR] 노이즈 플로어 ────────────────────────────────────────
 SNR_THRESHOLD      = 2.0
 NOISE_FLOOR_PCTILE = 70
 
-# ── [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA ──────────────────────────
-FSCORE_ALPHA_UP   = 0.70   # 상승 반영 속도 (새 값 80% 즉시 반영)
-FSCORE_ALPHA_DOWN = 0.10   # 하강 반영 속도 (거의 안 내려감)
+FSCORE_ALPHA_UP   = 0.70
+FSCORE_ALPHA_DOWN = 0.10
 
-# ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
 EARLY_CEIL_HZ            = 1000
 FREQ_MIN_LIMIT           = 300
 CALIBRATION_CUTOFF_RATIO = 0.9
 
-# ── 녹음/타이밍 ──────────────────────────────────────────────────────
 NOISE_CALIBRATION_TIME = 3
 SPLASH_GUARD_TIME      = 6.0
 SAMPLE_RATE  = 44100
 CHUNK_SIZE   = 4096
 
-# ── 디스플레이 ───────────────────────────────────────────────────────
 LOGO_PATH       = '/home/kimcapybara/venv/DEU.png'
 LOGO_SIZE       = (70, 70)
 WIN_W, WIN_H    = 800, 480
@@ -167,7 +104,6 @@ USE_CENTER      = False
 PLOT_UPDATE_MS  = 200
 PLOT_MAX_POINTS = 2000
 
-# ── LPC 파라미터 ─────────────────────────────────────────────────────
 LPC_ORDER        = 16
 LPC_DS_FACTOR    = 5
 LPC_DS_RATE      = SAMPLE_RATE // LPC_DS_FACTOR
@@ -179,81 +115,69 @@ LPC_PEAK_PROM    = 0.18
 LPC_CONTINUITY_W = 600.0
 LPC_RISE_BIAS    = 0.05
 
-# ── LOESS 파라미터 ────────────────────────────────────────────────────
 LOESS_FRAC   = 0.25
 LOESS_DEGREE = 1
 
-# ── tracking 파라미터 ────────────────────────────────────────────────
 TRACKING_ENTRY_HZ       = 1200
 TRACKING_ENTRY_MULT     = 1.6
 TRACKING_MODE_THRESHOLD = 20
 TRACKING_BAND_HZ        = 500
 TRACKING_FLOOR_RATIO    = 0.90
 
-# ── 초기 구간 보호 ───────────────────────────────────────────────────
 EARLY_NOISE_SEC = 6.0
 EARLY_BUF_SIZE  = 9
 MONO_DROP_RATIO = 0.85
 
-# ── EMA alpha (구간 밖 fallback) ─────────────────────────────────────
 EMA_ALPHA_NORMAL    = 0.35
 EMA_ALPHA_FINAL     = 0.68
 FINAL_APPROACH_MULT = 1.5
 
-# ── tracking adaptive EMA ────────────────────────────────────────────
 TRACKING_EMA_SPIKE_ALPHA  = 0.05
 TRACKING_EMA_RISE2_ALPHA  = 0.08
 TRACKING_EMA_RISE1_ALPHA  = 0.15
 TRACKING_EMA_FALL_ALPHA   = 0.35
 FINAL_TRACKING_RISE_ALPHA = 0.45
 
-# ── Hz/청크 속도 제한 ────────────────────────────────────────────────
 RATE_LIMIT_NORMAL_HZ  = 100.0
 RATE_LIMIT_FINAL_HZ   = 300.0
 SPIKE_RATIO_THRESHOLD = 1.15
 
-# ── 이론 곡선 가이드 ─────────────────────────────────────────────────
 THEORY_GUIDE_ALPHA        = 0.40
 THEORY_GUIDE_MARGIN       = 0.25
 THEORY_GUIDE_ALPHA_FINAL  = 0.50
 THEORY_GUIDE_MARGIN_FINAL = 0.375
 
-# ── D 안정화 ─────────────────────────────────────────────────────────
 DIAM_CAND_MAXLEN   = 14
 DIAM_CAND_MIN      = 8
 DIAM_EMA_KEEP      = 0.92
 DIAM_EMA_NEW       = 0.08
 DIAM_OUTLIER_RATIO = 0.25
 
-# ── LSM / 데이터 충분성 ───────────────────────────────────────────────
+DIAM_RELOCK_STREAK = 5
+
 LSM_R2_MIN     = 0.95
 REG_MIN_POINTS = 14
 THEORY_LOCK_R2 = 0.92
 
-# ── 피크 고착 감지 ────────────────────────────────────────────────────
 FREEZE_RESET_N = 8
 BUF_SIZE_FINAL = 3
 
-# ── init_stable 최소 주파수 ──────────────────────────────────────────
 INIT_STABLE_MIN_HZ = 350
 
-# ── 기타 ────────────────────────────────────────────────────────────
 MIN_SLOPE_CUTOFF = 16 * FLOW_RATE / (np.pi * SOUND_SPEED * 15.0**2) * 0.3
 PRINT_INTERVAL   = 0.1
 
-# ── 고역통과 필터 ────────────────────────────────────────────────────
 HP_SOS = signal.butter(4, 150, 'hp', fs=SAMPLE_RATE, output='sos')
 
-# ── 전역 상태 변수 ───────────────────────────────────────────────────
 history_time          = []
-history_freq          = []           # stable_f: 화면/그래프 기준 스무딩 주파수
-history_detected_freq = []           # detected_f: EMA/median 이전 1차 검출 주파수
-history_stop_freq     = []           # f_for_stop: 비대칭 EMA 기반 제어용 주파수
+history_freq          = []
+history_detected_freq = []
+history_stop_freq     = []
 reg_time_buffer       = deque(maxlen=200)
 reg_inv_freq_buffer   = deque(maxlen=200)
 diameter_candidates   = deque(maxlen=DIAM_CAND_MAXLEN)
 freq_buffer           = deque()
-_f_stop_ema           = 0.0          # [v5.29-ASYM-EMA] 비대칭 EMA 상태값
+_f_stop_ema           = 0.0
 
 is_filling              = False
 filling_start_time      = 0.0
@@ -310,9 +234,11 @@ _eff_target_air_cm    = 3.0
 init_stable_buffer    = deque(maxlen=10)
 
 peak_lock_floor = 0.0
-dynamic_Q       = FLOW_RATE   # [v5.25-DYN-Q]
+dynamic_Q       = FLOW_RATE
 
-# [v5.32-TIME-Q-BRIDGE] 시간/유량 예측 브릿지 상태
+_diam_reject_streak    = 0
+_diam_reject_direction = 0
+
 bridge_active          = False
 bridge_start_elapsed   = 0.0
 bridge_start_fill_pct  = 0.0
@@ -322,21 +248,15 @@ bridge_start_freq      = 0.0
 bridge_eta_sec         = 0.0
 bridge_last_log        = 0.0
 
-# [v5.31-STAG-LOG] 후반부 정체 진단용 (제어/검출에 영향 없음, 로그 전용)
-_stag_buffer   = deque(maxlen=40)   # (t, raw_f, stable_f, f_for_stop)
+_stag_buffer   = deque(maxlen=40)
 _stag_last_log = 0.0
 
 _reg_event = threading.Event()
 
-# ── GPIO 초기화 ──────────────────────────────────────────────────────
 solenoid = OutputDevice(SOLENOID_GPIO, active_high=RELAY_ACTIVE_HIGH, initial_value=False)
 sw_on    = Button(SW_ON_GPIO,  pull_up=True, bounce_time=0.05)
 sw_off   = Button(SW_OFF_GPIO, pull_up=True, bounce_time=0.05)
 
-
-# ════════════════════════════════════════════════════════════════════
-#  GPIO 제어
-# ════════════════════════════════════════════════════════════════════
 def solenoid_on():
     try: solenoid.on()
     except Exception as e: print(f'\n[GPIO ON 실패] {e}')
@@ -348,10 +268,6 @@ def solenoid_off():
 def solenoid_off_async():
     threading.Thread(target=solenoid_off, daemon=True).start()
 
-
-# ════════════════════════════════════════════════════════════════════
-#  구간별 파라미터 조회
-# ════════════════════════════════════════════════════════════════════
 def _get_zone_ema_alpha(fill_pct: float, in_final: bool) -> float:
     if 50.0 <= fill_pct < 100.0:
         key = int(fill_pct // 10) * 10
@@ -359,18 +275,10 @@ def _get_zone_ema_alpha(fill_pct: float, in_final: bool) -> float:
             return ZONE_EMA_ALPHA[key]
     return EMA_ALPHA_FINAL if in_final else EMA_ALPHA_NORMAL
 
-
 def _get_zone_advance() -> float:
-    """
-    [v5.26-ZONE-FIX] advance는 TARGET_FILL_PCT 구간 기준으로 고정 조회.
-    """
     key = int(TARGET_FILL_PCT // 10) * 10
     return ZONE_ADVANCE_PCT.get(key, 0.0)
 
-
-# ════════════════════════════════════════════════════════════════════
-#  [v5.25-DIAM-EMA] 지름 기반 EMA 스케일
-# ════════════════════════════════════════════════════════════════════
 def _get_diam_ema_scale(diameter: float, fill_pct: float) -> float:
     if diameter <= 0:
         return 1.0
@@ -379,12 +287,7 @@ def _get_diam_ema_scale(diameter: float, fill_pct: float) -> float:
         base = min(1.0, base * DIAM_EMA_SCALE_FINAL_BOOST)
     return base
 
-
-# ════════════════════════════════════════════════════════════════════
-#  [v5.32-DH-RECAL] H 보정량 선택
-# ════════════════════════════════════════════════════════════════════
 def _get_init_air_offset(init_f: float, diameter: float) -> float:
-    """컵 이름 없이 초기 주파수와 추정 지름만으로 초기 공기층 보정량을 선택한다."""
     try:
         init_f   = float(init_f)
         diameter = float(diameter)
@@ -398,12 +301,7 @@ def _get_init_air_offset(init_f: float, diameter: float) -> float:
         return INIT_OFFSET_LARGE_MID_CM if diameter >= INIT_OFFSET_LARGE_D_CM else INIT_OFFSET_SMALL_MID_CM
     return INIT_OFFSET_HIGH_FREQ_CM
 
-
-# ════════════════════════════════════════════════════════════════════
-#  수학 유틸리티
-# ════════════════════════════════════════════════════════════════════
 def _flow_volume_to_fill_pct(q_ml_s: float, dt_s: float, diameter_cm: float, init_air_cm: float) -> float:
-    """유량 Q[ml/s]가 dt초 동안 만든 채움률 증가분(%)을 계산한다."""
     try:
         q_ml_s      = float(q_ml_s)
         dt_s        = float(dt_s)
@@ -422,7 +320,6 @@ def _flow_volume_to_fill_pct(q_ml_s: float, dt_s: float, diameter_cm: float, ini
     added_ml = q_ml_s * dt_s
     total_air_volume_ml = area_cm2 * init_air_cm
     return (added_ml / (total_air_volume_ml + 1e-12)) * 100.0
-
 
 def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
     n = len(x)
@@ -451,7 +348,6 @@ def loess_smooth(x, y, frac=LOESS_FRAC, degree=LOESS_DEGREE):
             smoothed[i] = y[i]
     return smoothed
 
-
 def levinson_durbin(r, order):
     e = float(r[0])
     if e <= 0:
@@ -467,10 +363,6 @@ def levinson_durbin(r, order):
         e    *= max(1.0 - lam * lam, 1e-12)
     return a
 
-
-# ════════════════════════════════════════════════════════════════════
-#  주파수 검출
-# ════════════════════════════════════════════════════════════════════
 def lpc_main_frequency(chunk, last_freq, f_min, f_max):
     x_ds  = signal.decimate(chunk.astype(float), LPC_DS_FACTOR, ftype='fir')
     sr_ds = LPC_DS_RATE
@@ -520,7 +412,6 @@ def lpc_main_frequency(chunk, last_freq, f_min, f_max):
         cands.append(float(pf[np.argmax(score)]))
     return float(np.median(cands)) if cands else 0.0
 
-
 def fft_backup_frequency(chunk, last_freq, f_min, f_max):
     windowed = chunk * np.hamming(len(chunk))
     fft_val  = np.abs(np.fft.rfft(windowed))
@@ -547,7 +438,6 @@ def fft_backup_frequency(chunk, last_freq, f_min, f_max):
         score = pm_n
     return float(pf[np.argmax(score)])
 
-
 def _harmonic_correct(f: float, ref: float) -> float:
     if ref <= 0 or f <= 0:
         return f
@@ -562,7 +452,6 @@ def _harmonic_correct(f: float, ref: float) -> float:
         return 0.0
     return f
 
-
 def get_frequency(chunk, last_freq, f_min, f_max):
     filtered = signal.sosfilt(HP_SOS, chunk.astype(float))
     lpc_f = lpc_main_frequency(filtered, last_freq, f_min, f_max)
@@ -573,10 +462,6 @@ def get_frequency(chunk, last_freq, f_min, f_max):
     fft_f = _harmonic_correct(fft_f, last_freq)
     return float(fft_f)
 
-
-# ════════════════════════════════════════════════════════════════════
-#  회귀 기반 D 추정
-# ════════════════════════════════════════════════════════════════════
 def robust_slope_loess_lsm(times, inv_freqs):
     if len(times) < 12:
         return None, 0.0, 0.0
@@ -600,7 +485,6 @@ def robust_slope_loess_lsm(times, inv_freqs):
     except Exception:
         return None, 0.0, 0.0
 
-
 def theory_freq(t: float) -> float:
     if not theory_locked:
         return 0.0
@@ -609,10 +493,6 @@ def theory_freq(t: float) -> float:
         return 0.0
     return 1.0 / denom
 
-
-# ════════════════════════════════════════════════════════════════════
-#  회귀 워커 스레드
-# ════════════════════════════════════════════════════════════════════
 def _regression_worker():
     global current_diameter, target_freq, calibration_done
     global theory_slope, theory_intercept, theory_locked
@@ -621,6 +501,7 @@ def _regression_worker():
     global last_d_locked_cm, last_d_candidate_median, last_d_candidate_mad
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
+    global _diam_reject_streak, _diam_reject_direction
 
     while True:
         _reg_event.wait(timeout=1.0)
@@ -636,7 +517,7 @@ def _regression_worker():
             _cur_d    = float(current_diameter)
             _cand_cnt = len(diameter_candidates)
             _dyn_q    = float(dynamic_Q)
-            _diam_full = (_cand_cnt >= DIAM_CAND_MAXLEN) or \
+            _diam_full = (_cand_cnt >= DIAM_CAND_MAXLEN) or\
                          (_cand_cnt >= DIAM_CAND_MIN and _filling_elapsed > DIAM_CALC_END_TIME)
 
         if _diam_full:
@@ -676,7 +557,6 @@ def _regression_worker():
                 last_r2 = r_sq
             continue
 
-        # ── [v5.25-DYN-Q] r² 통과 시 dynamic_Q EMA 갱신 ─────────────
         if _cur_d > 0 and _cand_cnt >= DIAM_CAND_MIN:
             q_implied = abs(s_a) * np.pi * SOUND_SPEED * _cur_d**2 / 16
             if DYNAMIC_Q_MIN <= q_implied <= DYNAMIC_Q_MAX:
@@ -687,7 +567,6 @@ def _regression_worker():
                 _dyn_q = new_dyn_q
                 print(f'\n[DYN-Q] Q={_dyn_q:.2f}ml/s (역산={q_implied:.1f})')
 
-        # [v5.32-DH-RECAL] D 역산에 보정된 유효 유량 사용
         effective_Q = DIAMETER_EST_FLOW_RATE
         temp_D = np.sqrt(16 * effective_Q / (np.pi * SOUND_SPEED * abs(s_a)))
 
@@ -714,16 +593,39 @@ def _regression_worker():
             cur_med = temp_D
 
         if outlier:
-            print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm ±30%, 무시)')
-            continue
+            direction = 1 if temp_D > cur_med else -1
+            with lock:
+                if direction == _diam_reject_direction:
+                    _diam_reject_streak += 1
+                else:
+                    _diam_reject_direction = direction
+                    _diam_reject_streak = 1
+                _streak_now = _diam_reject_streak
+
+            if _streak_now >= DIAM_RELOCK_STREAK:
+                with lock:
+                    diameter_candidates.clear()
+                    diameter_candidates.append(temp_D)
+                    current_diameter = 0.0
+                    _diam_reject_streak = 0
+                    _diam_reject_direction = 0
+                print(f'\n[D락해제] {direction:+d}방향 {DIAM_RELOCK_STREAK}연속 거부'
+                      f' → 후보 리셋, temp_D={temp_D:.2f}cm로 재시작')
+            else:
+                print(f'\n[D이상치] temp_D={temp_D:.2f}cm (중앙값={cur_med:.2f}cm'
+                      f' ±{DIAM_OUTLIER_RATIO*100:.0f}%, 무시 {_streak_now}/{DIAM_RELOCK_STREAK})')
+                continue
 
         with lock:
             last_r2 = r_sq
-            diameter_candidates.append(temp_D)
+            _diam_reject_streak = 0
+            _diam_reject_direction = 0
+            if (not diameter_candidates) or (diameter_candidates[-1] != temp_D):
+                diameter_candidates.append(temp_D)
 
             _new_cnt      = len(diameter_candidates)
             _elapsed_now  = time.time() - filling_start_time - NOISE_CALIBRATION_TIME
-            diam_full_now = (_new_cnt >= DIAM_CAND_MAXLEN) or \
+            diam_full_now = (_new_cnt >= DIAM_CAND_MAXLEN) or\
                             (_new_cnt >= DIAM_CAND_MIN and _elapsed_now > DIAM_CALC_END_TIME)
 
             cand_arr = np.array(list(diameter_candidates), dtype=float)
@@ -746,7 +648,7 @@ def _regression_worker():
             if init_air_len_cm == 0.0 and _init_f > 0 and _cur_d > 0:
                 h_offset = _get_init_air_offset(_init_f, _cur_d)
                 h_init   = SOUND_SPEED / (4 * _init_f) - END_CORRECTION_K * _cur_d
-                h_reg    = SOUND_SPEED * theory_intercept / 4.0 - END_CORRECTION_K * _cur_d \
+                h_reg    = SOUND_SPEED * theory_intercept / 4.0 - END_CORRECTION_K * _cur_d\
                            if (theory_locked and theory_intercept > 0) else 0.0
 
                 h_init_corr = h_init + h_offset
@@ -787,14 +689,9 @@ def _regression_worker():
                 print(f'\n[★ 지름 확정] D={_cur_d:.3f}cm | dynQ={dynamic_Q:.1f}ml/s'
                       f' | cand={_new_cnt} | t={_elapsed_now:.1f}s')
 
-
 _reg_worker_thread = threading.Thread(target=_regression_worker, daemon=True)
 _reg_worker_thread.start()
 
-
-# ════════════════════════════════════════════════════════════════════
-#  급수 시작/종료
-# ════════════════════════════════════════════════════════════════════
 def start_filling_local() -> None:
     global is_filling, filling_start_time, calibration_done
     global freq_buffer, reg_time_buffer, reg_inv_freq_buffer
@@ -817,6 +714,7 @@ def start_filling_local() -> None:
     global last_init_air_by_initfreq_cm, last_init_air_by_regression_cm, last_init_air_locked_cm
     global last_model_valid, last_reject_reason, last_control_profile
     global _stag_buffer, _stag_last_log
+    global _diam_reject_streak, _diam_reject_direction
     global bridge_active, bridge_start_elapsed, bridge_start_fill_pct, bridge_pred_fill_pct
     global bridge_start_q, bridge_start_freq, bridge_eta_sec, bridge_last_log
 
@@ -825,7 +723,7 @@ def start_filling_local() -> None:
         filling_start_time      = time.time()
         calibration_done        = False
         freq_buffer             = deque()
-        _f_stop_ema             = 0.0    # [v5.29-ASYM-EMA]
+        _f_stop_ema             = 0.0
         last_stop_elapsed_sec   = 0.0
         last_raw_stop_freq      = 0.0
         last_decision_freq      = 0.0
@@ -878,8 +776,10 @@ def start_filling_local() -> None:
         _eff_target_air_cm      = 3.0
         peak_lock_floor         = 0.0
         init_stable_buffer      = deque(maxlen=10)
-        _stag_buffer            = deque(maxlen=40)   # [v5.31-STAG-LOG]
+        _stag_buffer            = deque(maxlen=40)
         _stag_last_log          = 0.0
+        _diam_reject_streak     = 0
+        _diam_reject_direction  = 0
         bridge_active           = False
         bridge_start_elapsed    = 0.0
         bridge_start_fill_pct   = 0.0
@@ -890,7 +790,6 @@ def start_filling_local() -> None:
         bridge_last_log         = 0.0
     print('\n>>> [1단계] 배경 소음 측정 (3초)...')
 
-
 def stop_filling_local(save_result: bool) -> None:
     global is_filling, request_finish, history_freq_snapshot
     global last_stop_elapsed_sec
@@ -900,13 +799,9 @@ def stop_filling_local(save_result: bool) -> None:
         is_filling = False
         if save_result:
             request_finish = True
-    close_audio_stream_async(delay_sec=0.35)                    # 급수 종료 후 분석용 오디오 스트림을 확실히 해제
+    close_audio_stream_async(delay_sec=0.35)
     print('\n>>> 물 주입 종료.')
 
-
-# ════════════════════════════════════════════════════════════════════
-#  오디오 콜백
-# ════════════════════════════════════════════════════════════════════
 def audio_callback(indata, frames, time_info, status):
     global is_filling, filling_start_time, calibration_done
     global target_freq, current_diameter
@@ -946,7 +841,6 @@ def audio_callback(indata, frames, time_info, status):
         with lock:
             elapsed = current_time - filling_start_time
 
-        # ── 1단계: 배경 소음 수집 + 노이즈 플로어 측정 ──────────────
         if elapsed < NOISE_CALIBRATION_TIME:
             windowed = chunk * np.hamming(len(chunk))
             fft_val  = np.abs(np.fft.rfft(windowed))
@@ -968,7 +862,6 @@ def audio_callback(indata, frames, time_info, status):
 
         filling_elapsed = elapsed - NOISE_CALIBRATION_TIME
 
-        # ── 2단계: SPLASH 구간 펌프 소음 보완 ──────────────────────
         if filling_elapsed < SPLASH_GUARD_TIME:
             windowed = chunk * np.hamming(len(chunk))
             fft_val  = np.abs(np.fft.rfft(windowed))
@@ -990,7 +883,6 @@ def audio_callback(indata, frames, time_info, status):
             _last_s = float(last_stable_f)
             _nfl    = float(noise_floor_level)
 
-        # ── SNR 체크 ─────────────────────────────────────────────────
         if _nfl > 0:
             windowed_snr = chunk * np.hamming(len(chunk))
             fft_snr      = np.abs(np.fft.rfft(windowed_snr))
@@ -1001,7 +893,6 @@ def audio_callback(indata, frames, time_info, status):
                 if peak_mag < _nfl * SNR_THRESHOLD:
                     return
 
-        # ── 3단계: 탐색 범위 결정 ────────────────────────────────────
         if filling_elapsed < 3.5:
             current_ceil  = EARLY_CEIL_HZ
             current_floor = dynamic_min_limit
@@ -1028,7 +919,6 @@ def audio_callback(indata, frames, time_info, status):
         if _tf > 0 and dynamic_min_limit > _tf * 0.85:
             dynamic_min_limit = _tf * 0.85
 
-        # ── 4단계: 주파수 검출 ───────────────────────────────────────
         with lock:
             _init_confirmed = (initial_stable_freq > 0)
 
@@ -1059,27 +949,22 @@ def audio_callback(indata, frames, time_info, status):
             return
 
         consecutive_loss_count = 0
-        raw_f_for_reg = float(detected_f)   # EMA 이전 raw 주파수
+        raw_f_for_reg = float(detected_f)
 
-        # 변경
         if _f_stop_ema <= 0:
             _f_stop_ema = raw_f_for_reg
         elif raw_f_for_reg >= _f_stop_ema:
             _f_stop_ema = (_f_stop_ema * (1 - FSCORE_ALPHA_UP)
                            + raw_f_for_reg * FSCORE_ALPHA_UP)
         else:
-            if not tracking_mode:                                # 트래킹 전: 조금 내려감
+            if not tracking_mode:
                 _f_stop_ema = (_f_stop_ema * (1 - FSCORE_ALPHA_DOWN)
                                + raw_f_for_reg * FSCORE_ALPHA_DOWN)
-            # 트래킹 모드 진입 후: 하강 무시 → 현재값 유지 (단조 증가)
 
-        f_for_stop_plot = _f_stop_ema   # 그래프 비교용
+        f_for_stop_plot = _f_stop_ema
 
-        # ── [v5.30-PKFLOOR] spike 감지 플래그 ───────────────────────
-        # raw_f_for_reg가 직전 추적값의 SPIKE_RATIO_THRESHOLD 배 초과 → spike
         _is_spike = (_last > 0 and raw_f_for_reg > _last * SPIKE_RATIO_THRESHOLD)
 
-        # ── 5단계: EMA 스무딩 ────────────────────────────────────────
         with lock:
             _cur_d_snap   = float(current_diameter)
             _calib_snap   = bool(calibration_done)
@@ -1090,6 +975,9 @@ def audio_callback(indata, frames, time_info, status):
             L_now    = SOUND_SPEED / (4 * _last_s) - END_CORRECTION_K * _cur_d_snap
             in_final = (L_now < _eff_tgt * FINAL_APPROACH_MULT)
         else:
+            in_final = False
+
+        if _fill_pct_now < FINAL_MODE_MIN_FILL_PCT:
             in_final = False
 
         if _calib_snap and _fill_pct_now >= 50.0:
@@ -1131,7 +1019,6 @@ def audio_callback(indata, frames, time_info, status):
             if detected_f - _last > max_rise:
                 detected_f = _last + max_rise
 
-        # ── 이론 곡선 가이드 ─────────────────────────────────────────
         if theory_locked and detected_f > 0:
             f_theory = theory_freq(filling_elapsed)
             if f_theory > 0:
@@ -1159,7 +1046,6 @@ def audio_callback(indata, frames, time_info, status):
 
         last_tracked_freq = detected_f
 
-        # ── 6단계: freq_buffer → stable_f (표시·그래프 전용) ─────────
         if in_final:
             buf_size = BUF_SIZE_FINAL
         elif filling_elapsed < EARLY_NOISE_SEC:
@@ -1182,7 +1068,7 @@ def audio_callback(indata, frames, time_info, status):
             _freeze_count = 0
 
         if tracking_mode:
-            stable_f = float(np.median(list(freq_buffer)[-BUF_SIZE_FINAL:])) \
+            stable_f = float(np.median(list(freq_buffer)[-BUF_SIZE_FINAL:]))\
                        if len(freq_buffer) >= BUF_SIZE_FINAL else detected_f
         else:
             stable_f = float(np.median(list(freq_buffer))) if freq_buffer else detected_f
@@ -1210,7 +1096,6 @@ def audio_callback(indata, frames, time_info, status):
                     initial_stable_time = float(filling_elapsed)
                     print(f'\n[★ 초기주파수 확정] {initial_stable_freq:.0f}Hz | t={initial_stable_time:.1f}s')
 
-        # ── [v5.30-PKFLOOR] spike 시 max_freq_seen 갱신 차단 ─────────
         with lock:
             if filling_elapsed > SPLASH_GUARD_TIME and stable_f > max_freq_seen and not _is_spike:
                 max_freq_seen = stable_f
@@ -1223,14 +1108,12 @@ def audio_callback(indata, frames, time_info, status):
             if stable_f < hard_floor:
                 stable_f = hard_floor
 
-        # ── [v5.30-PKFLOOR] spike 시 peak_lock_floor 갱신 차단 ───────
         if stable_f > peak_lock_floor and not _is_spike:
             peak_lock_floor = stable_f
         if peak_lock_floor > 0 and stable_f < peak_lock_floor * 0.90:
             stable_f = peak_lock_floor * 0.90
 
-        # ── 7단계: tracking 모드 진입 판정 ──────────────────────────
-        _tracking_thresh = max(TRACKING_ENTRY_HZ, _init * TRACKING_ENTRY_MULT) \
+        _tracking_thresh = max(TRACKING_ENTRY_HZ, _init * TRACKING_ENTRY_MULT)\
                            if _init > 0 else TRACKING_ENTRY_HZ
 
         if stable_f > _tracking_thresh:
@@ -1243,12 +1126,11 @@ def audio_callback(indata, frames, time_info, status):
                 tracking_mode = True
             print(f'\n[★ 트래킹 모드] {stable_f:.0f}Hz (thresh={_tracking_thresh:.0f}Hz) 시작')
 
-        # ── 8단계: 회귀 버퍼 수집 (SPIKE-UNI 적용) ──────────────────
         with lock:
             _init_f   = float(initial_stable_freq)
             _cur_d    = float(current_diameter)
             _cand_cnt = len(diameter_candidates)
-            _diam_full = (_cand_cnt >= DIAM_CAND_MAXLEN) or \
+            _diam_full = (_cand_cnt >= DIAM_CAND_MAXLEN) or\
                          (_cand_cnt >= DIAM_CAND_MIN and filling_elapsed > DIAM_CALC_END_TIME)
 
         if filling_elapsed > CALC_START_TIME and not _diam_full:
@@ -1297,7 +1179,6 @@ def audio_callback(indata, frames, time_info, status):
                     elif raw_f_for_reg >= _init_f * 4.0:
                         print(f'\n[D진단] ⚠ raw_f({raw_f_for_reg:.0f}) ≥ init_f({_init_f:.0f})*4.0 → 배음 의심, 제외')
 
-        # ── 9단계: 정지 판단 [v5.30-STABLE-CTRL] ────────────────────
         with lock:
             _tf2      = float(target_freq)
             _cd       = bool(calibration_done)
@@ -1305,17 +1186,12 @@ def audio_callback(indata, frames, time_info, status):
             _init_air = float(init_air_len_cm)
 
         if filling_elapsed > CONTROL_START_TIME and _cd and stable_f > 0:
-            # [v5.30-STABLE-CTRL] 제어 주파수 = stable_f (EMA+median)
-            # f_for_stop(_f_stop_ema)는 로그/그래프 비교용으로만 유지
             f_for_stop = float(_f_stop_ema) if _f_stop_ema > 0 else stable_f
 
             with lock:
                 last_raw_stop_freq = f_for_stop
-                last_decision_freq = stable_f    # 실제 제어 기준 주파수
+                last_decision_freq = stable_f
 
-            # [주의/v5.31] 헤더의 'stable_f 제어' 주석과 달리 실제 제어는 f_for_stop을 사용한다.
-            #   동작은 v5.30과 동일하게 유지(변경 금지) — 그래프(검증법 참고)로 어느 신호가
-            #   후반부 상승을 가장 잘 따라가는지 확인한 뒤, 한쪽으로 통일할 것.
             current_air = SOUND_SPEED / (4 * f_for_stop) - END_CORRECTION_K * _cur_d2
             with lock:
                 last_current_air = float(current_air)
@@ -1323,7 +1199,6 @@ def audio_callback(indata, frames, time_info, status):
             if _init_air > 0:
                 fill_pct = max(0.0, min(100.0, (1.0 - current_air / _init_air) * 100.0))
 
-                # [v5.28-FILL-RATE] 상방향 속도 제한
                 with lock:
                     _prev_fill = float(last_fill_pct)
                 if _prev_fill > 0 and fill_pct > _prev_fill + FILL_PCT_RATE_LIMIT:
@@ -1337,29 +1212,22 @@ def audio_callback(indata, frames, time_info, status):
                     last_model_valid       = True
                     last_reject_reason     = 'ok'
 
-                # ── [v5.31-STAG-LOG] 후반부 정체 진단 (제어에 영향 없음, 로그 전용) ──
-                # 최근 ~약 40청크 동안의 raw / stable_f / f_for_stop 변화율(Hz/s)을 계산.
-                # stable_f가 사실상 안 오르는데(<10Hz/s) 목표까지 5%+ 남았으면 정체로 판단하고,
-                # raw도 안 오르면 '검출단계', raw는 오르는데 stable만 평평하면 '후처리' 문제.
                 _stag_buffer.append((filling_elapsed, raw_f_for_reg, stable_f, f_for_stop))
-                if (current_time - _stag_last_log >= 1.0          # 1초에 한 번만 출력
-                        and len(_stag_buffer) >= 10               # 표본 충분
-                        and fill_pct < TARGET_FILL_PCT - 5.0):     # 아직 목표까지 5%+ 남음
+                if (current_time - _stag_last_log >= 1.0
+                        and len(_stag_buffer) >= 10
+                        and fill_pct < TARGET_FILL_PCT - 5.0):
                     _arr = list(_stag_buffer)
-                    _dt  = max(_arr[-1][0] - _arr[0][0], 1e-6)     # 0 나눗셈 방지
-                    _d_raw  = (_arr[-1][1] - _arr[0][1]) / _dt     # raw 검출 변화율
-                    _d_smo  = (_arr[-1][2] - _arr[0][2]) / _dt     # stable_f 변화율
-                    _d_stop = (_arr[-1][3] - _arr[0][3]) / _dt     # f_for_stop 변화율
-                    if abs(_d_smo) < 10.0:                          # stable_f 정체
+                    _dt  = max(_arr[-1][0] - _arr[0][0], 1e-6)
+                    _d_raw  = (_arr[-1][1] - _arr[0][1]) / _dt
+                    _d_smo  = (_arr[-1][2] - _arr[0][2]) / _dt
+                    _d_stop = (_arr[-1][3] - _arr[0][3]) / _dt
+                    if abs(_d_smo) < 10.0:
                         _src = '검출단계(LPC/FFT)' if abs(_d_raw) < 10.0 else '후처리(median/EMA)'
                         print(f'\n[정체감지] t={filling_elapsed:.1f}s 추정원인={_src}'
                               f' | d_raw={_d_raw:+.0f} d_smo={_d_smo:+.0f} d_stop={_d_stop:+.0f} Hz/s'
                               f' | fill={fill_pct:.0f}%/{TARGET_FILL_PCT:.0f}%')
                     _stag_last_log = current_time
 
-                # ── [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 ──
-                # 250mL 비커처럼 후반부 공기층이 너무 짧아져 주파수 검출이 포화되는 경우,
-                # 70%까지는 음향 추정값을 믿고, 이후는 Q·D·H 기반 시간 외삽으로 채움률을 증가시킨다.
                 bridge_used = False
                 if (BRIDGE_ENABLE
                         and TARGET_FILL_PCT >= BRIDGE_TARGET_MIN_PCT
@@ -1373,8 +1241,6 @@ def audio_callback(indata, frames, time_info, status):
                         _bridge_q      = float(bridge_start_q)
 
                     if not _bridge_active:
-                        # FLOW_RATE 기준을 최소 예측 유량으로 둔다.
-                        # 예측 유량을 크게 잡을수록 목표 도달 시점을 더 이르게 판단하므로 넘침 방지에 유리하다.
                         q_for_bridge = max(DYNAMIC_Q_MIN, float(dynamic_Q), FLOW_RATE * BRIDGE_Q_SCALE)
                         target_for_eta = max(BRIDGE_ARM_PCT, TARGET_FILL_PCT - BRIDGE_STOP_ADVANCE_PCT)
                         remain_pct = max(0.0, target_for_eta - fill_pct)
@@ -1492,17 +1358,13 @@ def audio_callback(indata, frames, time_info, status):
                     last_stop_elapsed_sec = filling_elapsed
                     is_filling     = False
                     request_finish = True
-                close_audio_stream_async(delay_sec=0.35)        # 자동 정지 후 분석용 오디오 스트림을 확실히 해제
+                close_audio_stream_async(delay_sec=0.35)
                 return
 
     except Exception as e:
         print(f'\n[AUDIO_CALLBACK_ERROR] {type(e).__name__}: {e}', flush=True)
         return
 
-
-# ════════════════════════════════════════════════════════════════════
-#  오디오 스트림 관리
-# ════════════════════════════════════════════════════════════════════
 def ensure_audio_stream():
     global audio_stream
     if audio_stream is not None:
@@ -1517,35 +1379,33 @@ def ensure_audio_stream():
     audio_stream.start()
 
 def close_audio_stream_async(delay_sec=0.35):
-    """급수 종료 후 급수 분석용 sounddevice 스트림을 비동기로 정리한다."""
     global audio_stream
 
-    stream_ref = audio_stream                                      # 현재 스트림 참조를 고정
-    if stream_ref is None:                                         # 열린 분석 스트림이 없으면 종료
+    stream_ref = audio_stream
+    if stream_ref is None:
         return
 
     def _worker():
         global audio_stream
-        time.sleep(max(0.0, float(delay_sec)))                     # 콜백 종료 여유 시간
+        time.sleep(max(0.0, float(delay_sec)))
         try:
             with lock:
-                still_filling = bool(is_filling)                  # 새 급수가 시작됐는지 확인
+                still_filling = bool(is_filling)
             if still_filling:
-                return                                             # 급수 중이면 닫지 않음
+                return
             if audio_stream is not stream_ref:
-                return                                             # 다른 스트림으로 바뀌었으면 보호
+                return
             try:
-                stream_ref.stop()                                  # PortAudio 스트림 정지
+                stream_ref.stop()
             except Exception:
                 pass
             try:
-                stream_ref.close()                                 # 오디오 장치 해제
+                stream_ref.close()
             except Exception:
                 pass
-            audio_stream = None                                    # 다음 급수 때 새로 열도록 초기화
+            audio_stream = None
             print('\n[CORE] 급수 분석 audio_stream 정리 완료')
         except Exception as e:
             print(f'\n[CORE] audio_stream 정리 오류: {e}')
 
-    threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
-
+    threading.Thread(target=_worker, daemon=True).start()
