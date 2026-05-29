@@ -700,7 +700,7 @@ def _regression_worker():
 
         temp_D *= DIAMETER_SCALE * auto_scale
 
-        if not (2.0 < temp_D < 15.0):
+        if not (5.0 < temp_D < 10.0):
             continue
 
         with lock:
@@ -900,6 +900,7 @@ def stop_filling_local(save_result: bool) -> None:
         is_filling = False
         if save_result:
             request_finish = True
+    close_audio_stream_async(delay_sec=0.35)                    # 급수 종료 후 분석용 오디오 스트림을 확실히 해제
     print('\n>>> 물 주입 종료.')
 
 
@@ -1491,6 +1492,7 @@ def audio_callback(indata, frames, time_info, status):
                     last_stop_elapsed_sec = filling_elapsed
                     is_filling     = False
                     request_finish = True
+                close_audio_stream_async(delay_sec=0.35)        # 자동 정지 후 분석용 오디오 스트림을 확실히 해제
                 return
 
     except Exception as e:
@@ -1513,3 +1515,37 @@ def ensure_audio_stream():
         blocksize=CHUNK_SIZE,
     )
     audio_stream.start()
+
+def close_audio_stream_async(delay_sec=0.35):
+    """급수 종료 후 급수 분석용 sounddevice 스트림을 비동기로 정리한다."""
+    global audio_stream
+
+    stream_ref = audio_stream                                      # 현재 스트림 참조를 고정
+    if stream_ref is None:                                         # 열린 분석 스트림이 없으면 종료
+        return
+
+    def _worker():
+        global audio_stream
+        time.sleep(max(0.0, float(delay_sec)))                     # 콜백 종료 여유 시간
+        try:
+            with lock:
+                still_filling = bool(is_filling)                  # 새 급수가 시작됐는지 확인
+            if still_filling:
+                return                                             # 급수 중이면 닫지 않음
+            if audio_stream is not stream_ref:
+                return                                             # 다른 스트림으로 바뀌었으면 보호
+            try:
+                stream_ref.stop()                                  # PortAudio 스트림 정지
+            except Exception:
+                pass
+            try:
+                stream_ref.close()                                 # 오디오 장치 해제
+            except Exception:
+                pass
+            audio_stream = None                                    # 다음 급수 때 새로 열도록 초기화
+            print('\n[CORE] 급수 분석 audio_stream 정리 완료')
+        except Exception as e:
+            print(f'\n[CORE] audio_stream 정리 오류: {e}')
+
+    threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
+
