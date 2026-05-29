@@ -65,7 +65,7 @@ RELAY_ACTIVE_HIGH = True
 
 # ── 물리 상수 ────────────────────────────────────────────────────────
 SOUND_SPEED      = 34300.0
-FLOW_RATE        = 18.0        # ml/s 실측값 (v5.27)
+FLOW_RATE        = 15.0        # ml/s 실측값 (v5.27)
 DIAMETER_EST_FLOW_RATE = 15.0  # [v5.32-DH-RECAL] D 역산용 유효 유량
 END_CORRECTION_K = 0.35
 
