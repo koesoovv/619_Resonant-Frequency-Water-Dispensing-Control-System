@@ -80,13 +80,15 @@ DISPLAY_FALL_PER_SEC   = 8.0         # 목표 수위를 낮추거나 정지 보�
 # ── GUI 부드러움/부하 조절 ─────────────────────────────────────────
 # Raspberry Pi에서 무리가 가지 않도록 20fps 수준으로 컵 애니메이션만 올리고,
 # 상태값 갱신은 12.5fps 수준으로 유지한다.
-CANVAS_ANIM_MS = 75                  # 컵/아우라 애니메이션 주기(ms), 급수 후 지속 버벅임 완화용
-UI_UPDATE_MS   = 110                 # core 상태값 GUI 반영 주기(ms), 라즈베리파이 부하 완화
-VOICE_ORB_RENDER_SKIP = 2            # 예비값. 캐시 사용 중에도 음성 오브 갱신 부담 완화용
-WATER_GRADIENT_STRIPS = 6            # 물 그라디언트 조각 수. 급수 후 GUI 부하 완화
-VOICE_ORB_POINTS = 28                # 음성 오브 외곽 점 개수. 급수 후 아우라 버벅임 완화
-VOICE_ORB_VOL_STEPS = 4              # 아우라 볼륨 단계 수. 캐시 크기/렌더링 부담 완화
-VOICE_ORB_FRAME_COUNT = 10           # 아우라 애니메이션 프레임 수. 급수 후 지속 버벅임 완화
+CANVAS_ANIM_MS = 55                  # 컵/아우라 애니메이션 주기(ms). 급수 제어 DSP와 병행해도 과부하가 덜 생기도록 완화
+UI_UPDATE_MS   = 90                  # core 상태값을 GUI에 반영하는 주기(ms). 아우라와 수위 애니메이션 부하 분산
+VOICE_ORB_RENDER_SKIP = 1            # 음성 오브는 캐시 이미지를 사용하므로 매 프레임 갱신
+WATER_GRADIENT_STRIPS = 7           # 물 그라디언트 조각 수. 급수 중 캔버스 redraw 부하 완화
+VOICE_ORB_POINTS = 32                # 음성 오브 외곽 점 개수. 아우라 모양 유지하면서 렌더링 부하 완화
+VOICE_ORB_VOL_STEPS = 5              # 아우라 볼륨 단계 수. 캐시 단계 고정
+VOICE_ORB_FRAME_COUNT = 16           # 아우라 애니메이션 프레임 수. 캐시 프레임 고정
+VOICE_ORB_ANIM_FPS = 14.0             # 아우라 프레임을 redraw 횟수가 아니라 실제 시간 기준으로 진행
+VOICE_VISUAL_LATCH_SEC = 0.22         # VAD active가 순간적으로 끊겨도 아우라를 짧게 유지
 POST_FILL_ANIM_RESET_MS = 80         # 급수 종료 후 애니메이션 루프 재정렬 지연(ms)
 
 # 초반 주파수 기반 컵 크기 판정값.
@@ -220,7 +222,8 @@ class CupCanvas(tk.Canvas):
         self._complete_t      = 0
         self._anim_id        = None
         self._voice_photo    = None
-        self._orb_frame       = 0     # 음성 오브 렌더링 부하 조절용 프레임 카운터
+        self._orb_frame       = 0     # 기존 호환용 카운터. 실제 아우라는 시간 기준으로 진행
+        self._voice_vol_smooth = 0.0  # 아우라 크기 표시용 볼륨 EMA
         self._voice_orb_cache = {}    # 보라색 음성 오브 PhotoImage 캐시. PIL 실시간 렌더링 반복을 줄임
         self._post_fill_recover_until = 0.0  # 급수 종료 후 애니메이션 타이밍 재정렬 구간
         self.after(300, self._prebuild_voice_orb_cache)  # 앱 시작 후 아우라 프레임을 미리 생성
@@ -248,9 +251,8 @@ class CupCanvas(tk.Canvas):
     def recover_animation_after_fill(self):
         """급수 후 밀린 애니메이션 타이밍을 재정렬한다. 음성인식 로직은 건드리지 않는다."""
         self._last_smooth_t = time.time()
-        self._voice_t = 0
-        self._orb_frame = 0
-        self._post_fill_recover_until = time.time() + 0.15
+        # _voice_t/_orb_frame은 초기화하지 않는다. 초기화하면 다음 음성 입력 때 아우라가 첫 프레임부터 다시 시작해 끊겨 보인다.
+        self._post_fill_recover_until = time.time() + 0.20
 
         try:
             if self._anim_id is not None:
@@ -329,7 +331,8 @@ class CupCanvas(tk.Canvas):
 
         vol_idx = int(round(vol * (VOICE_ORB_VOL_STEPS - 1)))
         vol_idx = max(0, min(VOICE_ORB_VOL_STEPS - 1, vol_idx))
-        frame_idx = int(self._voice_t) % VOICE_ORB_FRAME_COUNT
+        # redraw가 늦어져도 아우라 속도는 느려지지 않도록 실제 시간 기준으로 프레임 선택
+        frame_idx = int(time.monotonic() * VOICE_ORB_ANIM_FPS) % VOICE_ORB_FRAME_COUNT
         key = (vol_idx, frame_idx)
 
         if key not in self._voice_orb_cache:
@@ -370,16 +373,23 @@ class CupCanvas(tk.Canvas):
         self.delete('all')
         pct = self._pct
 
-        # ① 시리 오브 — 캐시된 PhotoImage를 사용해 부드러움은 유지하고 CPU 부하는 줄인다.
+        # ① 시리 오브 — 표시 상태는 VAD active만 따르되, 프레임은 실제 시간 기준으로 진행한다.
         if self._voice:
             self._orb_frame += 1
-            vol = float(getattr(core, 'mic_volume', 0.5))
+            try:
+                raw_vol = float(getattr(core, 'mic_volume', 0.5))
+            except (TypeError, ValueError):
+                raw_vol = 0.5
+            raw_vol = max(0.0, min(1.0, raw_vol))
+            # 급수 시작 후 mic_volume 갱신이 듬성듬성 와도 크기가 갑자기 죽지 않게 EMA로 완충한다.
+            self._voice_vol_smooth = self._voice_vol_smooth * 0.72 + raw_vol * 0.28
+            vol = self._voice_vol_smooth
             self._voice_photo = self._get_voice_orb_photo(vol)
             if self._voice_photo is not None:
                 self.create_image(0, 0, anchor='nw', image=self._voice_photo)
         else:
             self._voice_photo = None
-            self._orb_frame = 0
+            self._voice_vol_smooth *= 0.85
 
         # ② 원형 링 — 급수 중일 때만 표시
         if self._filling:
@@ -529,9 +539,9 @@ class CupCanvas(tk.Canvas):
         self._complete_t = 0
 
     def set_voice(self, active: bool):
-        self._voice = active
-        if not active:
-            self._voice_t = 0
+        # False가 잠깐 들어와도 애니메이션 카운터를 초기화하지 않는다.
+        # 실제 프레임은 time.monotonic() 기준이라 급수 시작 후 redraw가 밀려도 아우라 속도가 느려지지 않는다.
+        self._voice = bool(active)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -548,6 +558,7 @@ def run_kiosk_gui(on_ready=None):
 
     _last_saved_t  = [0.0]
     target_pct_var = tk.IntVar(value=70)
+    voice_visual_until = [0.0]  # 실제 발화 감지 후 아우라를 짧게 유지하는 표시 전용 래치
 
     # 화면 표시 전용 수위 상태값.
     # core의 실제 제어값을 그대로 쓰지 않고, 0%에서 시작해 목표 수위까지만 부드럽게 올라가도록 분리한다.
@@ -1099,7 +1110,12 @@ def run_kiosk_gui(on_ready=None):
                 if finish:
                     core.request_finish = False
 
-            visual_voice = bool(voice)                                      # 실제 발화 감지 중일 때만 무거운 아우라 렌더링
+            # voice_ready는 '말해도 되는 대기 상태'일 뿐 실제 발화가 아니다.
+            # 따라서 아우라는 voice_active가 켜졌을 때만 표시하고, 짧은 VAD 끊김만 래치로 보정한다.
+            now_voice_visual = time.time()
+            if voice:
+                voice_visual_until[0] = now_voice_visual + VOICE_VISUAL_LATCH_SEC
+            visual_voice = bool(now_voice_visual < voice_visual_until[0])
             cup_canvas.set_voice(visual_voice)
 
             if voice:
@@ -1359,8 +1375,18 @@ def run_kiosk_gui(on_ready=None):
             else:
                 status_lbl.configure(text='급 수 중', fg=GREEN_CLR)  # 소음 측정 종료 후 급수 중 표시
 
+            # ── 사용자 GUI 표시용 현재 Hz 보정 ─────────────────────
+            # 제어값은 그대로 두고, 화면에 보이는 주파수만 목표 Hz를 넘지 않게 제한한다.
+            # 자동 정지 후에는 실제 sf가 낮거나 높아도 최종 표시를 목표 Hz에 맞춰 고정한다.
+            if tf > 0 and (finish or display_completed[0]):
+                display_freq_hz = tf                              # 완료 후 표시는 목표 Hz에 고정
+            elif tf > 0 and sf > 0:
+                display_freq_hz = min(sf, tf)                     # 급수 중 목표 Hz 초과 표시는 차단
+            else:
+                display_freq_hz = sf                              # 목표 Hz가 없으면 기존 값 표시
+
             freq_cur_lbl.configure(
-                text=f'{sf:.0f} Hz' if sf > 0 else '--- Hz',
+                text=f'{display_freq_hz:.0f} Hz' if display_freq_hz > 0 else '--- Hz',
                 fg=GREEN_CLR if t_mode else AMBER,
             )
             freq_tgt_lbl.configure(
@@ -1370,8 +1396,8 @@ def run_kiosk_gui(on_ready=None):
             freq_bar_cv.delete('all')
             bw = max(freq_bar_cv.winfo_width(), 10)
             freq_bar_cv.create_rectangle(0, 0, bw, 16, fill='#1e3a5f', outline='')
-            if sf > 0 and tf > 0:
-                ratio = min(1.0, sf / tf)
+            if display_freq_hz > 0 and tf > 0:
+                ratio = max(0.0, min(1.0, display_freq_hz / tf))  # 표시 바도 목표 Hz까지만 채움
                 fill_w = int(bw * ratio)
                 freq_bar_cv.create_rectangle(0, 0, fill_w, 16, fill=CYAN, outline='')
 
