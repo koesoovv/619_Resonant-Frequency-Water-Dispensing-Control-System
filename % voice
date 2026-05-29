@@ -54,6 +54,8 @@ MIN_RMS_FOR_STT = 0.003
 NOISE_REDUCE    = True
 TARGET_RMS      = 0.06
 MAX_GAIN        = 8.0
+NOISE_PROP_DECREASE = 0.25    # noisereduce 강도. 0.35보다 말소리 왜곡을 줄임
+VOICE_READ_FAIL_LIMIT = 3     # 마이크 read 연속 실패 시 voice_loop 재시작 유도
 
 COMMAND_TIMEOUT    = 20.0   # 호출어 인식 후 다음 명령 대기 시간
 LOCATION_TIMEOUT   = COMMAND_TIMEOUT  # 기존 코드 호환용
@@ -84,10 +86,18 @@ DISPENSER_SOUND_PATH = '/home/kimcapybara/venv/HI/0001.mp3'
 
 DEBUG = True
 
+# ── 사용자 GUI 음성 대기 상태 표시 ───────────────────────────────────
+VOICE_READY_TEXT = '말씀해 주세요'          # 실제로 마이크 입력을 받을 준비가 되었을 때 GUI 표시
+VOICE_BUSY_TEXT  = '안내 중... 잠시 기다려주세요'  # TTS 재생 중 GUI 표시
+VOICE_PROCESS_TEXT = '인식 중...'           # STT 처리 중 GUI 표시
+
 # ── 정수기 안내 음원 제어 ─────────────────────────────────────────────
 _dispenser_sound_stop = threading.Event()
 _dispenser_proc       = None
 _shutdown = threading.Event()
+_finish_tts_lock = threading.Lock()      # 급수 완료 TTS 중복 방지용
+_last_finish_tts_time = 0.0              # 마지막 급수 완료 안내 시각
+_voice_audio_restart_request = threading.Event()  # 급수 후 음성 입력 스트림 재시작 요청
 
 # ════════════════════════════════════════════════════════════════════
 #  상태 정의
@@ -124,7 +134,7 @@ KW_START = [
     '시작', '틀어', '받아', '나와', '줘',
     '시작해', '틀어줘', '받아줘', '나와라',
     '해줘', '해 줘', '부어', '부어줘', '따라', '따라줘',
-    '채워', '채워줘', '내놔',
+    '채워', '채워줘', '내놔', '깔아줘', '빨아줘', '깔 아줘', '빨 아줘', '깔아 줘', '빨아 줘'
 ]
 KW_STOP    = ['멈춰', '정지', '그만', '꺼', '중지', '스톱', 'stop',
               '멈춰줘', '꺼줘', '그만해', '중지해']
@@ -198,27 +208,33 @@ DISPLAY_WORD_GROUPS = [
     },
     {
         'canonical': '90%',
-        'aliases': ['90%', '90프로', '90퍼센트', '구십프로', '구십 퍼센트', '구십퍼센트', '가득', '꽉', '풀'],
+        'aliases': ['90%', '90프로', '90퍼센트', '구십프로', '구십 퍼센트', '구십퍼센트'],
         'mode': 'phrase',
         'fuzzy': False,
         'threshold': 1.0,
     },
     {
         'canonical': '따라줘',
-        'aliases': ['깔아줘', '빨아줘', '깔 아줘', '빨 아줘'],
+        'aliases': ['깔아줘', '빨아줘', '깔 아줘', '빨 아줘', '깔아 줘', '빨아 줘'],
         'mode': 'substring',
         'fuzzy': False,
         'threshold': 1.0,
     },
-        {
+    {
         'canonical': '급수',
         'aliases': ['급소'],
         'mode': 'substring',
         'fuzzy': False,
         'threshold': 1.0,
     },
+    {
+        'canonical': '물',
+        'aliases': ['불'],
+        'mode': 'substring',
+        'fuzzy': False,
+        'threshold': 1.0,
+    },
 ]
-
 # ════════════════════════════════════════════════════════════════════
 #  로그
 # ════════════════════════════════════════════════════════════════════
@@ -429,10 +445,26 @@ def _tts_gui_state(text: str):
         log_dbg(f'TTS GUI 상태 갱신 오류: {e}')                  # 실패해도 TTS 자체는 계속 진행
 
 
+def _voice_ready_gui_state(ready=None, text=None):
+    """사용자 GUI에 '지금 말해도 되는지'를 표시하기 위한 상태값을 갱신한다."""
+    try:
+        import smart_water_core as core                         # 순환 import 방지용 함수 내부 import
+        with core.lock:                                          # GUI 주기 갱신과 충돌 방지
+            if ready is not None:
+                core.voice_ready = bool(ready)                   # True이면 실제 음성 입력 대기 상태
+            if text is not None:
+                core.voice_ready_text = str(text)                # GUI에 표시할 대기/처리 상태 문구
+                core.voice_ready_time = time.time()              # 마지막 상태 갱신 시각
+    except Exception as e:
+        log_dbg(f'음성 대기 상태 갱신 오류: {e}')                # 실패해도 음성 루프는 계속 진행
+
+
 def speak(text: str):
     log_info(f'[TTS] "{text}"')
+    _voice_ready_gui_state(False, VOICE_BUSY_TEXT)               # TTS 중에는 사용자 발화를 받지 않음을 표시
     _tts_gui_state(text)                                         # 음성 출력 전 GUI 안내 문장 먼저 갱신
     if not USE_TTS:
+        _voice_ready_gui_state(False, '잠시 후 말씀해 주세요')     # cooldown 이후 listen_text에서 ready로 바뀜
         return
     try:
         asyncio.run(_make_tts(text))
@@ -446,6 +478,46 @@ def speak(text: str):
             os.remove(TTS_FILE)
     except Exception as e:
         log_info(f'TTS 오류: {e}')
+    finally:
+        # 실제 수신 가능 시점은 voice_loop의 TTS_COOLDOWN 이후 collect_speech()가 시작될 때다.
+        _voice_ready_gui_state(False, '잠시 후 말씀해 주세요')
+
+
+
+def request_voice_audio_restart(reason: str = 'manual'):
+    """
+    음성인식 입력 스트림을 안전하게 재시작하도록 voice_loop에 요청한다.
+    급수 분석 스트림과 음성 입력 스트림이 같은 USB 오디오 장치를 건드린 뒤
+    VAD/아우라 반응이 느려지는 현상을 줄이기 위한 복구용이다.
+    """
+    try:
+        _voice_audio_restart_request.set()
+        log_info(f'[VOICE_RESTART] 요청됨: {reason}')
+    except Exception as e:
+        log_info(f'[VOICE_RESTART] 요청 오류: {e}')
+
+
+def notify_water_finished(source: str = 'gui'):
+    """
+    사용자 GUI 자동 정지에서도 급수 완료 안내를 보장한다.
+    인식률 관련 VAD/STT/전처리 파라미터는 변경하지 않는다.
+    """
+    global _last_finish_tts_time
+
+    now = time.time()
+    with _finish_tts_lock:
+        if now - _last_finish_tts_time < 4.0:                  # 중복 안내 방지
+            return
+        _last_finish_tts_time = now                            # 마지막 안내 시각 갱신
+
+    def _worker():
+        try:
+            log_info(f'[FINISH_TTS] 급수 완료 안내 요청 ({source})')  # 완료 안내 로그
+            speak('급수가 완료되었습니다')                         # 완료 TTS 출력
+        except Exception as e:
+            log_info(f'[FINISH_TTS] 오류: {e}')                  # 오류가 나도 음성 루프는 유지
+
+    threading.Thread(target=_worker, daemon=True).start()       # GUI 메인 루프를 막지 않음
 
 
 def _play_sound_once(path: str):
@@ -540,19 +612,21 @@ def rms(audio):
 
 
 def clean_audio(audio):
-    cleaned = audio.copy()
+    """STT 입력용 전처리. noisereduce 후 RMS를 TARGET_RMS 근처로 맞춘다."""
+    cleaned = audio.copy().astype(np.float32)
     if NOISE_REDUCE:
         try:
             cleaned = nr.reduce_noise(
                 y=cleaned, sr=VOICE_SAMPLE_RATE,
-                stationary=False, prop_decrease=0.35,
+                stationary=False, prop_decrease=NOISE_PROP_DECREASE,
                 n_fft=512, hop_length=128,
-            )
+            ).astype(np.float32)
         except Exception as e:
             log_dbg(f'noisereduce 오류: {e}')
     r = rms(cleaned)
     if r > 0.0001:
-        cleaned = np.clip(cleaned * min(TARGET_RMS / r, MAX_GAIN), -1.0, 1.0)
+        gain = min(TARGET_RMS / r, MAX_GAIN)
+        cleaned = np.clip(cleaned * gain, -1.0, 1.0)
     return cleaned.astype(np.float32)
 
 
@@ -579,6 +653,7 @@ def _chunk_volume(chunk):
 
 def collect_speech(stream, vad_model, max_seconds):
     _voice_gui_state(active=False, volume=0.0)
+    _voice_ready_gui_state(True, VOICE_READY_TEXT)               # 이 함수가 시작된 순간부터 실제 발화 수신 가능
 
     if max_seconds <= 0:
         return None
@@ -592,14 +667,22 @@ def collect_speech(stream, vad_model, max_seconds):
     speech_frames = []
     speaking      = False
     silence_cnt   = 0
+    read_fail_count = 0
 
     vad_model.reset_states()
     try:
         for _ in range(max_chunks):
             try:
                 data, _ = stream.read(VAD_CHUNK_SIZE)
-            except Exception:
-                break
+                read_fail_count = 0
+            except Exception as e:
+                read_fail_count += 1
+                log_info(f'[VOICE_READ_ERROR] {type(e).__name__}: {e} ({read_fail_count}/{VOICE_READ_FAIL_LIMIT})')
+                _voice_gui_state(active=False, volume=0.0, text='음성 입력 오류')
+                if read_fail_count >= VOICE_READ_FAIL_LIMIT:
+                    raise RuntimeError('음성 마이크 스트림 read 연속 실패') from e
+                time.sleep(0.05)
+                continue
 
             chunk = (data[:, 0] if data.ndim > 1 else data.flatten()).astype(np.float32)
             prob  = vad_model(torch.from_numpy(chunk), VOICE_SAMPLE_RATE).item()
@@ -610,6 +693,7 @@ def collect_speech(stream, vad_model, max_seconds):
                     speaking    = True
                     silence_cnt = 0
                     speech_frames.extend(list(pre_roll))
+                    _voice_ready_gui_state(False, '듣는 중...')             # 사용자가 말하는 동안은 수신 중 상태
                     _voice_gui_state(active=True, volume=_chunk_volume(chunk))
                     log_dbg(f'음성 감지 ({prob:.0%})')
             else:
@@ -639,26 +723,170 @@ def collect_speech(stream, vad_model, max_seconds):
 _recognizer = sr.Recognizer()
 
 
+def _parse_google_alternatives(result):
+    """Google STT show_all 결과에서 후보 문장 목록을 뽑는다."""
+    alternatives = []
+    if not result:
+        return alternatives
+    if isinstance(result, dict):
+        for item in result.get('alternative', []):
+            text = str(item.get('transcript', '')).strip()
+            conf = item.get('confidence', None)
+            if text:
+                alternatives.append((text, conf))
+    elif isinstance(result, str):
+        text = result.strip()
+        if text:
+            alternatives.append((text, None))
+    return alternatives
+
+
+def _hangul_count(text):
+    """한글 글자 수를 계산한다."""
+    return len(re.findall(r'[가-힣]', str(text)))
+
+
+def _english_count(text):
+    """영문 글자 수를 계산한다."""
+    return len(re.findall(r'[A-Za-z]', str(text)))
+
+
+def _stt_candidate_score(text):
+    """프로젝트 명령어에 가까운 STT 후보에 점수를 준다."""
+    if not text:
+        return -9999.0
+
+    raw = str(text).strip()
+    n = _norm(raw)
+    shown = voice_display_text(raw)
+    sn = _norm(shown)
+    score = 0.0
+
+    if any(_norm(w) in n for w in WAKE_WORDS) or any(_norm(w) in sn for w in WAKE_WORDS):
+        score += 100.0
+    if detect_pour_start_command(raw) or detect_pour_start_command(shown):
+        score += 80.0
+    if detect_stop_command(raw) or detect_stop_command(shown):
+        score += 80.0
+    if detect_location_command(raw)[0] != 'UNKNOWN' or detect_location_command(shown)[0] != 'UNKNOWN':
+        score += 60.0
+    if detect_arrival_command(raw) or detect_arrival_command(shown):
+        score += 50.0
+
+    level_ok, _, level_reason = detect_level_command(raw)
+    shown_level_ok, _, shown_level_reason = detect_level_command(shown)
+    if level_ok or shown_level_ok:
+        score += 70.0
+    elif level_reason != 'NONE' or shown_level_reason != 'NONE':
+        score += 20.0
+
+    project_words = [
+        '물', '불', '급수', '정수기', '컵',
+        '따라', '따라줘', '받아', '받아줘', '깔아', '깔아줘', '빨아', '빨아줘',
+        '멈춰', '정지', '위치', '찾아', '퍼센트', '프로',
+    ]
+    for word in project_words:
+        if _norm(word) in n or _norm(word) in sn:
+            score += 10.0
+
+    score += min(_hangul_count(raw), 24) * 0.5
+    score -= _english_count(raw) * 2.0
+    return score
+
+
+def _audio_to_google_alternatives(audio_np, label):
+    """오디오 하나를 Google STT에 넣고 후보 문장을 반환한다."""
+    if audio_np is None or audio_np.size == 0:
+        return []
+    try:
+        audio_i16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+        audio_data = sr.AudioData(audio_i16.tobytes(), VOICE_SAMPLE_RATE, 2)
+        result = _recognizer.recognize_google(
+            audio_data,
+            language='ko-KR',
+            show_all=True,
+        )
+        alternatives = _parse_google_alternatives(result)
+        for text, conf in alternatives:
+            log_dbg(f'[STT-{label}] 후보: "{text}" | conf={conf}')
+        return alternatives
+    except sr.UnknownValueError:
+        log_dbg(f'[STT-{label}] UnknownValueError')
+        return []
+    except sr.RequestError as e:
+        log_info(f'[WARN] STT 네트워크 오류({label}): {e}')
+        return []
+    except Exception as e:
+        log_info(f'[ERROR] STT 오류({label}): {e}')
+        return []
+
+
+def _select_best_stt_candidate(candidates):
+    """STT 후보 중 프로젝트 명령어에 가장 가까운 문장을 선택한다."""
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda x: (x['score'], x['confidence']),
+        reverse=True,
+    )
+    return candidates[0]
+
+
 def transcribe_google(audio_np):
+    """
+    clean 음성을 우선 STT에 넣고, 결과가 약하면 raw 음성 후보까지 확인한다.
+    STT 실패 여부와 관계없이 voice_loop는 계속 살아 있도록 빈 문자열만 반환한다.
+    """
     if audio_np is None or audio_np.size == 0:
         return ''
-    cleaned = clean_audio(audio_np)
-    try:
-        audio_data = sr.AudioData(
-            (cleaned * 32767).astype(np.int16).tobytes(),
-            VOICE_SAMPLE_RATE, 2,
+
+    raw_audio = audio_np.astype(np.float32)
+    clean_np = clean_audio(raw_audio)
+    candidates = []
+
+    clean_alternatives = _audio_to_google_alternatives(clean_np, 'CLEAN')
+    for text, conf in clean_alternatives:
+        candidates.append({
+            'label': 'CLEAN',
+            'text': text,
+            'display': voice_display_text(text),
+            'score': _stt_candidate_score(text),
+            'confidence': float(conf) if conf is not None else 0.0,
+        })
+
+    best_clean = _select_best_stt_candidate(candidates[:])
+
+    # clean 결과가 프로젝트 명령어로 충분히 확실하면 raw 요청을 생략해 네트워크/CPU 부하를 줄인다.
+    if best_clean is not None and best_clean['score'] >= 60.0:
+        log_info(
+            f'[STT] 선택: {best_clean["label"]} | '
+            f'raw="{best_clean["text"]}" | '
+            f'display="{best_clean["display"]}" | '
+            f'score={best_clean["score"]:.1f}'
         )
-        text = _recognizer.recognize_google(audio_data, language='ko-KR')
-        log_dbg('Google STT 처리 완료')
-        return text.strip()
-    except sr.UnknownValueError:
+        return best_clean['text'].strip()
+
+    raw_alternatives = _audio_to_google_alternatives(raw_audio, 'RAW')
+    for text, conf in raw_alternatives:
+        candidates.append({
+            'label': 'RAW',
+            'text': text,
+            'display': voice_display_text(text),
+            'score': _stt_candidate_score(text),
+            'confidence': float(conf) if conf is not None else 0.0,
+        })
+
+    best = _select_best_stt_candidate(candidates)
+    if best is None:
         return ''
-    except sr.RequestError as e:
-        log_info(f'[WARN] STT 네트워크 오류: {e}')
-        return ''
-    except Exception as e:
-        log_info(f'[ERROR] STT 오류: {e}')
-        return ''
+
+    log_info(
+        f'[STT] 선택: {best["label"]} | '
+        f'raw="{best["text"]}" | '
+        f'display="{best["display"]}" | '
+        f'score={best["score"]:.1f}'
+    )
+    return best['text'].strip()
 
 
 def listen_text(stream, vad_model, max_seconds):
@@ -666,6 +894,7 @@ def listen_text(stream, vad_model, max_seconds):
     if audio is None:
         return ''
 
+    _voice_ready_gui_state(False, VOICE_PROCESS_TEXT)             # STT 처리 중에는 말해도 반영되지 않음
     text = transcribe_google(audio)
     if text:
         shown_text = voice_display_text(text)
@@ -673,6 +902,7 @@ def listen_text(stream, vad_model, max_seconds):
         log_info(f'[STT] 인식됨: "{shown_text}"')
     else:
         _voice_gui_state(text='인식 실패')
+        _voice_ready_gui_state(True, '다시 말씀해 주세요')          # 실패해도 바로 다음 발화 대기 상태로 복귀
 
     return text
 
@@ -779,12 +1009,33 @@ def detect_level_command(text):
 
 def detect_pour_start_command(text):
     t       = _norm(text)
-    directs = ['물줘','물따라줘','물받아줘','물틀어줘',
-               '급수시작','급수해줘','따라줘','받아줘']
+    directs = [
+        '물줘', '물따라줘', '물받아줘', '물틀어줘',
+        '급수시작', '급수해줘',
+        '따라줘', '받아줘',
+        '깔아줘', '빨아줘', '깔 아줘', '빨 아줘', '깔아 줘', '빨아 줘',
+    ]
     if _contains_any(t, [_norm(k) for k in directs]):
         return True
     return (_contains_any(t, [_norm(k) for k in KW_WATER]) and
             _contains_any(t, [_norm(k) for k in KW_START]))
+
+# GUI 표시용 호출어 보정은 DISPLAY_WORD_GROUPS에서 처리하지 않는다.
+# 이유: '새미야' 안의 '새미', '미야'가 반복 치환되어 '새새새미미미야야야'처럼 깨질 수 있기 때문이다.
+DISPLAY_WAKE_ALIASES = [
+    '새미야', '세미야', '샘이야', '쌤이야',
+    '지니야', '진이야', '지니아', '진희야', '제니야', '시리야', '시니어',
+    '최미영', '세비야', '지니', '지니어', '지니 야',
+    '도비야', '우석아', '가희야', '세 명',
+    '세미', '새미', '미야', '샘',
+    '먹고싶다', '마시고싶다', '아쿠야', '덕배야',
+]
+
+
+def _display_compact(text: str) -> str:
+    """호출어 표시 보정용 비교 문자열을 만든다."""
+    return re.sub(r'\s+', '', str(text).lower().strip())
+
 
 def _clean_display_spaces(text: str) -> str:
     """중복 공백을 정리한다."""
@@ -887,14 +1138,21 @@ def normalize_display_text(text: str) -> str:
 
 
 def voice_display_text(text):
-    """
-    STT 원문을 사용자 GUI/일반 로그 표시용 문장으로 변환한다.
+    """STT 원문을 사용자 GUI/로그 표시용 표준 문장으로 변환한다."""
+    if not text:                                             # 빈 입력 방지
+        return ''                                            # GUI에는 빈 문자열 표시
 
-    사용 방법:
-      - DISPLAY_WORD_GROUPS에 canonical/aliases를 추가하면 화면 표시 단어가 계속 확장된다.
-      - 명령 판정은 원문 text를 그대로 사용하므로, 표시 단어를 바꿔도 제어 로직은 바뀌지 않는다.
-    """
-    return normalize_display_text(text)
+    raw = str(text).strip()                                  # STT 결과 원문 정리
+    raw_compact = _display_compact(raw)                      # 호출어 비교용 문자열
+
+    for alias in DISPLAY_WAKE_ALIASES:                       
+        if raw_compact == _display_compact(alias):            
+            return '세미야'                                  
+
+    shown = raw                                              # 호출어가 아니면 일반 표시 보정 진행
+    shown = _replace_display_phrases(shown)                  # phrase/substring 별칭 치환
+    shown = _replace_display_tokens(shown)                   # token/fuzzy 별칭 치환
+    return _clean_display_spaces(shown)                      # 중복 공백 제거 후 반환
 
 # ════════════════════════════════════════════════════════════════════
 #  음성인식 메인 루프
@@ -1057,6 +1315,11 @@ def voice_loop():
         while True:
             if _shutdown.is_set():
                 log_info('음성인식 루프 종료')
+                break
+
+            if _voice_audio_restart_request.is_set():
+                _voice_audio_restart_request.clear()
+                log_info('[VOICE_RESTART] 음성 입력 스트림 재시작 처리')
                 break
 
             if time.time() - last_tts_time < TTS_COOLDOWN:
@@ -1330,7 +1593,8 @@ def voice_loop():
                     still_filling = bool(_core.is_filling)
                 if not still_filling:
                     log_result('급수 종료 감지 (외부 정지 또는 목표 도달)')
-                    tts('급수가 완료되었습니다')
+                    notify_water_finished(source='voice_loop')                # 중복 방지 포함 완료 안내
+                    request_voice_audio_restart('pouring_finished')           # 급수 후 입력 스트림 재시작
                     selected_level = None
                     change_mode(MODE_SLEEP)
                     continue
@@ -1349,7 +1613,16 @@ def voice_loop():
     except Exception as e:
         log_info(f'[ERROR] voice_loop 예외: {e}')
     finally:
-        stream.stop()
-        stream.close()
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+        _voice_gui_state(active=False, volume=0.0)
+        _voice_ready_gui_state(False, '음성인식 재시작 중...')
         log_info('음성인식 오디오 스트림 종료')
+
 
