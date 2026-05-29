@@ -156,20 +156,42 @@ def main():
         print(f'  [{time.strftime("%H:%M:%S")}] 일반인 GUI import 완료', flush=True)
 
     voice_thread = None
+    voice_watchdog_thread = None
 
     def start_voice_thread_once():
-        """GUI 초기화가 끝난 뒤 음성인식 스레드를 1회만 시작한다."""
-        nonlocal voice_thread
-        if voice_thread is not None and voice_thread.is_alive():
+        """GUI 초기화가 끝난 뒤 음성인식 watchdog을 1회만 시작한다."""
+        nonlocal voice_thread, voice_watchdog_thread
+
+        if voice_watchdog_thread is not None and voice_watchdog_thread.is_alive():
             return
+
         voice._shutdown.clear()
-        voice_thread = threading.Thread(
-            target=voice.voice_loop,
-            name='VoiceLoop',
+
+        def _voice_watchdog():
+            """음성인식 루프가 죽으면 GUI가 켜져 있는 동안 자동 재시작한다."""
+            nonlocal voice_thread
+
+            while not voice._shutdown.is_set():
+                if voice_thread is None or not voice_thread.is_alive():
+                    voice_thread = threading.Thread(
+                        target=voice.voice_loop,
+                        name='VoiceLoop',
+                        daemon=True,
+                    )
+                    voice_thread.start()
+                    print(f'  [{time.strftime("%H:%M:%S")}] 음성인식 스레드 시작/재시작됨', flush=True)
+
+                time.sleep(2.0)
+
+            print(f'  [{time.strftime("%H:%M:%S")}] 음성인식 watchdog 종료', flush=True)
+
+        voice_watchdog_thread = threading.Thread(
+            target=_voice_watchdog,
+            name='VoiceWatchdog',
             daemon=True,
         )
-        voice_thread.start()
-        print(f'  [{time.strftime("%H:%M:%S")}] 음성인식 스레드 시작됨', flush=True)
+        voice_watchdog_thread.start()
+        print(f'  [{time.strftime("%H:%M:%S")}] 음성인식 watchdog 시작됨', flush=True)
 
     try:
         # GUI 내부에서 CTk 위젯 생성과 콜백 등록이 끝난 뒤 on_ready를 호출한다.
@@ -188,4 +210,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
