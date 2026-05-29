@@ -105,7 +105,7 @@ INIT_AIR_REG_BLEND           = 0.20
 ZONE_EMA_ALPHA = {
     50: 0.15,
     60: 0.25,
-    70: 0.50,
+    70: 0.45,
     80: 0.60,
     90: 0.92,
 }
@@ -116,13 +116,13 @@ ZONE_ADVANCE_PCT = {
     60:  0.0,
     70:  0.0,
     80:  0.0,
-    90:  1.0,
+    90:  0.0,
 }
 
 # ── [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준 ──────────
 DIAM_THRESHOLD             = 8.0
 DIAM_EMA_SCALE_SMALL       = 1.00
-DIAM_EMA_SCALE_LARGE       = 0.90
+DIAM_EMA_SCALE_LARGE       = 0.65
 DIAM_EMA_SCALE_FINAL_BOOST = 1.15
 
 # ── [v5.25-DYN-Q] 동적 유량 추적 ────────────────────────────────────
@@ -136,15 +136,15 @@ SPIKE_EARLY_TIME     = 15.0
 REG_SPIKE_GATE_EARLY = REG_SPIKE_GATE * 2.5   # = 0.20
 
 # ── [v5.28-FILL-RATE] fill_pct 상방향 속도 제한 ─────────────────────
-FILL_PCT_RATE_LIMIT = 3.0   # %/청크, 상방향만 적용
+FILL_PCT_RATE_LIMIT = 2.0   # %/청크, 상방향만 적용
 
 # ── [v5.25-SNR] 노이즈 플로어 ────────────────────────────────────────
 SNR_THRESHOLD      = 2.0
 NOISE_FLOOR_PCTILE = 70
 
 # ── [v5.29-ASYM-EMA] f_for_stop 비대칭 EMA ──────────────────────────
-FSCORE_ALPHA_UP   = 0.80   # 상승 반영 속도 (새 값 80% 즉시 반영)
-FSCORE_ALPHA_DOWN = 0.05   # 하강 반영 속도 (거의 안 내려감)
+FSCORE_ALPHA_UP   = 0.70   # 상승 반영 속도 (새 값 80% 즉시 반영)
+FSCORE_ALPHA_DOWN = 0.10   # 하강 반영 속도 (거의 안 내려감)
 
 # ── 주파수 탐색 범위 ─────────────────────────────────────────────────
 FREQ_MAX_LIMIT           = 3000
@@ -213,10 +213,10 @@ RATE_LIMIT_FINAL_HZ   = 300.0
 SPIKE_RATIO_THRESHOLD = 1.15
 
 # ── 이론 곡선 가이드 ─────────────────────────────────────────────────
-THEORY_GUIDE_ALPHA        = 0.10
-THEORY_GUIDE_MARGIN       = 0.15
-THEORY_GUIDE_ALPHA_FINAL  = 0.25
-THEORY_GUIDE_MARGIN_FINAL = 0.30
+THEORY_GUIDE_ALPHA        = 0.40
+THEORY_GUIDE_MARGIN       = 0.25
+THEORY_GUIDE_ALPHA_FINAL  = 0.50
+THEORY_GUIDE_MARGIN_FINAL = 0.375
 
 # ── D 안정화 ─────────────────────────────────────────────────────────
 DIAM_CAND_MAXLEN   = 14
@@ -232,7 +232,7 @@ THEORY_LOCK_R2 = 0.92
 
 # ── 피크 고착 감지 ────────────────────────────────────────────────────
 FREEZE_RESET_N = 8
-BUF_SIZE_FINAL = 5
+BUF_SIZE_FINAL = 3
 
 # ── init_stable 최소 주파수 ──────────────────────────────────────────
 INIT_STABLE_MIN_HZ = 350
@@ -900,6 +900,7 @@ def stop_filling_local(save_result: bool) -> None:
         is_filling = False
         if save_result:
             request_finish = True
+    close_audio_stream_async(delay_sec=0.35)                    # 급수 종료 후 분석용 오디오 스트림을 확실히 해제
     print('\n>>> 물 주입 종료.')
 
 
@@ -1306,10 +1307,7 @@ def audio_callback(indata, frames, time_info, status):
         if filling_elapsed > CONTROL_START_TIME and _cd and stable_f > 0:
             # [v5.30-STABLE-CTRL] 제어 주파수 = stable_f (EMA+median)
             # f_for_stop(_f_stop_ema)는 로그/그래프 비교용으로만 유지
-            if _f_stop_ema > 0:
-                f_for_stop = min(float(_f_stop_ema), stable_f)   # 보수적 제어
-            else:
-                f_for_stop = stable_f
+            f_for_stop = float(_f_stop_ema) if _f_stop_ema > 0 else stable_f
 
             with lock:
                 last_raw_stop_freq = f_for_stop
@@ -1494,6 +1492,7 @@ def audio_callback(indata, frames, time_info, status):
                     last_stop_elapsed_sec = filling_elapsed
                     is_filling     = False
                     request_finish = True
+                close_audio_stream_async(delay_sec=0.35)        # 자동 정지 후 분석용 오디오 스트림을 확실히 해제
                 return
 
     except Exception as e:
@@ -1516,3 +1515,37 @@ def ensure_audio_stream():
         blocksize=CHUNK_SIZE,
     )
     audio_stream.start()
+
+def close_audio_stream_async(delay_sec=0.35):
+    """급수 종료 후 급수 분석용 sounddevice 스트림을 비동기로 정리한다."""
+    global audio_stream
+
+    stream_ref = audio_stream                                      # 현재 스트림 참조를 고정
+    if stream_ref is None:                                         # 열린 분석 스트림이 없으면 종료
+        return
+
+    def _worker():
+        global audio_stream
+        time.sleep(max(0.0, float(delay_sec)))                     # 콜백 종료 여유 시간
+        try:
+            with lock:
+                still_filling = bool(is_filling)                  # 새 급수가 시작됐는지 확인
+            if still_filling:
+                return                                             # 급수 중이면 닫지 않음
+            if audio_stream is not stream_ref:
+                return                                             # 다른 스트림으로 바뀌었으면 보호
+            try:
+                stream_ref.stop()                                  # PortAudio 스트림 정지
+            except Exception:
+                pass
+            try:
+                stream_ref.close()                                 # 오디오 장치 해제
+            except Exception:
+                pass
+            audio_stream = None                                    # 다음 급수 때 새로 열도록 초기화
+            print('\n[CORE] 급수 분석 audio_stream 정리 완료')
+        except Exception as e:
+            print(f'\n[CORE] audio_stream 정리 오류: {e}')
+
+    threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
+
