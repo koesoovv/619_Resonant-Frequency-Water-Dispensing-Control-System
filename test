@@ -81,8 +81,8 @@ STOP_TRIGGER_COUNT      = 5
 
 # ── [v5.32-TIME-Q-BRIDGE] 70% 이후 시간/유량 예측 브릿지 ─────────────
 BRIDGE_ENABLE           = True   # True: 고수위 목표에서 70% 이후 시간/유량 기반으로 보정
-BRIDGE_TARGET_MIN_PCT   = 80.0   # 80% 이상 목표에서만 브릿지 사용
-BRIDGE_ARM_PCT          = 70.0   # 음향 추정 수위가 이 값 이상이면 브릿지 시작
+BRIDGE_TARGET_MIN_PCT   = 65.0   # 80% 이상 목표에서만 브릿지 사용
+BRIDGE_ARM_PCT          = 55.0   # 음향 추정 수위가 이 값 이상이면 브릿지 시작
 BRIDGE_STOP_ADVANCE_PCT = 2.0    # 정지 히트 지연 보정용 선행 정지율(%)
 BRIDGE_Q_SCALE          = 1.00   # 1.00=FLOW_RATE 기준, 크게 하면 더 이르게 정지
 BRIDGE_LOG_INTERVAL     = 0.5    # 브릿지 로그 출력 간격(s)
@@ -1361,11 +1361,20 @@ def audio_callback(indata, frames, time_info, status):
                 # 250mL 비커처럼 후반부 공기층이 너무 짧아져 주파수 검출이 포화되는 경우,
                 # 70%까지는 음향 추정값을 믿고, 이후는 Q·D·H 기반 시간 외삽으로 채움률을 증가시킨다.
                 bridge_used = False
+                # [v5.34] 포화 감지: 실측 raw가 정체(<15Hz/s)인데 목표까지 5%+ 남았으면 포화로 간주
+                _raw_stagnant = False
+                if len(_stag_buffer) >= 10:
+                    _a = list(_stag_buffer)
+                    _dt = max(_a[-1][0] - _a[0][0], 1e-6)
+                    _d_raw = (_a[-1][1] - _a[0][1]) / _dt   # raw 검출 변화율 Hz/s
+                    _raw_stagnant = (abs(_d_raw) < 15.0)
+
                 if (BRIDGE_ENABLE
                         and TARGET_FILL_PCT >= BRIDGE_TARGET_MIN_PCT
                         and _init_air > 0
                         and _cur_d2 > 0
-                        and (fill_pct >= BRIDGE_ARM_PCT or bridge_active)):
+                        and (fill_pct >= BRIDGE_ARM_PCT or bridge_active
+                             or (_raw_stagnant and fill_pct >= BRIDGE_ARM_PCT - 10.0))):
                     with lock:
                         _bridge_active = bool(bridge_active)
                         _bridge_t0     = float(bridge_start_elapsed)
@@ -1375,7 +1384,16 @@ def audio_callback(indata, frames, time_info, status):
                     if not _bridge_active:
                         # FLOW_RATE 기준을 최소 예측 유량으로 둔다.
                         # 예측 유량을 크게 잡을수록 목표 도달 시점을 더 이르게 판단하므로 넘침 방지에 유리하다.
-                        q_for_bridge = max(DYNAMIC_Q_MIN, float(dynamic_Q), FLOW_RATE * BRIDGE_Q_SCALE)
+                         # [v5.34] 후반부 중력식 유량 감소 반영: FLOW_RATE 바닥값 제거.
+                        #   실측상 후반 Q는 초기의 ~55%까지 하락(8~9ml/s)하므로
+                        #   dynamic_Q 추적값을 우선 신뢰하고, 그것도 없으면 보수적 하한 사용.
+                        BRIDGE_Q_LATE_FACTOR = 0.6   # 신규 상수(상단 BRIDGE 블록에 추가 권장)
+                        _q_track = float(dynamic_Q)
+                        if _q_track >= DYNAMIC_Q_MIN:
+                            q_for_bridge = _q_track * BRIDGE_Q_SCALE
+                        else:
+                            q_for_bridge = FLOW_RATE * BRIDGE_Q_LATE_FACTOR * BRIDGE_Q_SCALE
+                        q_for_bridge = max(6.0, q_for_bridge)   # 물리 하한(과대예측 방지)
                         target_for_eta = max(BRIDGE_ARM_PCT, TARGET_FILL_PCT - BRIDGE_STOP_ADVANCE_PCT)
                         remain_pct = max(0.0, target_for_eta - fill_pct)
                         area_cm2 = np.pi * (_cur_d2 * 0.5) ** 2
@@ -1548,4 +1566,3 @@ def close_audio_stream_async(delay_sec=0.35):
             print(f'\n[CORE] audio_stream 정리 오류: {e}')
 
     threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
-
