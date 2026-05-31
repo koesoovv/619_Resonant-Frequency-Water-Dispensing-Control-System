@@ -1548,4 +1548,3 @@ def close_audio_stream_async(delay_sec=0.35):
             print(f'\n[CORE] audio_stream 정리 오류: {e}')
 
     threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
-
