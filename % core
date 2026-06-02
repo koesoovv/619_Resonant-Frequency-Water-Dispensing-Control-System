@@ -115,8 +115,8 @@ ZONE_ADVANCE_PCT = {
     50:  0.0,
     60:  0.0,
     70:  0.0,
-    80:  0.0,
-    90:  0.0,
+    80:  0.5,
+    90:  0.5,
 }
 
 # ── [v5.25-DIAM-EMA] 지름 기반 EMA 스케일 — 8cm 단일 기준 ──────────
@@ -1548,3 +1548,4 @@ def close_audio_stream_async(delay_sec=0.35):
             print(f'\n[CORE] audio_stream 정리 오류: {e}')
 
     threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
+
