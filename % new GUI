@@ -163,6 +163,7 @@ DISPLAY_RAW_UP_CONFIRM_SECONDS = 0.35 # 실제 추정 수위 상승이 이 시�
 DISPLAY_RAW_UP_MARGIN_PCT = 0.7      # 이 값 이상 오른 추정값만 상승 후보로 봄
 DISPLAY_RAW_JITTER_RESET_PCT = 5.5   # 상승 후보가 이 이상 흔들리면 확인 시간 초기화
 CORE_AUDIO_CLOSE_DELAY_SEC = 0.8     # 급수 종료 후 급수 분석용 오디오 스트림 정리 지연(s)
+DISPLAY_COMPLETE_HOLD_SEC = 5.0      # 급수 완료 후 가득 찬 화면을 유지하는 시간(s). 이후 0%로 복귀
 
 
 def _get_display_profile_value(profile: str, key: str, default: float) -> float:
@@ -217,7 +218,7 @@ class CupCanvas(tk.Canvas):
         self._voice          = False
         self._voice_t        = 0
         self._wave_t         = 0
-        self._bubbles        = [self._new_bubble() for _ in range(3)]  # 물방울 4개 → 3개
+        self._bubbles        = []  # 물방울 제거(GPU 부하 완화). 복구 시 [self._new_bubble() for _ in range(3)]
         self._complete_active = False
         self._complete_t      = 0
         self._anim_id        = None
@@ -226,6 +227,13 @@ class CupCanvas(tk.Canvas):
         self._voice_vol_smooth = 0.0  # 아우라 크기 표시용 볼륨 EMA
         self._voice_orb_cache = {}    # 보라색 음성 오브 PhotoImage 캐시. PIL 실시간 렌더링 반복을 줄임
         self._post_fill_recover_until = 0.0  # 급수 종료 후 애니메이션 타이밍 재정렬 구간
+        # [계측] 프레임 타이밍. proc_max(벽시계)와 cpu_max(실제 CPU)를 비교해 GIL 뺏김을 확인한다.
+        self._frame_prev_t      = None
+        self._frame_gap_sum_ms  = 0.0
+        self._frame_gap_max_ms  = 0.0
+        self._frame_proc_max_ms = 0.0
+        self._frame_cpu_max_ms  = 0.0
+        self._frame_count       = 0
         self.after(300, self._prebuild_voice_orb_cache)  # 앱 시작 후 아우라 프레임을 미리 생성
         self._redraw()
         self._animate()
@@ -268,6 +276,14 @@ class CupCanvas(tk.Canvas):
 
     def _animate(self):
         frame_start = time.time() 
+        frame_cpu_start = time.thread_time()   # [계측] 이 스레드 실제 CPU 시간(GIL 뺏긴 시간 제외)
+        if self._frame_prev_t is not None:     # [계측] 직전 프레임과의 간격
+            gap_ms = (frame_start - self._frame_prev_t) * 1000.0
+            self._frame_gap_sum_ms += gap_ms
+            self._frame_count += 1
+            if gap_ms > self._frame_gap_max_ms:
+                self._frame_gap_max_ms = gap_ms
+        self._frame_prev_t = frame_start
         now = frame_start
         dt = max(0.016, min(0.12, now - self._last_smooth_t))
         self._last_smooth_t = now
@@ -292,12 +308,7 @@ class CupCanvas(tk.Canvas):
 
             self._pct = max(0.0, min(100.0, self._pct + step))
 
-        if self._pct > 2:
-            wy = CUP_BY - CUP_INNER_H * (self._pct / 100.0)
-            for b in self._bubbles:
-                b[1] -= b[3]
-                if b[1] < wy + 4:
-                    b[:] = self._new_bubble()
+        # 물방울 애니메이션 제거(GPU 부하 완화)
         if self._voice:
             self._voice_t += 1
         if self._filling:
@@ -310,6 +321,12 @@ class CupCanvas(tk.Canvas):
                 self._complete_t = 0
         self._redraw()
         elapsed_ms = int((time.time() - frame_start) * 1000)
+        proc_ms = (time.time() - frame_start) * 1000.0   # [계측] 벽시계 프레임 시간
+        if proc_ms > self._frame_proc_max_ms:
+            self._frame_proc_max_ms = proc_ms
+        cpu_ms = (time.thread_time() - frame_cpu_start) * 1000.0  # [계측] 실제 CPU 시간
+        if cpu_ms > self._frame_cpu_max_ms:
+            self._frame_cpu_max_ms = cpu_ms
         next_delay = max(1, CANVAS_ANIM_MS - elapsed_ms)
 
         if time.time() < self._post_fill_recover_until:
@@ -449,10 +466,7 @@ class CupCanvas(tk.Canvas):
             self.create_polygon(poly_pts, fill='#1e40af', outline='', smooth=False)
             self.create_line(wave_pts, fill='#93c5fd', width=2, smooth=True)
 
-            for bx, by2, br, _ in self._bubbles:
-                if wy < by2 < CUP_BY:
-                    self.create_oval(bx-br, by2-br, bx+br, by2+br,
-                                     outline='#93c5fd', width=1, fill='')
+            # 물방울 그리기 제거(GPU 부하 완화)
 
         # ⑤ 하단 타원
         self.create_oval(CUP_BX-CUP_BRX, CUP_BY-CUP_BRY,
@@ -567,6 +581,7 @@ def run_kiosk_gui(on_ready=None):
     display_start_t = [time.time()]
     display_was_filling = [False]
     display_completed = [False]
+    display_complete_t = [0.0]      # 급수 완료(가득 참) 시각. 이 시점부터 HOLD_SEC 후 0%로 복귀
     display_raw_ready = [False]
     display_raw_mode = [False]      # 현재 %가 한 번이라도 생성되면 시간 기준 임의 상승을 끄고 현재 %를 추종
     display_last_raw_pct = [0.0]
@@ -575,6 +590,12 @@ def run_kiosk_gui(on_ready=None):
     display_confirmed_raw_time = [0.0]     # 안정 추정 수위가 마지막으로 확정된 시각.
     display_pending_raw_goal = [None]      # 상승 후보 추정 수위.
     display_pending_raw_since = [0.0]      # 상승 후보가 유지되기 시작한 시각.
+
+    # 주파수 게이지 보간 상태값.
+    # 게이지를 매 프레임 (현재Hz/목표Hz)로 즉시 그리지 않고, 목표 비율을 향해 부드럽게 따라가게 한다.
+    # 급수 중에는 목표를 향해 점진적으로 차오르고, 완료 시에도 100%까지 자연스럽게 채워진다.
+    freq_bar_ratio = [0.0]                 # 현재 화면에 그려지는 게이지 비율(0.0~1.0)
+    freq_bar_last_t = [time.time()]        # 게이지 보간용 마지막 갱신 시각
 
     # 초반 주파수 기반 표시 속도 프로파일 상태값.
     # 700~800Hz 근처로 시작하면 큰 컵, 1000Hz 근처로 시작하면 작은 컵으로 보고 GUI 상승 속도를 다르게 적용한다.
@@ -1073,6 +1094,27 @@ def run_kiosk_gui(on_ready=None):
     except Exception as e:
         print(f'\n[GUI] 콜백 등록 오류 (단독 실행 시 무시): {e}')
 
+    # ── [계측] 프레임 타이밍 진단 로그 ──────────────────
+    _diag_last_t = [0.0]
+
+    def _print_frame_diag(filling):
+        cc = cup_canvas
+        fc = max(1, cc._frame_count)
+        gap_avg = cc._frame_gap_sum_ms / fc
+        print(
+            f'\n[DIAG] filling={filling}'
+            f' | frame_n={cc._frame_count}'
+            f' | gap_avg={gap_avg:.0f} gap_max={cc._frame_gap_max_ms:.0f}'
+            f' | proc_max={cc._frame_proc_max_ms:.0f}'
+            f' | cpu_max={cc._frame_cpu_max_ms:.0f}',
+            flush=True,
+        )
+        cc._frame_gap_sum_ms = 0.0
+        cc._frame_gap_max_ms = 0.0
+        cc._frame_proc_max_ms = 0.0
+        cc._frame_cpu_max_ms = 0.0
+        cc._frame_count = 0
+
     # ── 100ms 주기 갱신 ──────────────────────────────
     def periodic_update():
         try:
@@ -1107,8 +1149,16 @@ def run_kiosk_gui(on_ready=None):
                 tts_time = float(getattr(core, 'last_tts_time', 0.0) or 0.0)
                 voice_ready = bool(getattr(core, 'voice_ready', False))
                 voice_ready_text = str(getattr(core, 'voice_ready_text', '') or '')
+                voice_remain_sec = float(getattr(core, 'voice_remain_sec', -1.0) or -1.0)
+                voice_remain_time = float(getattr(core, 'voice_remain_time', 0.0) or 0.0)
                 if finish:
                     core.request_finish = False
+
+            # [계측] 약 2초 주기로 프레임 타이밍 진단 출력
+            _diag_now = time.time()
+            if _diag_now - _diag_last_t[0] >= 2.0:
+                _print_frame_diag(filling)
+                _diag_last_t[0] = _diag_now
 
             # voice_ready는 '말해도 되는 대기 상태'일 뿐 실제 발화가 아니다.
             # 따라서 아우라는 voice_active가 켜졌을 때만 표시하고, 짧은 VAD 끊김만 래치로 보정한다.
@@ -1123,6 +1173,12 @@ def run_kiosk_gui(on_ready=None):
                 speech_text_lbl.configure(fg=CYAN)
             elif voice_ready:
                 ready_msg = voice_ready_text if voice_ready_text else '말씀해 주세요'
+                # 남은 발화 가능 시간 카운트다운 표시.
+                # remain이 0 이상이고, 갱신된 지 1초 이내(오래된 값 제외)일 때만 '(N초)'를 덧붙인다.
+                now_remain_gui = time.time()
+                if voice_remain_sec >= 0.0 and (now_remain_gui - voice_remain_time) <= 1.0:
+                    remain_disp = int(voice_remain_sec + 0.999)   # 올림 처리(0.1초 남아도 1초로 보이게)
+                    ready_msg = f'{ready_msg} ({remain_disp}초)'
                 _fit_text_to_fixed_label(speech_text_lbl, ready_msg, kind='user')
                 speech_text_lbl.configure(fg=CYAN)
             elif speech_text:
@@ -1268,6 +1324,7 @@ def run_kiosk_gui(on_ready=None):
                 # 목표 도달로 급수가 끝난 순간: 표시값은 목표 수위에 정확히 맞춘다.
                 display_pct_state[0] = target_pct
                 display_completed[0] = True
+                display_complete_t[0] = now_for_display   # 완료 시각 기록 → HOLD_SEC 후 0%로 복귀
                 display_raw_ready[0] = False
                 display_raw_mode[0] = False
                 display_confirmed_raw_time[0] = 0.0
@@ -1339,7 +1396,15 @@ def run_kiosk_gui(on_ready=None):
                     display_pct_state[0] = max(0.0, min(target_pct, cur_display))
             else:
                 # 대기 중에는 core의 남은 air 값이 0으로 초기화되어도 화면에 100%를 찍지 않는다.
-                if not display_completed[0]:
+                if display_completed[0]:
+                    # 급수 완료 후 HOLD_SEC 동안은 가득 찬 화면을 유지하고,
+                    # 그 시간이 지나면 완료 상태를 풀어 0%로 부드럽게 내려간다.
+                    if now_for_display - display_complete_t[0] >= DISPLAY_COMPLETE_HOLD_SEC:
+                        display_completed[0] = False
+                        display_complete_t[0] = 0.0
+                        display_pct_state[0] = 0.0
+                    # HOLD 구간 동안은 display_pct_state(목표 수위)를 그대로 유지
+                else:
                     display_pct_state[0] = 0.0
                 display_raw_ready[0] = False
                 display_raw_mode[0] = False
@@ -1358,9 +1423,14 @@ def run_kiosk_gui(on_ready=None):
                 cup_canvas.set_fill(display_fill_pct, immediate=True)
                 cup_canvas.freeze_fill()
             elif not filling:
-                # 대기/정지 상태에서는 이전 애니메이션 목표를 계속 따라가지 않도록 즉시 고정한다.
-                cup_canvas.set_fill(display_fill_pct, immediate=True)
-                cup_canvas.freeze_fill()
+                if display_completed[0]:
+                    # 급수 완료 후 HOLD 구간: 가득 찬 화면을 그대로 고정 유지한다.
+                    cup_canvas.set_fill(display_fill_pct, immediate=True)
+                    cup_canvas.freeze_fill()
+                else:
+                    # HOLD가 끝나 0%로 복귀하는 구간: 즉시 고정하지 않고 목표값만 넘겨
+                    # _animate의 하강 속도(canvas_max_down)로 부드럽게 내려가게 한다.
+                    cup_canvas.set_fill(display_fill_pct)
             else:
                 cup_canvas.set_fill(display_fill_pct)                  # 급수 중에는 목표값만 넘겨 부드럽게 추종
             cup_canvas.set_filling(filling)
@@ -1377,13 +1447,18 @@ def run_kiosk_gui(on_ready=None):
 
             # ── 사용자 GUI 표시용 현재 Hz 보정 ─────────────────────
             # 제어값은 그대로 두고, 화면에 보이는 주파수만 목표 Hz를 넘지 않게 제한한다.
-            # 자동 정지 후에는 실제 sf가 낮거나 높아도 최종 표시를 목표 Hz에 맞춰 고정한다.
+            # 게이지와 동일한 타이밍으로 동작시킨다:
+            #  - 완료(또는 완료 후 HOLD): 목표 Hz에 고정(현재 주파수로 되돌아가지 않음)
+            #  - 급수 중: 현재 주파수(목표 초과 표시는 차단)
+            #  - 대기(완료 풀림 포함): 표시를 비운다(--- Hz)
             if tf > 0 and (finish or display_completed[0]):
                 display_freq_hz = tf                              # 완료 후 표시는 목표 Hz에 고정
-            elif tf > 0 and sf > 0:
+            elif filling and tf > 0 and sf > 0:
                 display_freq_hz = min(sf, tf)                     # 급수 중 목표 Hz 초과 표시는 차단
+            elif filling:
+                display_freq_hz = sf                              # 급수 중 목표 Hz가 없으면 기존 값 표시
             else:
-                display_freq_hz = sf                              # 목표 Hz가 없으면 기존 값 표시
+                display_freq_hz = 0.0                             # 대기 상태: 현재 Hz 표시 비움
 
             freq_cur_lbl.configure(
                 text=f'{display_freq_hz:.0f} Hz' if display_freq_hz > 0 else '--- Hz',
@@ -1396,9 +1471,44 @@ def run_kiosk_gui(on_ready=None):
             freq_bar_cv.delete('all')
             bw = max(freq_bar_cv.winfo_width(), 10)
             freq_bar_cv.create_rectangle(0, 0, bw, 16, fill='#1e3a5f', outline='')
-            if display_freq_hz > 0 and tf > 0:
-                ratio = max(0.0, min(1.0, display_freq_hz / tf))  # 표시 바도 목표 Hz까지만 채움
-                fill_w = int(bw * ratio)
+
+            # ── 게이지 목표 비율 결정 ────────────────────────────────
+            # 컵 수위 애니메이션과 동일한 타이밍으로 움직인다.
+            #  - 급수 중: 현재 주파수/목표 주파수 비율을 목표로 점진 상승.
+            #  - 완료(또는 완료 후 HOLD 구간): 100%에 고정. 주파수가 흔들려도 현재 주파수로 되돌아가지 않는다.
+            #  - 완료가 풀린 대기 상태: 0%로 복귀. (display_completed가 5초 뒤 False가 되며 컵과 함께 내려간다)
+            if finish or display_completed[0]:
+                target_ratio = 1.0                                  # 완료 도달 후 HOLD 동안 100% 고정
+            elif filling and display_freq_hz > 0 and tf > 0:
+                target_ratio = max(0.0, min(1.0, display_freq_hz / tf))  # 급수 중: 목표를 향해 진행
+            elif filling:
+                target_ratio = freq_bar_ratio[0]                    # 급수 중 목표 못 구하면 현재 값 유지(정체 시 멈추지 않게)
+            else:
+                target_ratio = 0.0                                  # 대기 상태: 게이지를 0으로 내린다
+
+            # ── 게이지 비율 부드럽게 보간 ────────────────────────────
+            now_bar = time.time()
+            dt_bar = max(0.0, min(0.5, now_bar - freq_bar_last_t[0]))
+            freq_bar_last_t[0] = now_bar
+
+            cur_ratio = freq_bar_ratio[0]
+            BAR_UP_PER_SEC   = 0.6   # 게이지 상승 최대 속도(초당 비율). 0.6이면 0→100%에 약 1.7초
+            BAR_DOWN_PER_SEC = 2.0   # 대기/초기화 시 하강 속도(초당 비율)
+
+            if target_ratio >= cur_ratio:
+                # 목표가 더 높음: 상승 속도 상한을 두고 부드럽게 차오른다(점프 방지).
+                cur_ratio = min(target_ratio, cur_ratio + BAR_UP_PER_SEC * dt_bar)
+            elif (not filling) and (not display_completed[0]):
+                # 대기 상태(완료 풀림 포함): 게이지를 0으로 부드럽게 내린다.
+                cur_ratio = max(target_ratio, cur_ratio - BAR_DOWN_PER_SEC * dt_bar)
+            else:
+                # 급수 중 목표가 현재보다 낮음(주파수 흔들림): 한번 올라간 게이지는 잘 내리지 않게 천천히만 내린다.
+                cur_ratio = max(target_ratio, cur_ratio - BAR_UP_PER_SEC * 0.5 * dt_bar)
+
+            freq_bar_ratio[0] = max(0.0, min(1.0, cur_ratio))
+
+            if freq_bar_ratio[0] > 0.0:
+                fill_w = int(bw * freq_bar_ratio[0])
                 freq_bar_cv.create_rectangle(0, 0, fill_w, 16, fill=CYAN, outline='')
 
             if len(hit_dots) != max_hits:
@@ -1427,6 +1537,3 @@ def run_kiosk_gui(on_ready=None):
 
 if __name__ == '__main__':
     run_kiosk_gui()
-
-
-
