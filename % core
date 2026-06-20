@@ -115,7 +115,7 @@ ZONE_ADVANCE_PCT = {
     50:  0.0,
     60:  0.0,
     70:  0.0,
-    80:  0.5,
+    80:  0.0,
     90:  0.5,
 }
 
@@ -325,6 +325,22 @@ bridge_last_log        = 0.0
 # [v5.31-STAG-LOG] 후반부 정체 진단용 (제어/검출에 영향 없음, 로그 전용)
 _stag_buffer   = deque(maxlen=40)   # (t, raw_f, stable_f, f_for_stop)
 _stag_last_log = 0.0
+
+# [CB-DIAG] 오디오 콜백 GIL 경합 측정용 (제어/검출에 영향 없음, 로그 전용)
+#   기대 호출 주기 = CHUNK_SIZE / SAMPLE_RATE (예: 4096/44100 ≈ 92.9ms).
+#   실제 gap이 이보다 크게 벌어지면 콜백이 GIL에 밀려 늦게 호출된 것이다.
+#   proc(벽시계 처리시간) ≫ cpu(thread_time 실제 CPU)면 처리 도중에도 GIL을 뺏긴 것이다.
+_cb_prev_entry_t   = None    # 직전 콜백 진입 시각(벽시계)
+_cb_gap_max_ms     = 0.0     # 최근 윈도 내 최대 호출 간격
+_cb_gap_sum_ms     = 0.0
+_cb_proc_max_ms    = 0.0     # 최근 윈도 내 최대 처리 시간(벽시계)
+_cb_cpu_max_ms     = 0.0     # 최근 윈도 내 최대 처리 시간(실제 CPU)
+_cb_count          = 0
+_cb_late_count     = 0       # 기대 주기의 1.5배를 초과한 '밀린' 콜백 수
+_cb_last_log_t     = 0.0
+CB_DIAG_ENABLE     = True    # False로 두면 계측/로그 완전 비활성
+CB_DIAG_INTERVAL   = 2.0     # 로그 출력 간격(s)
+CB_EXPECTED_MS     = CHUNK_SIZE / SAMPLE_RATE * 1000.0  # 기대 호출 주기(ms)
 
 _reg_event = threading.Event()
 
@@ -1503,13 +1519,69 @@ def audio_callback(indata, frames, time_info, status):
 # ════════════════════════════════════════════════════════════════════
 #  오디오 스트림 관리
 # ════════════════════════════════════════════════════════════════════
+def audio_callback_timed(indata, frames, time_info, status):
+    """
+    [CB-DIAG] audio_callback 호출 간격/처리 시간을 측정하는 얇은 래퍼.
+    본체(audio_callback)는 전혀 수정하지 않는다. 계측이 꺼져 있으면 곧장 본체만 호출한다.
+    측정값은 약 CB_DIAG_INTERVAL초마다 콘솔에 한 줄로 출력한다.
+    GIL 영향 판정:
+      - gap_max ≫ CB_EXPECTED_MS  → 콜백이 늦게 호출됨(다른 스레드가 GIL 점유)
+      - proc_max ≫ cpu_max        → 처리 도중에도 GIL을 뺏김
+    """
+    global _cb_prev_entry_t, _cb_gap_max_ms, _cb_gap_sum_ms
+    global _cb_proc_max_ms, _cb_cpu_max_ms, _cb_count, _cb_late_count, _cb_last_log_t
+
+    if not CB_DIAG_ENABLE:
+        return audio_callback(indata, frames, time_info, status)
+
+    entry_t   = time.time()
+    cpu_start = time.thread_time()
+
+    # 직전 진입과의 간격(호출이 밀렸는지)
+    if _cb_prev_entry_t is not None:
+        gap_ms = (entry_t - _cb_prev_entry_t) * 1000.0
+        _cb_gap_sum_ms += gap_ms
+        _cb_count += 1
+        if gap_ms > _cb_gap_max_ms:
+            _cb_gap_max_ms = gap_ms
+        if gap_ms > CB_EXPECTED_MS * 1.5:
+            _cb_late_count += 1
+    _cb_prev_entry_t = entry_t
+
+    try:
+        return audio_callback(indata, frames, time_info, status)
+    finally:
+        proc_ms = (time.time() - entry_t) * 1000.0
+        cpu_ms  = (time.thread_time() - cpu_start) * 1000.0
+        if proc_ms > _cb_proc_max_ms:
+            _cb_proc_max_ms = proc_ms
+        if cpu_ms > _cb_cpu_max_ms:
+            _cb_cpu_max_ms = cpu_ms
+
+        # 급수 중일 때만, 약 CB_DIAG_INTERVAL초마다 요약 출력 후 윈도 리셋
+        if is_filling and (entry_t - _cb_last_log_t >= CB_DIAG_INTERVAL) and _cb_count > 0:
+            gap_avg = _cb_gap_sum_ms / max(1, _cb_count)
+            print(f'\n[CB-DIAG] filling=True | n={_cb_count}'
+                  f' | expect={CB_EXPECTED_MS:.0f}ms'
+                  f' | gap_avg={gap_avg:.0f} gap_max={_cb_gap_max_ms:.0f}'
+                  f' | proc_max={_cb_proc_max_ms:.0f} cpu_max={_cb_cpu_max_ms:.0f}'
+                  f' | late={_cb_late_count}/{_cb_count}')
+            _cb_last_log_t  = entry_t
+            _cb_gap_max_ms  = 0.0
+            _cb_gap_sum_ms  = 0.0
+            _cb_proc_max_ms = 0.0
+            _cb_cpu_max_ms  = 0.0
+            _cb_count       = 0
+            _cb_late_count  = 0
+
+
 def ensure_audio_stream():
     global audio_stream
     if audio_stream is not None:
         return
     audio_stream = sd.InputStream(
         device=INPUT_DEVICE,
-        callback=audio_callback,
+        callback=audio_callback_timed,   # [CB-DIAG] 계측 래퍼 등록(본체 audio_callback은 그대로)
         channels=1,
         samplerate=SAMPLE_RATE,
         blocksize=CHUNK_SIZE,
@@ -1548,4 +1620,3 @@ def close_audio_stream_async(delay_sec=0.35):
             print(f'\n[CORE] audio_stream 정리 오류: {e}')
 
     threading.Thread(target=_worker, daemon=True).start()           # GUI/오디오 콜백을 막지 않음
-
