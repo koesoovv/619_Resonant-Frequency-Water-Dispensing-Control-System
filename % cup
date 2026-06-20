@@ -1,0 +1,585 @@
+#include <Arduino.h>                              // Arduino 기본 기능 사용
+#include <WiFi.h>                                 // ESP32 Wi-Fi 기능 사용
+#include <WebServer.h>                            // ESP32 웹서버 기능 사용
+#include <DFRobotDFPlayerMini.h>                  // DFPlayer Mini 제어 라이브러리 사용
+
+const char* ssid = "619";                         // Wi-Fi 이름
+const char* password = "619619619@!";             // Wi-Fi 비밀번호
+
+WebServer server(80);                             // 80번 포트 웹서버 생성
+
+HardwareSerial dfSerial(1);                       // DFPlayer 통신용 UART1 사용
+DFRobotDFPlayerMini mp3;                          // DFPlayer Mini 객체 생성
+
+const int DF_RX_PIN = D0;                         // ESP32 RX, DFPlayer TX 연결
+const int DF_TX_PIN = D1;                         // ESP32 TX, 1kΩ 거쳐 DFPlayer RX 연결
+
+#define TRIG_PIN D2                               // 초음파 TRIG 핀
+#define ECHO_PIN D4                               // 초음파 ECHO 핀, 전압분배 후 연결
+
+const int IR_PIN = D13;                           // IR 센서 OUT 핀
+
+// 중요: 대부분의 IR 장애물 센서는 감지 시 LOW가 나옴
+// 만약 시리얼 모니터에서 컵을 댔을 때 IR 값이 1이면 HIGH로 바꾸면 됨
+const int IR_ACTIVE_VALUE = LOW;                  // IR 감지값, 감지 시 LOW 기준
+
+const int TRACK_NO_CUP = 2;                       // 컵 없음 음원: /mp3/0001.mp3
+const int TRACK_CUP_EXISTS = 1;                   // 컵 있음 음원: /mp3/0002.mp3
+
+const int START_VOLUME = 18;                      // 시작 볼륨
+const int MAX_VOLUME = 20;                        // 최대 볼륨
+const int MIN_VOLUME = 0;                         // 최소 볼륨
+int currentVolume = START_VOLUME;                 // 현재 볼륨 저장
+
+const float STOP_DISTANCE_CM = 20.0;              // 초음파 정지 기준 거리
+const int NEED_ULTRA_COUNT = 3;                   // 20cm 이내 3회 연속 감지 시 정지
+int ultraCount = 0;                               // 초음파 연속 감지 횟수
+
+const int NEED_IR_COUNT = 3;                      // IR 3회 연속 확인 후 음원 전환
+int irActiveCount = 0;                            // IR 감지 연속 횟수
+int irInactiveCount = 0;                          // IR 미감지 연속 횟수
+
+unsigned long lastMeasureTime = 0;                // 마지막 초음파 측정 시간
+const unsigned long MEASURE_INTERVAL = 150;       // 초음파 측정 주기
+
+unsigned long lastIrCheckTime = 0;                // 마지막 IR 확인 시간
+const unsigned long IR_CHECK_INTERVAL = 100;      // IR 확인 주기
+
+unsigned long lastMp3CommandTime = 0;             // 마지막 DFPlayer 명령 시간
+const unsigned long MP3_COMMAND_INTERVAL = 500;   // DFPlayer 명령 최소 간격
+
+unsigned long systemStartTime = 0;                // 시스템 시작 시간
+const unsigned long ULTRA_IGNORE_TIME = 1500;     // 시작 후 1.5초 초음파 정지 판단 무시
+
+unsigned long lastPrintTime = 0;                  // 마지막 상태 출력 시간
+const unsigned long PRINT_INTERVAL = 500;         // 상태 출력 주기
+
+bool systemActive = false;                        // 시스템 동작 상태
+bool cupFound = false;                            // 컵 찾음 상태
+bool stableCupPresent = false;                    // 안정화된 컵 감지 상태
+String lastStopReason = "none";                   // 마지막 정지 원인
+unsigned long cupFoundTime = 0;                   // 컵 찾은 시간
+
+int currentTrack = 0;                             // 현재 재생 중인 음원 번호
+float lastDistance = -1.0;                        // 마지막 초음파 거리값
+String espIp = "";                               // ESP32 IP 주소 저장
+
+void setVolumeSafe(int vol) {                     // 볼륨 안전 설정 함수
+  if (vol < MIN_VOLUME) vol = MIN_VOLUME;         // 최소 볼륨 제한
+  if (vol > MAX_VOLUME) vol = MAX_VOLUME;         // 최대 볼륨 제한
+
+  currentVolume = vol;                            // 현재 볼륨 저장
+  mp3.volume(currentVolume);                      // DFPlayer 볼륨 적용
+
+  Serial.print("현재 볼륨: ");                    // 볼륨 출력
+  Serial.println(currentVolume);                  // 현재 볼륨 출력
+}
+
+void playTrack(int trackNum, bool force = false) {                 // 특정 음원 재생 함수
+  unsigned long now = millis();                                    // 현재 시간 저장
+
+  if (!force && currentTrack == trackNum) {                        // 같은 음원이면
+    return;                                                        // 중복 재생 방지
+  }
+
+  if (!force && now - lastMp3CommandTime < MP3_COMMAND_INTERVAL) {  // 명령 간격이 너무 짧으면
+    return;                                                        // 명령 무시
+  }
+
+  lastMp3CommandTime = now;                                        // 마지막 명령 시간 갱신
+
+  mp3.stop();                                                      // 기존 재생 정지
+  delay(80);                                                       // DFPlayer 안정화 대기
+
+  mp3.playMp3Folder(trackNum);                                     // /mp3/0001.mp3 또는 /mp3/0002.mp3 재생
+  currentTrack = trackNum;                                         // 현재 음원 번호 저장
+
+  Serial.print("재생 음원: 000");                                  // 재생 상태 출력
+  Serial.print(trackNum);                                          // 음원 번호 출력
+  Serial.println(".mp3");                                          // 확장자 출력
+}
+
+bool isCupPresentByIr() {                         // IR 기준 컵 감지 함수
+  int irValue = digitalRead(IR_PIN);              // IR 값 읽기
+  return irValue == IR_ACTIVE_VALUE;              // 감지값과 같으면 컵 있음
+}
+
+void applyStableIrState(bool cupPresent) {        // 안정화된 IR 상태를 음원에 반영
+  stableCupPresent = cupPresent;                  // 안정화 상태 저장
+
+  if (cupPresent) {                               // 컵이 있으면
+    if (currentTrack != TRACK_CUP_EXISTS) {       // 현재 음원이 컵 있음 음원이 아니면
+      playTrack(TRACK_CUP_EXISTS, true);          // 0002.mp3 강제 재생
+    }
+  } else {                                        // 컵이 없으면
+    if (currentTrack != TRACK_NO_CUP) {           // 현재 음원이 컵 없음 음원이 아니면
+      playTrack(TRACK_NO_CUP, true);              // 0001.mp3 강제 재생
+    }
+  }
+}
+
+void startSystem() {                              // 알림 시작 함수
+  systemActive = true;                            // 시스템 ON
+  systemStartTime = millis();                     // 시작 시간 저장
+
+  ultraCount = 0;                                 // 초음파 카운트 초기화
+  irActiveCount = 0;                              // IR 감지 카운트 초기화
+  irInactiveCount = 0;                            // IR 미감지 카운트 초기화
+
+  cupFound = false;                               // 컵 찾음 초기화
+  lastStopReason = "running";                     // 동작 중 상태 저장
+  cupFoundTime = 0;                               // 컵 찾은 시간 초기화
+  currentTrack = 0;                               // 현재 음원 초기화
+
+  bool cupPresent = isCupPresentByIr();           // 시작 순간 IR 상태 확인
+
+  if (cupPresent) {                               // 시작 시 컵이 있으면
+    irActiveCount = NEED_IR_COUNT;                // 감지 상태로 초기화
+    irInactiveCount = 0;                          // 미감지 카운트 초기화
+    applyStableIrState(true);                     // 0002.mp3 재생
+  } else {                                        // 시작 시 컵이 없으면
+    irActiveCount = 0;                            // 감지 카운트 초기화
+    irInactiveCount = NEED_IR_COUNT;              // 미감지 상태로 초기화
+    applyStableIrState(false);                    // 0001.mp3 재생
+  }
+
+  Serial.println("시스템 시작");                  // 상태 출력
+}
+
+void stopSystem(bool foundByUltrasonic = false) { // 알림 정지 함수
+  systemActive = false;                           // 시스템 OFF
+
+  ultraCount = 0;                                 // 초음파 카운트 초기화
+  irActiveCount = 0;                              // IR 감지 카운트 초기화
+  irInactiveCount = 0;                            // IR 미감지 카운트 초기화
+  currentTrack = 0;                               // 현재 음원 초기화
+
+  mp3.stop();                                     // DFPlayer 재생 정지
+  delay(50);                                      // 정지 안정화 대기
+
+  if (foundByUltrasonic) {                        // 초음파로 정지된 경우
+    cupFound = true;                              // 컵 찾음 처리
+    lastStopReason = "ultrasonic";                // 정지 원인 저장
+    cupFoundTime = millis();                      // 컵 찾은 시간 저장
+    Serial.println("초음파 감지 -> 컵 찾음 처리"); // 상태 출력
+  } else {                                        // 수동 정지인 경우
+    lastStopReason = "manual";                    // 수동 정지 저장
+    Serial.println("수동 정지");                  // 상태 출력
+  }
+}
+
+float readDistanceCm() {                          // 초음파 거리 측정 함수
+  digitalWrite(TRIG_PIN, LOW);                    // TRIG LOW 초기화
+  delayMicroseconds(5);                           // 5us 대기
+
+  digitalWrite(TRIG_PIN, HIGH);                   // TRIG HIGH 출력
+  delayMicroseconds(10);                          // 10us 펄스 출력
+  digitalWrite(TRIG_PIN, LOW);                    // TRIG LOW 종료
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000UL); // ECHO HIGH 시간 측정
+
+  if (duration == 0) {                            // ECHO 신호가 없으면
+    return -1.0;                                  // 측정 실패 반환
+  }
+
+  return duration * 0.0343 / 2.0;                 // cm 단위 거리 계산
+}
+
+void updateUltrasonic() {                         // 초음파 거리값 갱신 함수
+  unsigned long now = millis();                   // 현재 시간 저장
+
+  if (now - lastMeasureTime < MEASURE_INTERVAL) { // 측정 주기가 아니면
+    return;                                       // 함수 종료
+  }
+
+  lastMeasureTime = now;                          // 마지막 측정 시간 갱신
+  lastDistance = readDistanceCm();                // 초음파 거리 측정
+
+  if (!systemActive) {                            // 시스템이 꺼져 있으면
+    ultraCount = 0;                               // 카운트 초기화
+    return;                                       // 정지 판단 안 함
+  }
+
+  if (now - systemStartTime < ULTRA_IGNORE_TIME) { // 시작 직후 보호 시간
+    ultraCount = 0;                               // 카운트 초기화
+    return;                                       // 정지 판단 안 함
+  }
+
+  if (lastDistance < 0) {                         // 측정 실패이면
+    ultraCount = 0;                               // 카운트 초기화
+    Serial.println("초음파 측정 실패: -1");       // 실패 출력
+    return;                                       // 정지 판단 안 함
+  }
+
+  if (lastDistance <= STOP_DISTANCE_CM) {         // 20cm 이내이면
+    ultraCount++;                                 // 연속 감지 증가
+  } else {                                        // 20cm 밖이면
+    ultraCount = 0;                               // 연속 감지 초기화
+  }
+
+  if (ultraCount >= NEED_ULTRA_COUNT) {           // 3회 연속 감지이면
+    stopSystem(true);                             // 컵 찾음 처리 후 정지
+  }
+}
+
+void checkIrAndSelectSound() {                    // IR 상태에 따라 음원 선택
+  unsigned long now = millis();                   // 현재 시간 저장
+
+  if (now - lastIrCheckTime < IR_CHECK_INTERVAL) { // 확인 주기가 아니면
+    return;                                       // 함수 종료
+  }
+
+  lastIrCheckTime = now;                          // 마지막 확인 시간 갱신
+
+  bool cupPresent = isCupPresentByIr();           // IR 기준 컵 있음/없음 판단
+
+  if (cupPresent) {                               // 컵이 감지되면
+    irActiveCount++;                              // 감지 카운트 증가
+    irInactiveCount = 0;                          // 미감지 카운트 초기화
+  } else {                                        // 컵이 감지되지 않으면
+    irInactiveCount++;                            // 미감지 카운트 증가
+    irActiveCount = 0;                            // 감지 카운트 초기화
+  }
+
+  if (irActiveCount >= NEED_IR_COUNT) {           // 컵 있음이 3회 연속이면
+    applyStableIrState(true);                     // 컵 있음 음원으로 전환
+  }
+
+  if (irInactiveCount >= NEED_IR_COUNT) {         // 컵 없음이 3회 연속이면
+    applyStableIrState(false);                    // 컵 없음 음원으로 전환
+  }
+}
+
+void printStatus() {                              // 상태 출력 함수
+  unsigned long now = millis();                   // 현재 시간 저장
+
+  if (now - lastPrintTime < PRINT_INTERVAL) {     // 출력 주기가 아니면
+    return;                                       // 함수 종료
+  }
+
+  lastPrintTime = now;                            // 마지막 출력 시간 갱신
+
+  Serial.print("상태: ");                         // 상태 출력
+  Serial.print(systemActive ? "동작 중" : "대기"); // 동작 상태 출력
+
+  Serial.print(" / 컵 찾음: ");                   // 컵 찾음 출력
+  Serial.print(cupFound ? "true" : "false");      // 컵 찾음 상태 출력
+
+  Serial.print(" / IR값: ");                      // IR 원시값 출력
+  Serial.print(digitalRead(IR_PIN));              // IR 값 출력
+
+  Serial.print(" / IR판정: ");                    // IR 판정 출력
+  Serial.print(isCupPresentByIr() ? "컵 있음" : "컵 없음"); // 컵 판정 출력
+
+  Serial.print(" / 안정상태: ");                  // 안정 상태 출력
+  Serial.print(stableCupPresent ? "컵 있음" : "컵 없음"); // 안정 상태 출력
+
+  Serial.print(" / IR카운트: ");                  // IR 카운트 출력
+  Serial.print(irActiveCount);                    // 감지 카운트 출력
+  Serial.print("/");                              // 구분자
+  Serial.print(irInactiveCount);                  // 미감지 카운트 출력
+
+  Serial.print(" / 초음파: ");                    // 초음파 출력
+  Serial.print(lastDistance);                     // 거리값 출력
+  Serial.print(" cm");                            // 단위 출력
+
+  Serial.print(" / 초음파카운트: ");              // 초음파 카운트 출력
+  Serial.print(ultraCount);                       // 초음파 카운트 출력
+
+  Serial.print(" / 음원: ");                      // 음원 출력
+  if (currentTrack == 0) {                        // 현재 음원이 없으면
+    Serial.print("정지");                         // 정지 출력
+  } else {                                        // 현재 음원이 있으면
+    Serial.print("000");                          // 파일명 앞부분
+    Serial.print(currentTrack);                   // 음원 번호 출력
+  }
+
+  Serial.print(" / 볼륨: ");                      // 볼륨 출력
+  Serial.println(currentVolume);                  // 볼륨 출력
+}
+
+void handleDfPlayerMessage() {                    // DFPlayer 상태 메시지 처리
+  if (!mp3.available()) {                         // 메시지가 없으면
+    return;                                       // 함수 종료
+  }
+
+  uint8_t type = mp3.readType();                  // 메시지 종류 읽기
+  int value = mp3.read();                         // 메시지 값 읽기
+
+  if (type == DFPlayerPlayFinished) {             // 음원 재생 완료 시
+    if (systemActive && currentTrack > 0) {        // 시스템 동작 중이면
+      int repeatTrack = currentTrack;             // 반복할 음원 저장
+      currentTrack = 0;                           // 같은 음원 재시작 허용
+      playTrack(repeatTrack);                     // 같은 음원 반복 재생
+    }
+  } else if (type == DFPlayerError) {             // DFPlayer 오류 발생 시
+    Serial.print("DFPlayer 오류 코드: ");         // 오류 출력
+    Serial.println(value);                        // 오류 코드 출력
+    currentTrack = 0;                             // 오류 시 현재 음원 초기화
+  }
+}
+
+String makePage() {                               // 웹페이지 생성 함수
+  String state = systemActive ? "동작 중" : "대기 중"; // 시스템 상태 문자열
+  String trackText = "정지";                       // 현재 음원 기본값
+  String irState = isCupPresentByIr() ? "컵 있음" : "컵 없음"; // IR 판정 문자열
+
+  if (currentTrack > 0) {                         // 현재 재생 중이면
+    trackText = "000" + String(currentTrack) + ".mp3"; // 현재 음원 문자열
+  }
+
+  String page = "";                              // HTML 문자열 생성
+  page += "<!DOCTYPE html><html><head>";          // HTML 시작
+  page += "<meta charset='UTF-8'>";               // 한글 인코딩 설정
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"; // 모바일 설정
+  page += "<meta http-equiv='refresh' content='2'>"; // 2초마다 새로고침
+  page += "<title>컵 위치 알림 제어</title>";     // 페이지 제목
+
+  page += "<style>";                              // CSS 시작
+  page += "body{font-family:Arial;text-align:center;margin-top:30px;background:#f5f5f5;}"; // body 스타일
+  page += ".box{background:white;margin:auto;padding:25px;border-radius:16px;max-width:460px;box-shadow:0 0 12px #ccc;}"; // 박스 스타일
+  page += "button{font-size:22px;padding:14px 24px;margin:8px;border:0;border-radius:12px;cursor:pointer;}"; // 버튼 스타일
+  page += ".start{background:#2ecc71;color:white;}"; // 시작 버튼
+  page += ".stop{background:#e74c3c;color:white;}"; // 정지 버튼
+  page += ".vol{background:#3498db;color:white;}"; // 볼륨 버튼
+  page += ".test{background:#555;color:white;}"; // 테스트 버튼
+  page += ".status{font-size:20px;margin:10px;}"; // 상태 텍스트
+  page += ".small{font-size:14px;color:#555;}";  // 작은 설명
+  page += "</style>";                             // CSS 종료
+
+  page += "</head><body>";                        // body 시작
+  page += "<div class='box'>";                    // 박스 시작
+  page += "<h1>컵 위치 알림 제어</h1>";           // 제목 표시
+  page += "<div class='status'>상태: " + state + "</div>"; // 상태 표시
+  page += "<div class='status'>컵 찾음: " + String(cupFound ? "true" : "false") + "</div>"; // 컵 찾음 표시
+  page += "<div class='status'>정지 원인: " + lastStopReason + "</div>"; // 정지 원인 표시
+  page += "<div class='status'>현재 음원: " + trackText + "</div>"; // 현재 음원 표시
+  page += "<div class='status'>볼륨: " + String(currentVolume) + " / " + String(MAX_VOLUME) + "</div>"; // 볼륨 표시
+  page += "<div class='status'>IR 판정: " + irState + "</div>"; // IR 판정 표시
+  page += "<div class='status'>IR 원시값: " + String(digitalRead(IR_PIN)) + "</div>"; // IR 값 표시
+  page += "<div class='status'>초음파 거리: " + String(lastDistance) + " cm</div>"; // 거리 표시
+  page += "<div class='status'>ESP32 IP: " + espIp + "</div>"; // IP 표시
+
+  page += "<button class='start' onclick=\"location.href='/start'\">알림 시작</button>"; // 시작 버튼
+  page += "<button class='stop' onclick=\"location.href='/stop'\">알림 정지</button>"; // 정지 버튼
+  page += "<br>";                                  // 줄바꿈
+  page += "<button class='vol' onclick=\"location.href='/voldown'\">볼륨 -</button>"; // 볼륨 감소
+  page += "<button class='vol' onclick=\"location.href='/volup'\">볼륨 +</button>"; // 볼륨 증가
+  page += "<br>";                                  // 줄바꿈
+  page += "<button class='test' onclick=\"location.href='/test1'\">0001 테스트</button>"; // 0001 테스트
+  page += "<button class='test' onclick=\"location.href='/test2'\">0002 테스트</button>"; // 0002 테스트
+
+  page += "<p class='small'>IR 감지 LOW 기준: 컵 있음 -> 0002.mp3</p>"; // 설명
+  page += "<p class='small'>IR 미감지: 컵 없음 -> 0001.mp3</p>"; // 설명
+  page += "<p class='small'>초음파 20cm 이내 3회 연속 감지 시 알림 정지</p>"; // 설명
+  page += "<p class='small'>SD카드 파일명: /mp3/0001.mp3, /mp3/0002.mp3</p>"; // 설명
+  page += "</div>";                                // 박스 종료
+  page += "</body></html>";                        // HTML 종료
+
+  return page;                                     // 웹페이지 반환
+}
+
+void handleRoot() {                                // 메인 페이지 요청 처리
+  server.send(200, "text/html", makePage());       // 웹페이지 전송
+}
+
+void handleStart() {                               // 웹 시작 버튼 처리
+  startSystem();                                   // 시스템 시작
+  server.sendHeader("Location", "/");              // 메인으로 이동
+  server.send(303, "text/plain", "");              // 리다이렉트 응답
+}
+
+void handleStop() {                                // 웹 정지 버튼 처리
+  stopSystem(false);                               // 수동 정지
+  server.sendHeader("Location", "/");              // 메인으로 이동
+  server.send(303, "text/plain", "");              // 리다이렉트 응답
+}
+
+void handleVolumeUp() {                            // 볼륨 증가 처리
+  setVolumeSafe(currentVolume + 1);                // 볼륨 1 증가
+  server.sendHeader("Location", "/");              // 메인으로 이동
+  server.send(303, "text/plain", "");              // 리다이렉트 응답
+}
+
+void handleVolumeDown() {                          // 볼륨 감소 처리
+  setVolumeSafe(currentVolume - 1);                // 볼륨 1 감소
+  server.sendHeader("Location", "/");              // 메인으로 이동
+  server.send(303, "text/plain", "");              // 리다이렉트 응답
+}
+
+void handleTest1() {                               // 0001 테스트 처리
+  playTrack(TRACK_NO_CUP, true);                   // 0001.mp3 강제 재생
+  server.sendHeader("Location", "/");              // 메인으로 이동
+  server.send(303, "text/plain", "");              // 리다이렉트 응답
+}
+
+void handleTest2() {                               // 0002 테스트 처리
+  playTrack(TRACK_CUP_EXISTS, true);               // 0002.mp3 강제 재생
+  server.sendHeader("Location", "/");              // 메인으로 이동
+  server.send(303, "text/plain", "");              // 리다이렉트 응답
+}
+
+void handleApiStart() {                            // 라즈베리파이용 시작 API
+  startSystem();                                   // 시스템 시작
+  server.send(200, "application/json", "{\"ok\":true,\"action\":\"start\"}"); // JSON 응답
+}
+
+void handleApiStop() {                             // 라즈베리파이용 정지 API
+  stopSystem(false);                               // 수동 정지
+  server.send(200, "application/json", "{\"ok\":true,\"action\":\"stop\"}"); // JSON 응답
+}
+
+void handleApiReset() {                            // 컵 찾음 상태 초기화 API
+  cupFound = false;                                // 컵 찾음 초기화
+  lastStopReason = "none";                         // 정지 원인 초기화
+  cupFoundTime = 0;                                // 컵 찾은 시간 초기화
+  server.send(200, "application/json", "{\"ok\":true,\"action\":\"reset\"}"); // JSON 응답
+}
+
+void handleApiPlay1() {                            // API 0001 테스트
+  playTrack(TRACK_NO_CUP, true);                   // 0001.mp3 강제 재생
+  server.send(200, "application/json", "{\"ok\":true,\"track\":1}"); // JSON 응답
+}
+
+void handleApiPlay2() {                            // API 0002 테스트
+  playTrack(TRACK_CUP_EXISTS, true);               // 0002.mp3 강제 재생
+  server.send(200, "application/json", "{\"ok\":true,\"track\":2}"); // JSON 응답
+}
+
+void handleApiStatus() {                           // 상태 확인 API
+  String json = "{";                               // JSON 시작
+
+  json += "\"active\":";                           // 동작 상태 키
+  json += (systemActive ? "true" : "false");       // 동작 상태 값
+  json += ",";                                     // 쉼표
+
+  json += "\"cup_found\":";                        // 컵 찾음 키
+  json += (cupFound ? "true" : "false");           // 컵 찾음 값
+  json += ",";                                     // 쉼표
+
+  json += "\"ir_raw\":";                           // IR 원시값 키
+  json += String(digitalRead(IR_PIN));              // IR 원시값
+  json += ",";                                     // 쉼표
+
+  json += "\"ir_cup_present\":";                   // IR 컵 판정 키
+  json += (isCupPresentByIr() ? "true" : "false"); // IR 컵 판정 값
+  json += ",";                                     // 쉼표
+
+  json += "\"stable_cup_present\":";               // 안정화 컵 상태 키
+  json += (stableCupPresent ? "true" : "false");   // 안정화 컵 상태 값
+  json += ",";                                     // 쉼표
+
+  json += "\"distance_cm\":";                      // 거리 키
+  json += String(lastDistance, 1);                  // 거리 값
+  json += ",";                                     // 쉼표
+
+  json += "\"ir_active_count\":";                  // IR 감지 카운트 키
+  json += String(irActiveCount);                    // IR 감지 카운트 값
+  json += ",";                                     // 쉼표
+
+  json += "\"ir_inactive_count\":";                // IR 미감지 카운트 키
+  json += String(irInactiveCount);                  // IR 미감지 카운트 값
+  json += ",";                                     // 쉼표
+
+  json += "\"ultra_count\":";                      // 초음파 카운트 키
+  json += String(ultraCount);                       // 초음파 카운트 값
+  json += ",";                                     // 쉼표
+
+  json += "\"track\":";                            // 현재 음원 키
+  json += String(currentTrack);                     // 현재 음원 값
+  json += ",";                                     // 쉼표
+
+  json += "\"volume\":";                           // 볼륨 키
+  json += String(currentVolume);                    // 볼륨 값
+  json += ",";                                     // 쉼표
+
+  json += "\"stop_reason\":\"";                    // 정지 원인 키
+  json += lastStopReason;                           // 정지 원인 값
+  json += "\"";                                    // 문자열 종료
+
+  json += "}";                                     // JSON 종료
+
+  server.send(200, "application/json", json);       // JSON 응답
+}
+
+void setup() {                                      // 처음 한 번 실행
+  Serial.begin(115200);                             // 시리얼 모니터 시작
+  delay(1500);                                      // 시리얼 안정화 대기
+
+  pinMode(TRIG_PIN, OUTPUT);                        // 초음파 TRIG 출력 설정
+  pinMode(ECHO_PIN, INPUT);                         // 초음파 ECHO 입력 설정
+  pinMode(IR_PIN, INPUT_PULLUP);                    // IR 입력 풀업 설정
+  digitalWrite(TRIG_PIN, LOW);                      // TRIG 초기값 LOW
+
+  Serial.println();                                 // 줄바꿈
+  Serial.println("Nano ESP32 컵 위치 알림 시스템 시작"); // 시작 문구 출력
+
+  dfSerial.begin(9600, SERIAL_8N1, DF_RX_PIN, DF_TX_PIN); // DFPlayer UART 시작
+  delay(1500);                                      // DFPlayer 부팅 대기
+
+  if (!mp3.begin(dfSerial, false, true)) {           // DFPlayer 초기화
+    Serial.println("DFPlayer 연결 실패");           // 실패 출력
+    Serial.println("배선, SD카드, 전원 확인");      // 확인 항목 출력
+
+    while (true) {                                   // 실패 시 정지
+      delay(1000);                                   // 1초 대기
+    }
+  }
+
+  Serial.println("DFPlayer 연결 성공");              // 성공 출력
+
+  mp3.setTimeOut(500);                              // 응답 대기 시간 설정
+  setVolumeSafe(currentVolume);                     // 시작 볼륨 적용
+  mp3.EQ(DFPLAYER_EQ_NORMAL);                       // 기본 EQ 설정
+  mp3.outputDevice(DFPLAYER_DEVICE_SD);             // SD카드 출력 설정
+
+  WiFi.mode(WIFI_STA);                              // Wi-Fi 클라이언트 모드 설정
+  WiFi.begin(ssid, password);                       // Wi-Fi 연결 시작
+
+  Serial.print("Wi-Fi 연결 중");                    // 연결 상태 출력
+
+  while (WiFi.status() != WL_CONNECTED) {           // Wi-Fi 연결 대기
+    delay(500);                                     // 0.5초 대기
+    Serial.print(".");                              // 진행 표시
+  }
+
+  Serial.println();                                 // 줄바꿈
+  Serial.println("Wi-Fi 연결 완료");                // 연결 완료 출력
+
+  espIp = WiFi.localIP().toString();                // IP 주소 저장
+
+  Serial.print("ESP32 IP 주소: ");                  // IP 출력
+  Serial.println(espIp);                            // IP 출력
+
+  server.on("/", handleRoot);                       // 메인 페이지 등록
+  server.on("/start", handleStart);                 // 시작 버튼 등록
+  server.on("/stop", handleStop);                   // 정지 버튼 등록
+  server.on("/volup", handleVolumeUp);              // 볼륨 증가 등록
+  server.on("/voldown", handleVolumeDown);          // 볼륨 감소 등록
+  server.on("/test1", handleTest1);                 // 0001 테스트 등록
+  server.on("/test2", handleTest2);                 // 0002 테스트 등록
+
+  server.on("/api/start", handleApiStart);          // 시작 API 등록
+  server.on("/api/stop", handleApiStop);            // 정지 API 등록
+  server.on("/api/reset", handleApiReset);          // 리셋 API 등록
+  server.on("/api/status", handleApiStatus);        // 상태 API 등록
+  server.on("/api/play1", handleApiPlay1);          // 0001 테스트 API 등록
+  server.on("/api/play2", handleApiPlay2);          // 0002 테스트 API 등록
+
+  server.begin();                                   // 웹서버 시작
+
+  Serial.println("브라우저에서 아래 주소 접속");    // 접속 안내
+  Serial.print("http://");                          // 주소 앞부분
+  Serial.println(espIp);                            // IP 출력
+}
+
+void loop() {                                       // 계속 반복
+  server.handleClient();                            // 웹 요청 처리
+  updateUltrasonic();                               // 초음파 측정 및 정지 판단
+  printStatus();                                    // 상태 출력
+  handleDfPlayerMessage();                          // DFPlayer 상태 처리
+
+  if (systemActive) {                               // 시스템 동작 중이면
+    checkIrAndSelectSound();                        // IR 상태에 따라 음원 선택
+  }
+}
