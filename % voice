@@ -99,6 +99,42 @@ _finish_tts_lock = threading.Lock()      # 급수 완료 TTS 중복 방지용
 _last_finish_tts_time = 0.0              # 마지막 급수 완료 안내 시각
 _voice_audio_restart_request = threading.Event()  # 급수 후 음성 입력 스트림 재시작 요청
 
+# silero-VAD 모델을 voice_loop 진입마다 다시 받지 않고 프로세스당 1회만 로드해 캐시한다.
+# 급수 후 스트림 재시작 시 voice_loop가 재실행되어도 torch.hub.load가 반복되지 않게 한다.
+_vad_model_cache = None
+_vad_model_lock = threading.Lock()
+
+# voice_loop가 동시에 몇 개 살아 있는지 추적하는 진단용 카운터.
+# 정상 상태에서는 항상 1이어야 한다. 2 이상이면 중복 실행(watchdog 재시작) 의심.
+_voice_loop_active_count = 0
+_voice_loop_count_lock = threading.Lock()
+
+
+def get_voice_loop_active_count() -> int:
+    """현재 살아 있는 voice_loop 인스턴스 수(진단용)."""
+    with _voice_loop_count_lock:
+        return int(_voice_loop_active_count)
+
+
+
+def _get_vad_model():
+    """silero-VAD 모델을 1회만 로드해 캐시 후 재사용한다."""
+    global _vad_model_cache
+    with _vad_model_lock:
+        if _vad_model_cache is None:
+            log_info('silero-VAD 로드 중...')
+            model, _ = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                trust_repo=True,
+            )
+            _vad_model_cache = model
+            log_info('silero-VAD 로드 완료')
+        else:
+            log_info('silero-VAD 캐시 재사용')
+        return _vad_model_cache
+
 # ════════════════════════════════════════════════════════════════════
 #  상태 정의
 # ════════════════════════════════════════════════════════════════════
@@ -445,7 +481,7 @@ def _tts_gui_state(text: str):
         log_dbg(f'TTS GUI 상태 갱신 오류: {e}')                  # 실패해도 TTS 자체는 계속 진행
 
 
-def _voice_ready_gui_state(ready=None, text=None):
+def _voice_ready_gui_state(ready=None, text=None, remain_sec=None):
     """사용자 GUI에 '지금 말해도 되는지'를 표시하기 위한 상태값을 갱신한다."""
     try:
         import smart_water_core as core                         # 순환 import 방지용 함수 내부 import
@@ -455,8 +491,13 @@ def _voice_ready_gui_state(ready=None, text=None):
             if text is not None:
                 core.voice_ready_text = str(text)                # GUI에 표시할 대기/처리 상태 문구
                 core.voice_ready_time = time.time()              # 마지막 상태 갱신 시각
+            if remain_sec is not None:
+                # 발화 대기 중 남은 시간(초). 음수 방지. -1이면 '표시 안 함' 의미로 사용.
+                core.voice_remain_sec = float(remain_sec)        # GUI 카운트다운 표시용 남은 시간
+                core.voice_remain_time = time.time()             # 남은 시간 갱신 시각(오래되면 GUI가 무시)
     except Exception as e:
         log_dbg(f'음성 대기 상태 갱신 오류: {e}')                # 실패해도 음성 루프는 계속 진행
+
 
 
 def speak(text: str):
@@ -615,6 +656,7 @@ def clean_audio(audio):
     """STT 입력용 전처리. noisereduce 후 RMS를 TARGET_RMS 근처로 맞춘다."""
     cleaned = audio.copy().astype(np.float32)
     if NOISE_REDUCE:
+        time.sleep(0.001)   # GIL 양보: 무거운 noisereduce 직전에 GUI에 실행 기회를 준다.
         try:
             cleaned = nr.reduce_noise(
                 y=cleaned, sr=VOICE_SAMPLE_RATE,
@@ -623,6 +665,7 @@ def clean_audio(audio):
             ).astype(np.float32)
         except Exception as e:
             log_dbg(f'noisereduce 오류: {e}')
+        time.sleep(0.001)   # GIL 양보: noisereduce 직후 GUI 프레임이 밀린 만큼 따라잡게 한다.
     r = rms(cleaned)
     if r > 0.0001:
         gain = min(TARGET_RMS / r, MAX_GAIN)
@@ -669,6 +712,12 @@ def collect_speech(stream, vad_model, max_seconds):
     silence_cnt   = 0
     read_fail_count = 0
 
+    # 발화 대기 카운트다운(남은 발화 가능 시간) 표시용.
+    # 매 VAD 청크(~32ms)마다 갱신하면 GIL 부하가 커지므로 0.2초에 한 번만 GUI 상태를 갱신한다.
+    listen_start_t   = time.time()
+    last_remain_push = 0.0
+    REMAIN_PUSH_INTERVAL = 0.2
+
     vad_model.reset_states()
     try:
         for _ in range(max_chunks):
@@ -689,11 +738,19 @@ def collect_speech(stream, vad_model, max_seconds):
 
             if not speaking:
                 pre_roll.append(chunk.copy())
+
+                # 아직 발화 시작 전: 남은 발화 가능 시간을 0.2초마다 GUI에 갱신한다.
+                now_remain = time.time()
+                if now_remain - last_remain_push >= REMAIN_PUSH_INTERVAL:
+                    remain = max(0.0, max_seconds - (now_remain - listen_start_t))
+                    _voice_ready_gui_state(remain_sec=remain)
+                    last_remain_push = now_remain
+
                 if prob >= VAD_THRESHOLD:
                     speaking    = True
                     silence_cnt = 0
                     speech_frames.extend(list(pre_roll))
-                    _voice_ready_gui_state(False, '듣는 중...')             # 사용자가 말하는 동안은 수신 중 상태
+                    _voice_ready_gui_state(False, '듣는 중...', remain_sec=-1)  # 발화 시작 → 카운트다운 종료
                     _voice_gui_state(active=True, volume=_chunk_volume(chunk))
                     log_dbg(f'음성 감지 ({prob:.0%})')
             else:
@@ -706,9 +763,15 @@ def collect_speech(stream, vad_model, max_seconds):
                     silence_cnt += 1
                     if silence_cnt >= pad_n:
                         break
+
+            # GIL 양보점: 매 VAD 청크 처리 후 짧게 실제로 양보해 GUI 메인 스레드(아우라)가
+            # 55ms 주기를 지킬 틈을 확실히 준다. sleep(0)은 양보 보장이 없어 1ms 실제 sleep으로 강화.
+            # VAD 청크 간격(수십 ms) 대비 1ms는 무시할 수준이라 인식 타이밍/정확도는 불변.
+            time.sleep(0.001)
     finally:
         vad_model.reset_states()
         _voice_gui_state(active=False, volume=0.0)
+        _voice_ready_gui_state(remain_sec=-1)   # 수신 종료 → 카운트다운 표시 해제
 
     if not speech_frames or len(speech_frames) < min_n:
         return None
@@ -1164,14 +1227,17 @@ def voice_loop():
     지니야 → 네 부르셨나요? → 명령 지능형 분기
     기존 기능(정수기/컵 위치, 도착 대기, 급수량 선택 등) 모두 유지.
     """
-    log_info('silero-VAD 로드 중...')
-    vad_model, _ = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad',
-        model='silero_vad',
-        force_reload=False,
-        trust_repo=True,
-    )
-    log_info('silero-VAD 로드 완료')
+    # silero-VAD는 프로세스당 1회만 로드한다(캐시 재사용).
+    # 급수 후 입력 스트림을 재시작해도 무거운 torch.hub.load가 반복되지 않게 한다.
+    vad_model = _get_vad_model()
+
+    # 진단용: 살아 있는 voice_loop 인스턴스 수 증가. 정상이면 1이어야 한다.
+    global _voice_loop_active_count
+    with _voice_loop_count_lock:
+        _voice_loop_active_count += 1
+        _vl_count_now = _voice_loop_active_count
+    log_info(f'[DIAG] voice_loop 진입 — 활성 인스턴스 수={_vl_count_now}'
+             + ('  *** 중복 실행 의심 ***' if _vl_count_now > 1 else ''))
 
     mic_idx, mic_name = find_respeaker_device()
     if VOICE_MIC_DEVICE is not None:
@@ -1180,14 +1246,33 @@ def voice_loop():
     log_info(f'마이크: [{mic_idx}] {mic_name}' if mic_idx is not None
              else '마이크: 기본 장치')
 
-    stream = sd.InputStream(
-        samplerate=VOICE_SAMPLE_RATE,
-        channels=VOICE_CHANNELS,
-        dtype='float32',
-        device=mic_idx,
-        blocksize=VAD_CHUNK_SIZE,
-    )
-    stream.start()
+    def _open_voice_stream():
+        """음성 입력 sounddevice 스트림을 새로 열어 start까지 한다."""
+        s = sd.InputStream(
+            samplerate=VOICE_SAMPLE_RATE,
+            channels=VOICE_CHANNELS,
+            dtype='float32',
+            device=mic_idx,
+            blocksize=VAD_CHUNK_SIZE,
+        )
+        s.start()
+        return s
+
+    def _restart_voice_stream(old_stream):
+        """기존 스트림을 닫고 새 스트림을 연다. voice_loop는 죽이지 않는다."""
+        try:
+            old_stream.stop()
+        except Exception:
+            pass
+        try:
+            old_stream.close()
+        except Exception:
+            pass
+        new_stream = _open_voice_stream()
+        log_info('음성인식 오디오 스트림 재시작(루프 유지)')
+        return new_stream
+
+    stream = _open_voice_stream()
     log_info('음성인식 오디오 스트림 시작')
 
     _init_ultrasonic()
@@ -1319,8 +1404,12 @@ def voice_loop():
 
             if _voice_audio_restart_request.is_set():
                 _voice_audio_restart_request.clear()
-                log_info('[VOICE_RESTART] 음성 입력 스트림 재시작 처리')
-                break
+                log_info('[VOICE_RESTART] 음성 입력 스트림 재시작 처리(루프 유지)')
+                # 루프를 죽이지 않고 입력 스트림만 닫았다가 다시 연다.
+                # voice_loop를 break하면 main.py watchdog이 새 스레드를 띄우면서
+                # silero-VAD 재로드 + 스트림 중복 생성으로 GUI가 영구적으로 버벅인다.
+                stream = _restart_voice_stream(stream)
+                continue
 
             if time.time() - last_tts_time < TTS_COOLDOWN:
                 time.sleep(0.05)
@@ -1621,8 +1710,9 @@ def voice_loop():
             stream.close()
         except Exception:
             pass
+        with _voice_loop_count_lock:
+            _voice_loop_active_count = max(0, _voice_loop_active_count - 1)
+            _vl_count_now = _voice_loop_active_count
         _voice_gui_state(active=False, volume=0.0)
         _voice_ready_gui_state(False, '음성인식 재시작 중...')
-        log_info('음성인식 오디오 스트림 종료')
-
-
+        log_info(f'음성인식 오디오 스트림 종료 — 활성 voice_loop 수={_vl_count_now}')
